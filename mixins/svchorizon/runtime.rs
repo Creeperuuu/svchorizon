@@ -835,8 +835,17 @@ pub fn on_hud(
     let category_label = if groups.categories.is_empty() {
         "SVC Categories: none".to_owned()
     } else {
-        let names = groups.categories.iter().take(3)
-            .map(|category| category.name.as_str()).collect::<Vec<_>>().join(", ");
+        let names = groups.categories.iter().take(3).map(|category| {
+            let tab = category.tab_name.as_deref().or(category.tab.as_deref());
+            let description = category.description.as_deref()
+                .map(|value| value.chars().take(36).collect::<String>());
+            match (tab, description) {
+                (Some(tab), Some(description)) => format!("{} [{}: {}]", category.name, tab, description),
+                (Some(tab), None) => format!("{} [{}]", category.name, tab),
+                (None, Some(description)) => format!("{}: {}", category.name, description),
+                (None, None) => category.name.clone(),
+            }
+        }).collect::<Vec<_>>().join(", ");
         let extra = groups.categories.len().saturating_sub(3);
         if extra > 0 { format!("SVC Categories: {names} +{extra}") }
         else { format!("SVC Categories: {names}") }
