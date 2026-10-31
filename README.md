@@ -12,10 +12,12 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - AES-128-GCM encrypted UDP transport and authentication.
 - Vendored pure-Rust Opus codec.
 - CPAL microphone capture and speaker playback.
-- Push-to-talk keybind and connection HUD.
-- Basic player/location spatial audio.
+- Push-to-talk (V), hold-to-whisper (B), and toggleable RMS voice activation (C).
+- Concurrent per-speaker mixing, bounded sequence reordering, and short-burst Opus packet-loss concealment.
+- Per-player volume/mute engine controls and basic player/location spatial audio.
+- Connection and voice-activation HUD indicators.
 
-The implementation is not yet complete: group management, jitter buffering, remaining packet types, settings and end-to-end interoperability testing are outstanding.
+The implementation is not yet complete: group management, remaining packet types, device selection/settings UI, reconnect edge cases and end-to-end interoperability testing are outstanding. Per-player volume/mute setters are not yet exposed through an in-game player menu.
 
 ## Build and validate
 
