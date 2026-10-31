@@ -1,0 +1,23 @@
+[mod]
+id = "svchorizon"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "ba6344a59cb9e755b730dcf02285fc0d33b97d3c"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "svchorizon"
+source = "runtime.rs"
+
+[[injection]]
+id = "voicechat-packet"
+kind = "HEAD"
+target = "horizon_client::game::remote::Game<'_>::handle_packet"
+helper = "handle_packet.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "packet", ty = "&horizon_protocol::packets::play::Clientbound", value = "&packet" }
+]
