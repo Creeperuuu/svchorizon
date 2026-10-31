@@ -164,7 +164,7 @@ impl VoiceClient {
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
             ))
-            .ok();
+            .map_err(VoiceError::Io)?;
 
         let worker_running = Arc::clone(&running);
         let worker_transmitting = Arc::clone(&transmitting);
