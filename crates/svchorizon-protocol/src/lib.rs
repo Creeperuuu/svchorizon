@@ -5,3 +5,4 @@ pub mod wire;
 
 pub use crypto::VoiceSecret;
 pub use protocol::{ClientDatagram, ServerDatagram, VoicePacket};
+pub mod tcp;
