@@ -13,7 +13,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
@@ -117,6 +117,7 @@ pub struct VoiceClient {
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
     listener: Arc<Mutex<ListenerPose>>,
+    player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 }
 
 impl VoiceClient {
@@ -145,6 +146,7 @@ impl VoiceClient {
         let (event_tx, event_rx) = mpsc::sync_channel(32);
         let (audio_tx, audio_rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
+        let player_positions = Arc::new(RwLock::new(HashMap::new()));
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
@@ -164,12 +166,13 @@ impl VoiceClient {
         let worker_running = Arc::clone(&running);
         let worker_transmitting = Arc::clone(&transmitting);
         let worker_connected = Arc::clone(&connected);
+        let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
             .spawn(move || {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
-                    worker_running, worker_transmitting, worker_connected,
+                    worker_running, worker_transmitting, worker_connected, worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -182,7 +185,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, connected,
-            worker: Some(worker), audio_worker, listener,
+            worker: Some(worker), audio_worker, listener, player_positions,
         })
     }
 
@@ -207,6 +210,12 @@ impl VoiceClient {
 
     pub fn clear_listener(&self) {
         if let Ok(mut pose) = self.listener.lock() { pose.active = false; }
+    }
+
+    pub fn set_player_positions(&self, positions: Vec<([u8; 16], [f64; 3])>) {
+        if let Ok(mut current) = self.player_positions.write() {
+            *current = positions.into_iter().collect();
+        }
     }
 
     /// Queue exactly one 20 ms mono 48 kHz PCM frame. Returns false when muted
@@ -276,6 +285,7 @@ fn run_worker(
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
         Ok(value) => value,
@@ -368,7 +378,9 @@ fn run_worker(
                     }
                     Packet::PlayerSound { channel, sender, opus, distance, whispering, category, .. } => {
                         if validated {
-                            emit_audio(&mut decoders, &audio, channel, sender, None,
+                            let position = player_positions.read().ok()
+                                .and_then(|positions| positions.get(&sender).copied());
+                            emit_audio(&mut decoders, &audio, channel, sender, position,
                                 Some(distance), whispering, category, &opus);
                         }
                     }
