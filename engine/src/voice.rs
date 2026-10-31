@@ -496,7 +496,7 @@ fn emit_audio(
     for (out, input) in pcm.iter_mut().zip(float_pcm.iter()).take(samples.min(FRAME_SAMPLES)) {
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
-    let _ = audio.try_send(AudioFrame { pcm, position, max_distance: distance });
+    let _ = audio.try_send(AudioFrame { sender, pcm, position, max_distance: distance });
 }
 
 fn run_audio_io(
