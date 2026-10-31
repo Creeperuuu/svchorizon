@@ -177,6 +177,10 @@ impl VoiceClient {
         self.connected.load(Ordering::Acquire)
     }
 
+    pub fn is_transmitting(&self) -> bool {
+        self.transmitting.load(Ordering::Relaxed)
+    }
+
     /// Queue exactly one 20 ms mono 48 kHz PCM frame. Returns false when muted
     /// or when the bounded worker queue is full; the caller must not block.
     pub fn send_pcm(&self, frame: [i16; FRAME_SAMPLES]) -> bool {
