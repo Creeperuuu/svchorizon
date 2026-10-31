@@ -1,39 +1,49 @@
 # SVC Horizon
 
-Native Rust port of the Simple Voice Chat client for Horizon.
+A native Rust Simple Voice Chat client port for Horizon.
 
-**Status: protocol-core prototype, not a working voice-chat mod.** This repository currently establishes a Rust workspace and an initial subset of the official UDP protocol. It does not yet intercept Minecraft TCP custom payloads, capture/play audio, implement Opus, integrate Horizon hooks, or produce an installable hnmod. Do not use it as a functional client.
+<sub>Development status: advanced prototype; not yet validated in-game or against an official server.</sub>
 
-## Goal
+The project targets unmodified Paper/Spigot servers running the official Simple Voice Chat plugin and players using official Fabric, Forge and NeoForge clients. No Horizon-specific server plugin is intended.
 
-Interoperate with unmodified Paper/Spigot servers running the official Simple Voice Chat plugin and players using official Fabric, Forge, and NeoForge clients. No Horizon-specific server plugin.
+## Current implementation
 
-## Architecture
+- Official TCP request-secret / secret handshake hooks.
+- AES-128-GCM encrypted UDP transport and authentication.
+- Vendored pure-Rust Opus codec.
+- CPAL microphone capture and speaker playback.
+- Push-to-talk keybind and connection HUD.
+- Basic player/location spatial audio.
 
-1. Minecraft TCP custom payloads negotiate the voice server and provide the per-player secret.
-2. A separate UDP socket authenticates and carries encrypted voice packets.
-3. Opus handles microphone encoding and speaker decoding.
-4. Horizon native source mixins connect the runtime, keybinds, settings, and HUD.
+The implementation is not yet complete: group management, jitter buffering, remaining packet types, settings and end-to-end interoperability testing are outstanding.
 
-See [protocol notes](docs/PROTOCOL.md) and [implementation status](docs/STATUS.md).
+## Build and validate
 
-## Build
+The GitHub Actions workflows are manual-trigger only. Open **Actions → Build SVC Horizon hnmod → Run workflow** to run Windows/Linux protocol checks, compile the native engine for Windows, validate the pinned Horizon native mixins on Linux, and package the source bundle.
 
-Requires stable Rust and Cargo.
+The workflow artifact is `svchorizon-0.1.0.hnmod`. It is a source-based native mod bundle, not a Java mod or a modified Minecraft executable.
+
+Local protocol checks:
 
 ```sh
-cargo test --workspace
-cargo fmt --all --check
+cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The final deliverable is intended to be a source-based `.hnmod`, not a Java wrapper or modified game binary.
+## Pinned compatibility
 
-## References
+- Minecraft: 26.3
+- Horizon: `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`
+- horizon-mixins: `d9c83d7096b7ea5b83678da2efdfd6161f74997e`
+- Simple Voice Chat compatibility version: 20 (upstream 2.6.28+26.3)
+
+See [protocol notes](docs/PROTOCOL.md) and [implementation status](docs/STATUS.md).
+
+## Upstream references
 
 - [Simple Voice Chat](https://github.com/henkelmax/simple-voice-chat)
 - [Horizon](https://github.com/horizon-rust/horizon)
-- [Horizon native mod documentation](https://github.com/horizon-rust/horizon/blob/main/docs/native-mods.md)
 - [Horizon native mod template](https://github.com/horizon-rust/horizon-native-mod-template)
+- [Pure-Rust Opus implementation](https://github.com/restsend/opus-rs)
 
-License: MIT.
+License: MIT for project-authored files; the vendored Opus codec retains its BSD-3-Clause license.
