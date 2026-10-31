@@ -1,4 +1,4 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
 
 const SVC_COMPATIBILITY_VERSION: i32 = 20;
@@ -6,6 +6,7 @@ const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
 
 static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
+static PTT_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn voice_client() -> &'static Mutex<Option<VoiceClient>> {
     VOICE_CLIENT.get_or_init(|| Mutex::new(None))
@@ -95,6 +96,39 @@ fn poll_voice_events() {
             VoiceEvent::AudioUnavailable(reason) => eprintln!("[svchorizon] Audio device warning: {reason}"),
         }
     }
+}
+
+
+pub fn on_tick(game: &mut crate::game::Game<'_>) {
+    poll_voice_events();
+    let enabled = game.native_on("svchorizon") && game.native_playing();
+    if !enabled { PTT_DOWN.store(false, Ordering::Relaxed); }
+    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        client.set_transmitting(enabled && PTT_DOWN.load(Ordering::Relaxed));
+    }
+}
+
+pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
+    let binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
+    if key == binding {
+        PTT_DOWN.store(pressed, Ordering::Relaxed);
+        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+            client.set_transmitting(pressed && game.native_on("svchorizon") && game.native_playing());
+        }
+    }
+}
+
+pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+    mods.push(crate::game::native_hooks::NativeMod {
+        id: "svchorizon".into(),
+        title: "SVC Horizon 0.1.0".into(),
+        description: "Simple Voice Chat client for Horizon; connects to official voicechat servers.".into(),
+        keys: vec![[
+            "push_to_talk".into(),
+            "Push to talk".into(),
+            "key.keyboard.v".into(),
+        ]],
+    });
 }
 
 pub fn on_packet(
