@@ -1,4 +1,4 @@
-use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}}, thread};
+use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, thread};
 use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
 
 const SVC_COMPATIBILITY_VERSION: i32 = 20;
@@ -96,6 +96,10 @@ static PLAYER_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
 static PLAYER_IGNORE_DOWN: AtomicBool = AtomicBool::new(false);
 static PLAYER_VOL_DOWN: AtomicBool = AtomicBool::new(false);
 static PLAYER_VOL_UP: AtomicBool = AtomicBool::new(false);
+static INPUT_DEVICE_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
+static OUTPUT_DEVICE_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
+static INPUT_DEVICE_INDEX: AtomicUsize = AtomicUsize::new(0);
+static OUTPUT_DEVICE_INDEX: AtomicUsize = AtomicUsize::new(0);
 static GROUP_STATE: OnceLock<Mutex<GroupState>> = OnceLock::new();
 
 #[derive(Clone)]
