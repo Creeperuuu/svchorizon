@@ -111,6 +111,11 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     let enabled = game.native_on("svchorizon") && game.native_playing();
     if !enabled { PTT_DOWN.store(false, Ordering::Relaxed); }
     if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        if let Some(player) = game.native_player() {
+            client.set_listener(player.x, player.y, player.z, player.yaw);
+        } else {
+            client.clear_listener();
+        }
         client.set_transmitting(enabled && PTT_DOWN.load(Ordering::Relaxed));
     }
 }
