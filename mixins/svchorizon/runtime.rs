@@ -17,6 +17,7 @@ static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LOCAL_PLAYER_UUID: OnceLock<Mutex<Option<[u8; 16]>>> = OnceLock::new();
 static LAST_SERVER_INFO: OnceLock<Mutex<Option<(VoiceServerInfo, String)>>> = OnceLock::new();
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
+static GROUPS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn local_player_uuid() -> &'static Mutex<Option<[u8; 16]>> {
     LOCAL_PLAYER_UUID.get_or_init(|| Mutex::new(None))
@@ -616,7 +617,8 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             SELF_MUTE_KEY_DOWN.store(false, Ordering::Release);
         }
     } else if key == game.native_mod_key("svchorizon", "group_create", "key.keyboard.g") {
-        if pressed && !GROUP_CREATE_DOWN.swap(true, Ordering::AcqRel) && game.native_playing() {
+        if pressed && !GROUP_CREATE_DOWN.swap(true, Ordering::AcqRel)
+            && game.native_playing() && GROUPS_ENABLED.load(Ordering::Acquire) {
             send_create_group(game);
         } else if !pressed {
             GROUP_CREATE_DOWN.store(false, Ordering::Release);
@@ -635,7 +637,8 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             GROUP_NEXT_DOWN.store(false, Ordering::Release);
         }
     } else if key == game.native_mod_key("svchorizon", "group_join", "key.keyboard.j") {
-        if pressed && !GROUP_JOIN_DOWN.swap(true, Ordering::AcqRel) && game.native_playing() {
+        if pressed && !GROUP_JOIN_DOWN.swap(true, Ordering::AcqRel)
+            && game.native_playing() && GROUPS_ENABLED.load(Ordering::Acquire) {
             let selected = {
                 let state = group_state().lock().expect("SVC group state poisoned");
                 state.groups.get(state.selected).cloned()
@@ -647,7 +650,8 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             GROUP_JOIN_DOWN.store(false, Ordering::Release);
         }
     } else if key == game.native_mod_key("svchorizon", "group_leave", "key.keyboard.h") {
-        if pressed && !GROUP_LEAVE_DOWN.swap(true, Ordering::AcqRel) && game.native_playing() {
+        if pressed && !GROUP_LEAVE_DOWN.swap(true, Ordering::AcqRel)
+            && game.native_playing() && GROUPS_ENABLED.load(Ordering::Acquire) {
             send_leave_group(game);
         } else if !pressed {
             GROUP_LEAVE_DOWN.store(false, Ordering::Release);
@@ -745,7 +749,9 @@ pub fn on_hud(
     };
     game.native_text(batch, label, [8.0, 42.0], color, true);
     let groups = group_state().lock().expect("SVC group state poisoned");
-    let group_label = if let Some(active) = groups.active {
+    let group_label = if !GROUPS_ENABLED.load(Ordering::Acquire) {
+        "SVC Group: disabled by server".to_owned()
+    } else if let Some(active) = groups.active {
         groups.groups.iter().find(|group| group.id == active)
             .map(|group| format!("SVC Group: {}", group.name))
             .unwrap_or_else(|| "SVC Group: joined".to_owned())
@@ -790,6 +796,7 @@ pub fn on_packet(
             *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
             *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
             RECONNECTING.store(false, Ordering::Release);
+            GROUPS_ENABLED.store(false, Ordering::Release);
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") { send_secret_request(game); }
@@ -798,6 +805,7 @@ pub fn on_packet(
             match decode_secret(&payload.data) {
                 Some(info) => {
                     *local_player_uuid().lock().expect("SVC local player state poisoned") = Some(info.player);
+                    GROUPS_ENABLED.store(info.groups, Ordering::Release);
                     send_client_state(game, SELF_MUTED.load(Ordering::Relaxed), false);
                     {
                         let mut state = group_state().lock().expect("SVC player state poisoned");
