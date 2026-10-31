@@ -493,6 +493,7 @@ fn run_worker(
     encoder.packet_loss_perc = 5;
     let payload_limit = (info.mtu as usize).clamp(2, MAX_OPUS);
     let mut decoders: HashMap<[u8; 16], OpusDecoder> = HashMap::new();
+    let mut jitter = AudioJitterBuffer::default();
     let mut authenticated = false;
     let mut validated = false;
     let mut sequence = 0i64;
@@ -574,24 +575,37 @@ fn run_worker(
                     Packet::Ping { id, timestamp } => {
                         let _ = send_packet(&socket, &info, &Packet::Ping { id, timestamp });
                     }
-                    Packet::PlayerSound { channel, sender, opus, distance, whispering, category, .. } => {
+                    Packet::PlayerSound { sender, opus, sequence, distance, .. } => {
                         if validated {
                             let position = player_positions.read().ok()
                                 .and_then(|positions| positions.get(&sender).copied());
-                            emit_audio(&mut decoders, &audio, channel, sender, position,
-                                Some(distance), whispering, category, &opus);
+                            let ready = jitter.push(PendingAudio {
+                                sender, sequence, opus, position, max_distance: Some(distance),
+                            }, Instant::now());
+                            for frame in ready {
+                                emit_audio(&mut decoders, &audio, frame);
+                            }
                         }
                     }
-                    Packet::GroupSound { channel, sender, opus, category, .. } => {
+                    Packet::GroupSound { sender, opus, sequence, .. } => {
                         if validated {
-                            emit_audio(&mut decoders, &audio, channel, sender, None,
-                                None, false, category, &opus);
+                            let ready = jitter.push(PendingAudio {
+                                sender, sequence, opus, position: None, max_distance: None,
+                            }, Instant::now());
+                            for frame in ready {
+                                emit_audio(&mut decoders, &audio, frame);
+                            }
                         }
                     }
-                    Packet::LocationSound { channel, sender, location, opus, distance, category, .. } => {
+                    Packet::LocationSound { sender, location, opus, sequence, distance, .. } => {
                         if validated {
-                            emit_audio(&mut decoders, &audio, channel, sender, Some(location),
-                                Some(distance), false, category, &opus);
+                            let ready = jitter.push(PendingAudio {
+                                sender, sequence, opus, position: Some(location),
+                                max_distance: Some(distance),
+                            }, Instant::now());
+                            for frame in ready {
+                                emit_audio(&mut decoders, &audio, frame);
+                            }
                         }
                     }
                     _ => {}
@@ -607,6 +621,9 @@ fn run_worker(
                 break;
             }
         }
+        for frame in jitter.poll(Instant::now()) {
+            emit_audio(&mut decoders, &audio, frame);
+        }
     }
     connected.store(false, Ordering::Release);
     running.store(false, Ordering::Release);
@@ -615,27 +632,26 @@ fn run_worker(
 fn emit_audio(
     decoders: &mut HashMap<[u8; 16], OpusDecoder>,
     audio: &SyncSender<AudioFrame>,
-    _channel: [u8; 16],
-    sender: [u8; 16],
-    position: Option<[f64; 3]>,
-    distance: Option<f32>,
-    _whispering: bool,
-    _category: Option<String>,
-    opus: &[u8],
+    pending: PendingAudio,
 ) {
-    if opus.is_empty() || opus.len() > MAX_OPUS { return; }
-    if !decoders.contains_key(&sender) {
+    if pending.opus.is_empty() || pending.opus.len() > MAX_OPUS { return; }
+    if !decoders.contains_key(&pending.sender) {
         let Ok(decoder) = OpusDecoder::new(SAMPLE_RATE, 1) else { return; };
-        decoders.insert(sender, decoder);
+        decoders.insert(pending.sender, decoder);
     }
-    let Some(decoder) = decoders.get_mut(&sender) else { return; };
+    let Some(decoder) = decoders.get_mut(&pending.sender) else { return; };
     let mut float_pcm = [0.0f32; FRAME_SAMPLES];
-    let Ok(samples) = decoder.decode(opus, FRAME_SAMPLES, &mut float_pcm) else { return; };
+    let Ok(samples) = decoder.decode(&pending.opus, FRAME_SAMPLES, &mut float_pcm) else { return; };
     let mut pcm = [0i16; FRAME_SAMPLES];
     for (out, input) in pcm.iter_mut().zip(float_pcm.iter()).take(samples.min(FRAME_SAMPLES)) {
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
-    let _ = audio.try_send(AudioFrame { sender, pcm, position, max_distance: distance });
+    let _ = audio.try_send(AudioFrame {
+        sender: pending.sender,
+        pcm,
+        position: pending.position,
+        max_distance: pending.max_distance,
+    });
 }
 
 fn run_audio_io(
