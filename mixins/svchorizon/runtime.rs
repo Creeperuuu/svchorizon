@@ -15,9 +15,74 @@ static SELF_MUTE_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LOCAL_PLAYER_UUID: OnceLock<Mutex<Option<[u8; 16]>>> = OnceLock::new();
+static LAST_SERVER_INFO: OnceLock<Mutex<Option<(VoiceServerInfo, String)>>> = OnceLock::new();
+static RECONNECTING: AtomicBool = AtomicBool::new(false);
 
 fn local_player_uuid() -> &'static Mutex<Option<[u8; 16]>> {
     LOCAL_PLAYER_UUID.get_or_init(|| Mutex::new(None))
+}
+
+fn last_server_info() -> &'static Mutex<Option<(VoiceServerInfo, String)>> {
+    LAST_SERVER_INFO.get_or_init(|| Mutex::new(None))
+}
+
+fn apply_player_controls(client: &VoiceClient) {
+    let controls = {
+        let state = group_state().lock().expect("SVC player state poisoned");
+        state.players.iter().map(|player| {
+            (player.id, player.volume, player.ignored)
+        }).collect::<Vec<_>>()
+    };
+    for (id, volume, ignored) in controls {
+        client.set_player_volume(id, volume);
+        client.set_player_muted(id, ignored);
+    }
+}
+
+fn start_reconnect() {
+    if RECONNECTING.swap(true, Ordering::AcqRel) { return; }
+    let Some((info, fallback_host)) = last_server_info()
+        .lock().expect("SVC reconnect state poisoned").clone()
+    else {
+        RECONNECTING.store(false, Ordering::Release);
+        return;
+    };
+    let generation = SESSION_GENERATION.load(Ordering::Acquire);
+    let _ = thread::Builder::new().name("svchorizon-reconnect".into()).spawn(move || {
+        let mut delay_seconds = 1u64;
+        while REMOTE_ACTIVE.load(Ordering::Acquire)
+            && SESSION_GENERATION.load(Ordering::Acquire) == generation
+        {
+            thread::sleep(std::time::Duration::from_secs(delay_seconds));
+            if !REMOTE_ACTIVE.load(Ordering::Acquire)
+                || SESSION_GENERATION.load(Ordering::Acquire) != generation
+            {
+                break;
+            }
+            match VoiceClient::connect(info.clone(), &fallback_host) {
+                Ok(client) => {
+                    apply_player_controls(&client);
+                    if SESSION_GENERATION.load(Ordering::Acquire) == generation
+                        && REMOTE_ACTIVE.load(Ordering::Acquire)
+                    {
+                        let mut slot = voice_client().lock().expect("SVC client state poisoned");
+                        if slot.is_none() {
+                            *slot = Some(client);
+                            eprintln!("[svchorizon] Voice reconnect attempt started.");
+                        }
+                    }
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("[svchorizon] Voice reconnect failed: {error}");
+                    delay_seconds = (delay_seconds * 2).min(30);
+                }
+            }
+        }
+        if SESSION_GENERATION.load(Ordering::Acquire) == generation {
+            RECONNECTING.store(false, Ordering::Release);
+        }
+    });
 }
 static GROUP_CREATE_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
@@ -366,6 +431,8 @@ fn poll_voice_events() {
         guard.take();
         PTT_DOWN.store(false, Ordering::Relaxed);
     }
+    drop(guard);
+    if disconnected { start_reconnect(); }
 }
 
 pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
@@ -460,6 +527,8 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         drop(old_client);
         *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
         *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
+        *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
+        RECONNECTING.store(false, Ordering::Release);
         return;
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
@@ -711,6 +780,8 @@ pub fn on_packet(
             voice_client().lock().expect("SVC client state poisoned").take();
             *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
             *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
+            *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
+            RECONNECTING.store(false, Ordering::Release);
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") { send_secret_request(game); }
@@ -729,20 +800,13 @@ pub fn on_packet(
                     let fallback_host = game.remote.as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
+                    *last_server_info().lock().expect("SVC reconnect state poisoned") =
+                        Some((info.clone(), fallback_host.clone()));
                     let generation = SESSION_GENERATION.load(Ordering::Acquire);
                     let _ = thread::Builder::new().name("svchorizon-connect".into()).spawn(move || {
                         match VoiceClient::connect(info, &fallback_host) {
                             Ok(client) => {
-                                let controls = {
-                                    let state = group_state().lock().expect("SVC player state poisoned");
-                                    state.players.iter().map(|player| {
-                                        (player.id, player.volume, player.ignored)
-                                    }).collect::<Vec<_>>()
-                                };
-                                for (id, volume, ignored) in controls {
-                                    client.set_player_volume(id, volume);
-                                    client.set_player_muted(id, ignored);
-                                }
+                                apply_player_controls(&client);
                                 if SESSION_GENERATION.load(Ordering::Acquire) == generation {
                                     *voice_client().lock().expect("SVC client state poisoned") = Some(client);
                                     eprintln!("[svchorizon] Voice UDP/audio workers started.");
