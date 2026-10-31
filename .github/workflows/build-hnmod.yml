@@ -36,6 +36,15 @@ jobs:
           repository: horizon-rust/horizon
           ref: ba6344a59cb9e755b730dcf02285fc0d33b97d3c
           path: horizon
+      - name: Materialize tracked symlinks in pinned Horizon
+        run: |
+          cd horizon
+          git ls-files -s | awk '$1 == 120000 {print $4}' | while IFS= read -r link; do
+            [ -n "$link" ] || continue
+            target=$(git cat-file blob "HEAD:$link")
+            rm -f "$link"
+            cp -L "$target" "$link"
+          done
       - uses: actions/checkout@v4
         with:
           repository: horizon-rust/horizon-mixins
@@ -70,6 +79,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
