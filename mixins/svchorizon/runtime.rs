@@ -100,12 +100,6 @@ fn poll_voice_events() {
 }
 
 
-pub fn set_player_positions(positions: Vec<([u8; 16], [f64; 3])>) {
-    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-        client.set_player_positions(positions);
-    }
-}
-
 pub fn on_tick(game: &mut crate::game::Game<'_>) {
     poll_voice_events();
     if game.remote.is_none() {
@@ -116,7 +110,11 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     }
     let enabled = game.native_on("svchorizon") && game.native_playing();
     if !enabled { PTT_DOWN.store(false, Ordering::Relaxed); }
+    let positions = game.remote.as_ref()
+        .map(crate::game::remote::svchorizon_voice::player_positions)
+        .unwrap_or_default();
     if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        client.set_player_positions(positions);
         if let Some(player) = game.native_player() {
             client.set_listener(player.x, player.y, player.z, player.yaw);
         } else {
