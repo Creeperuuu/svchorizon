@@ -67,3 +67,10 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
   { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "batch" }
 ]
+
+[[injection]]
+id = "voice-player-positions"
+kind = "TAIL"
+target = "horizon_client::game::remote::Game<'_>::handle_packet"
+helper = "player_positions.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "self" }]
