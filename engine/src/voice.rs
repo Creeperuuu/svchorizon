@@ -635,15 +635,19 @@ struct PlaybackFrame {
 
 struct OutputAssembler {
     rx: Receiver<AudioFrame>,
-    active: Vec<PlaybackFrame>,
+    speakers: HashMap<[u8; 16], VecDeque<PlaybackFrame>>,
     step: f64,
     listener: Arc<Mutex<ListenerPose>>,
 }
+
 impl OutputAssembler {
+    const MAX_SPEAKERS: usize = 32;
+    const MAX_QUEUED_FRAMES_PER_SPEAKER: usize = 6;
+
     fn new(rx: Receiver<AudioFrame>, output_rate: u32, listener: Arc<Mutex<ListenerPose>>) -> Self {
         Self {
             rx,
-            active: Vec::with_capacity(8),
+            speakers: HashMap::with_capacity(8),
             step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)),
             listener,
         }
@@ -670,36 +674,58 @@ impl OutputAssembler {
         )
     }
 
-    /// Mix active speakers on the same timeline instead of serializing each
-    /// received frame into a single-speaker playback queue.
+    /// Mix one current frame per speaker. Consecutive packets from one
+    /// speaker remain sequential, while different speakers overlap.
     fn next_stereo(&mut self) -> [i16; 2] {
         for frame in self.rx.try_iter() {
-            if self.active.len() >= 32 { break; }
+            if !self.speakers.contains_key(&frame.sender)
+                && self.speakers.len() >= Self::MAX_SPEAKERS
+            {
+                continue;
+            }
             let (left_gain, right_gain) = self.gains_for(&frame);
-            self.active.push(PlaybackFrame { frame, position: 0.0, left_gain, right_gain });
+            let queue = self.speakers.entry(frame.sender).or_default();
+            if queue.len() >= Self::MAX_QUEUED_FRAMES_PER_SPEAKER {
+                continue;
+            }
+            queue.push_back(PlaybackFrame {
+                frame,
+                position: 0.0,
+                left_gain,
+                right_gain,
+            });
         }
 
         let mut left = 0.0f32;
         let mut right = 0.0f32;
         let step = self.step;
-        self.active.retain_mut(|voice| {
-            if voice.position >= FRAME_SAMPLES as f64 { return false; }
-            let index = voice.position.floor() as usize;
-            let next = (index + 1).min(FRAME_SAMPLES - 1);
-            let fraction = (voice.position - index as f64) as f32;
-            let pcm = &voice.frame.pcm;
-            let sample = pcm[index] as f32 + (pcm[next] as f32 - pcm[index] as f32) * fraction;
-            left += sample * voice.left_gain;
-            right += sample * voice.right_gain;
-            voice.position += step;
-            voice.position < FRAME_SAMPLES as f64
+        self.speakers.retain(|_, queue| {
+            if let Some(voice) = queue.front_mut() {
+                if voice.position < FRAME_SAMPLES as f64 {
+                    let index = voice.position.floor() as usize;
+                    let next = (index + 1).min(FRAME_SAMPLES - 1);
+                    let fraction = (voice.position - index as f64) as f32;
+                    let pcm = &voice.frame.pcm;
+                    let sample = pcm[index] as f32
+                        + (pcm[next] as f32 - pcm[index] as f32) * fraction;
+                    left += sample * voice.left_gain;
+                    right += sample * voice.right_gain;
+                    voice.position += step;
+                }
+                if voice.position >= FRAME_SAMPLES as f64 {
+                    queue.pop_front();
+                }
+            }
+            !queue.is_empty()
         });
+
         [
             left.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
             right.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
         ]
     }
 }
+
 fn build_output_stream(
     device: &cpal::Device,
     rx: Receiver<AudioFrame>,
