@@ -553,7 +553,10 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         if pressed && !GROUP_NEXT_DOWN.swap(true, Ordering::AcqRel) {
             let mut state = group_state().lock().expect("SVC group state poisoned");
             if !state.groups.is_empty() {
-                state.selected = (state.selected + 1) % state.groups.len();
+                for _ in 0..state.groups.len() {
+                    state.selected = (state.selected + 1) % state.groups.len();
+                    if !state.groups[state.selected].hidden { break; }
+                }
             }
             state.wrong_password = false;
         } else if !pressed {
@@ -565,7 +568,9 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
                 let state = group_state().lock().expect("SVC group state poisoned");
                 state.groups.get(state.selected).cloned()
             };
-            if let Some(group) = selected { send_join_group(game, &group); }
+            if let Some(group) = selected.filter(|group| !group.hidden) {
+                send_join_group(game, &group);
+            }
         } else if !pressed {
             GROUP_JOIN_DOWN.store(false, Ordering::Release);
         }
@@ -669,13 +674,14 @@ pub fn on_hud(
             .unwrap_or_else(|| "SVC Group: joined".to_owned())
     } else if groups.wrong_password {
         "SVC Group: password required (password entry not available yet)".to_owned()
-    } else if let Some(group) = groups.groups.get(groups.selected) {
-        let suffix = if group.has_password { " [locked]" } else { "" };
-        format!("SVC Group: {}{} ({}/{})", group.name, suffix, groups.selected + 1, groups.groups.len())
+    } else if let Some(group) = groups.groups.get(groups.selected).filter(|group| !group.hidden) {
+        let lock = if group.has_password { " [locked]" } else { "" };
+        let persistent = if group.persistent { " [persistent]" } else { "" };
+        let kind = match group.group_type { 1 => "open", 2 => "isolated", _ => "normal" };
+        format!("SVC Group: {}{}{} | {} ({}/{})", group.name, lock, persistent, kind, groups.selected + 1, groups.groups.len())
     } else {
-        "SVC Group: none | G create, N select, J join, H leave".to_owned()
+        "SVC Group: no visible groups | G create, N select, J join, H leave".to_owned()
     };
-    let _group_metadata = (groups.groups.get(groups.selected).map(|g| (g.persistent, g.hidden, g.group_type)));
     game.native_text(batch, &group_label, [8.0, 54.0], 0xFFFFFF, true);
     let player_label = if let Some(player) = groups.players.get(groups.selected_player) {
         let status = if player.ignored { "ignored" }
