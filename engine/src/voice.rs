@@ -1393,6 +1393,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
         );
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.01);
