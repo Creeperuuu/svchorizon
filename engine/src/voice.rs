@@ -1104,6 +1104,13 @@ mod tests {
     }
 
     #[test]
+    fn default_player_audio_settings_are_unmuted() {
+        let settings = PlayerAudioSettings::default();
+        assert_eq!(settings.volume, 1.0);
+        assert!(!settings.muted);
+    }
+
+    #[test]
     fn rejects_varint_overflow() {
         let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
         assert!(reader.varint().is_none());
