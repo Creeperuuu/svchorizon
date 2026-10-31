@@ -12,7 +12,7 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - AES-128-GCM encrypted UDP transport and authentication.
 - Vendored pure-Rust Opus codec.
 - CPAL microphone capture and speaker playback.
-- Push-to-talk (V), hold-to-whisper (B), and toggleable RMS voice activation (C).
+- Push-to-talk (V), hold-to-whisper (B), toggleable RMS voice activation (C), and microphone mute (M).
 - Concurrent per-speaker mixing, bounded sequence reordering, and short-burst Opus packet-loss concealment.
 - Per-player volume/mute engine controls and basic player/location spatial audio.
 - Official group create/join/leave payload codecs and group response decoders (not yet wired to in-game controls).
