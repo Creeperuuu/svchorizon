@@ -15,10 +15,11 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - Push-to-talk (V), hold-to-whisper (B), toggleable RMS voice activation (C), and microphone mute (M).
 - Concurrent per-speaker mixing, bounded sequence reordering, and short-burst Opus packet-loss concealment.
 - Per-player volume/mute and microphone-gain engine controls, plus basic player/location spatial audio.
-- Basic native group controls: create a public `Horizon` group (G), cycle discovered groups (N), join an unlocked selected group (J), and leave (H).
+- Native group controls: create a public `Horizon` group (G), cycle discovered groups (N), join an unlocked selected group (J), and leave (H).
+- Official player-state tracking with player selection (P), local ignore/mute (O), and per-player volume adjustment (Page Up/Page Down).
 - Connection and voice-activation HUD indicators.
 
-The implementation is not yet complete: password entry and group customization, player-state UI, remaining TCP payloads, device selection/settings UI, reconnect edge cases and end-to-end interoperability testing are outstanding. Per-player volume/mute setters are not yet exposed through an in-game player menu.
+The implementation is not yet complete: password entry and group customization, persistent player controls, remaining TCP payloads, device selection/settings UI, reconnect edge cases and end-to-end interoperability testing are outstanding. Player controls are currently keybind-driven rather than a full player-list screen.
 
 ## Build and validate
 
