@@ -19,7 +19,8 @@ Last updated: 2026-10-31.
 - [x] UDP worker with authentication retry, connection validation, ping echo, keepalive response and timeout handling.
 - [x] Automatic voice UDP reconnect worker with exponential backoff, session-generation checks and preserved per-player audio controls.
 - [x] Vendored pure-Rust Opus encoder/decoder, with tests for 48 kHz 20 ms VOIP frames and all upstream codec modes.
-- [x] CPAL default microphone capture and speaker playback; mono resampling to/from 48 kHz.
+- [x] CPAL microphone capture and speaker playback with local input/output device enumeration, F6/F7 device cycling, safe stream restart and default-device fallback.
+- [x] Selected microphone/speaker preferences survive voice UDP reconnects within the running game session.
 - [x] Configurable push-to-talk key registered in Horizon Options > Mods (default V).
 - [x] Native HUD connection/transmitting indicator.
 - [x] Player UUID-to-entity position mapping, location/player voice distance attenuation and stereo panning.
@@ -41,7 +42,7 @@ Last updated: 2026-10-31.
 - [ ] Password entry, custom group names/types, invites, group settings and full group UI. Basic group discovery, cycling, quick-create, public join and leave controls are now wired to the native runtime.
 - [ ] Remaining TCP custom payloads for recording-related controls and any newly introduced upstream extensions. Player-state and volume-category payloads are now decoded; the official UDP microphone/player/group/location sound variants and connection packets are implemented.
 - [ ] Full player-list screen, persistent per-player preferences, whisper-target selection, and recording controls. Player-state parsing and keybind-driven per-player ignore/volume controls are implemented.
-- [ ] Microphone/speaker device selection, persistent audio settings UI and in-game gain/voice-activation threshold sliders. Engine setters for microphone gain and RMS threshold are implemented.
+- [ ] Persistent audio settings UI and in-game gain/voice-activation threshold sliders. Microphone/speaker device selection is implemented through F6/F7 keybinds and is retained across reconnects for the current game session.
 - [ ] Server-transfer race testing, audio-device reconfiguration and real reconnect interoperability testing. Basic automatic reconnect with exponential backoff is implemented.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
 
