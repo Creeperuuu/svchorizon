@@ -421,7 +421,7 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
                 game.native_feedback(horizon_client::text::Text::literal("SVC: Group type must be normal, open, or isolated."));
                 return;
             }};
-            if name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 16) {
+            if name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 256) {
                 game.native_feedback(horizon_client::text::Text::literal("SVC: Group names must be 24 characters or fewer and passwords 256 or fewer."));
                 return;
             }
