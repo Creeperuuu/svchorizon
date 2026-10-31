@@ -1012,6 +1012,30 @@ mod tests {
     }
 
     #[test]
+    fn mixes_speakers_but_keeps_each_speakers_packets_sequential() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let listener = Arc::new(Mutex::new(ListenerPose::default()));
+        let mut output = OutputAssembler::new(rx, SAMPLE_RATE as u32, listener);
+
+        let make_frame = |sender, sample| AudioFrame {
+            sender,
+            pcm: [sample; FRAME_SAMPLES],
+            position: None,
+            max_distance: None,
+        };
+
+        tx.send(make_frame([1; 16], 1_000)).unwrap();
+        tx.send(make_frame([1; 16], 4_000)).unwrap();
+        tx.send(make_frame([2; 16], 2_000)).unwrap();
+
+        assert_eq!(output.next_stereo(), [3_000, 3_000]);
+        for _ in 1..FRAME_SAMPLES - 1 {
+            let _ = output.next_stereo();
+        }
+        assert_eq!(output.next_stereo(), [4_000, 4_000]);
+    }
+
+    #[test]
     fn rejects_varint_overflow() {
         let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
         assert!(reader.varint().is_none());
