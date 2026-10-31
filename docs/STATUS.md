@@ -45,7 +45,7 @@ Last updated: 2026-10-31.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version 20 from upstream 2.6.28+26.3. This value is release-specific, not a universal protocol version.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version 20 from upstream 2.6.27+26.3. This value is release-specific, not a universal protocol version.
 
 The vendored Opus implementation is from [restsend/opus-rs](https://github.com/restsend/opus-rs) and retains its BSD license in the engine bundle.
 
