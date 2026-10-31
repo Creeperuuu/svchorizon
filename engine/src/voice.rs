@@ -231,6 +231,9 @@ enum Command {
     Shutdown,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AudioDeviceSelection { input: Option<String>, output: Option<String> }
+
 pub struct VoiceClient {
     command_tx: SyncSender<Command>,
     event_rx: Receiver<VoiceEvent>,
@@ -246,6 +249,7 @@ pub struct VoiceClient {
     listener: Arc<Mutex<ListenerPose>>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
+    audio_devices: Arc<RwLock<AudioDeviceSelection>>,
 }
 
 impl VoiceClient {
@@ -296,11 +300,14 @@ impl VoiceClient {
         let audio_voice_activation = Arc::clone(&voice_activation);
         let audio_voice_threshold = Arc::clone(&voice_activation_threshold);
         let audio_microphone_gain = Arc::clone(&microphone_gain);
+        let audio_devices = Arc::new(RwLock::new(AudioDeviceSelection::default()));
+        let worker_audio_devices = Arc::clone(&audio_devices);
         let audio_worker = thread::Builder::new()
             .name("svchorizon-audio".into())
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
                 audio_settings, audio_voice_activation, audio_voice_threshold, audio_microphone_gain,
+                worker_audio_devices,
             ))
             .map_err(VoiceError::Io)?;
 
@@ -331,7 +338,34 @@ impl VoiceClient {
             command_tx, event_rx, running, transmitting, whispering,
             voice_activation, voice_activation_threshold, microphone_gain, connected,
             worker: Some(worker), audio_worker, listener, player_positions, player_audio_settings,
+            audio_devices,
         })
+    }
+
+    /// Enumerate available local microphone devices.
+    pub fn input_devices() -> Vec<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host().input_devices().map(|devices| devices.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+    }
+
+    /// Enumerate available local speaker devices.
+    pub fn output_devices() -> Vec<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host().output_devices().map(|devices| devices.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+    }
+
+    /// Select a local microphone by CPAL device name; None restores the OS default.
+    pub fn set_input_device(&self, name: Option<String>) {
+        if let Ok(mut selected) = self.audio_devices.write() { selected.input = name; }
+    }
+
+    /// Select a local speaker by CPAL device name; None restores the OS default.
+    pub fn set_output_device(&self, name: Option<String>) {
+        if let Ok(mut selected) = self.audio_devices.write() { selected.output = name; }
+    }
+
+    pub fn selected_audio_devices(&self) -> (Option<String>, Option<String>) {
+        self.audio_devices.read().map(|s| (s.input.clone(), s.output.clone())).unwrap_or_default()
     }
 
     /// Enable only while push-to-talk is held or voice activation is active.
@@ -725,35 +759,46 @@ fn run_audio_io(
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    selection: Arc<RwLock<AudioDeviceSelection>>,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
-    let mut streams = Vec::new();
-
-    match host.default_input_device() {
-        Some(device) => match build_input_stream(
-            &device, command_tx, transmitting, voice_activation, voice_activation_threshold,
-            microphone_gain, events.clone(),
-        ) {
-            Ok(stream) => if let Err(error) = stream.play() {
-                let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {error}")));
-            } else { streams.push(stream); },
-            Err(error) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("microphone unavailable: {error}"))); }
-        },
-        None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no default microphone device".into())); }
+    let shared_rx = Arc::new(Mutex::new(audio_rx));
+    let mut streams: Vec<cpal::Stream> = Vec::new();
+    let mut active_selection: Option<AudioDeviceSelection> = None;
+    while running.load(Ordering::Acquire) {
+        let selected = selection.read().map(|s| s.clone()).unwrap_or_default();
+        if active_selection.as_ref() != Some(&selected) {
+            streams.clear();
+            let input = match selected.input.as_deref() {
+                Some(name) => host.input_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next()),
+                None => host.default_input_device(),
+            };
+            match input {
+                Some(device) => match build_input_stream(&device, command_tx.clone(), Arc::clone(&transmitting),
+                    Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+                    Arc::clone(&microphone_gain), events.clone()) {
+                    Ok(stream) => match stream.play() { Ok(()) => streams.push(stream), Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {err}"))); } },
+                    Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("microphone unavailable: {err}"))); }
+                },
+                None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default microphone device".into())); }
+            }
+            let output = match selected.output.as_deref() {
+                Some(name) => host.output_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next()),
+                None => host.default_output_device(),
+            };
+            match output {
+                Some(device) => match build_output_stream(&device, Arc::clone(&shared_rx), events.clone(),
+                    Arc::clone(&listener), Arc::clone(&player_audio_settings)) {
+                    Ok(stream) => match stream.play() { Ok(()) => streams.push(stream), Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {err}"))); } },
+                    Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("speaker unavailable: {err}"))); }
+                },
+                None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default speaker device".into())); }
+            }
+            active_selection = Some(selected);
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-
-    match host.default_output_device() {
-        Some(device) => match build_output_stream(&device, audio_rx, events.clone(), listener, player_audio_settings) {
-            Ok(stream) => if let Err(error) = stream.play() {
-                let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {error}")));
-            } else { streams.push(stream); },
-            Err(error) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("speaker unavailable: {error}"))); }
-        },
-        None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no default speaker device".into())); }
-    }
-
-    while running.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(50)); }
     drop(streams);
 }
 
@@ -904,7 +949,7 @@ struct PlaybackFrame {
 }
 
 struct OutputAssembler {
-    rx: Receiver<AudioFrame>,
+    rx: Arc<Mutex<Receiver<AudioFrame>>>,
     speakers: HashMap<[u8; 16], VecDeque<PlaybackFrame>>,
     step: f64,
     listener: Arc<Mutex<ListenerPose>>,
@@ -916,7 +961,7 @@ impl OutputAssembler {
     const MAX_QUEUED_FRAMES_PER_SPEAKER: usize = 6;
 
     fn new(
-        rx: Receiver<AudioFrame>,
+        rx: Arc<Mutex<Receiver<AudioFrame>>>,
         output_rate: u32,
         listener: Arc<Mutex<ListenerPose>>,
         player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
@@ -954,7 +999,8 @@ impl OutputAssembler {
     /// Mix one current frame per speaker. Consecutive packets from one
     /// speaker remain sequential, while different speakers overlap.
     fn next_stereo(&mut self) -> [i16; 2] {
-        for frame in self.rx.try_iter() {
+        let incoming = self.rx.lock().map(|rx| rx.try_iter().collect::<Vec<_>>()).unwrap_or_default();
+        for frame in incoming {
             if !self.speakers.contains_key(&frame.sender)
                 && self.speakers.len() >= Self::MAX_SPEAKERS
             {
@@ -1018,7 +1064,7 @@ impl OutputAssembler {
 
 fn build_output_stream(
     device: &cpal::Device,
-    rx: Receiver<AudioFrame>,
+    rx: Arc<Mutex<Receiver<AudioFrame>>>,
     events: SyncSender<VoiceEvent>,
     listener: Arc<Mutex<ListenerPose>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
