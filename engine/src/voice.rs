@@ -133,7 +133,8 @@ impl AudioJitterBuffer {
         if packet.sequence < expected {
             return Vec::new();
         }
-        if !state.pending.contains_key(&packet.sequence)
+        if packet.sequence != expected
+            && !state.pending.contains_key(&packet.sequence)
             && state.pending.len() >= Self::MAX_PENDING_PER_SENDER
         {
             return Vec::new();
