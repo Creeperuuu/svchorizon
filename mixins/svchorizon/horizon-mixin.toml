@@ -21,3 +21,8 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "packet", ty = "&horizon_protocol::packets::play::Clientbound", value = "&packet" }
 ]
+
+[[crate]]
+id = "engine"
+path = "engine"
+dependent = "horizon-client"
