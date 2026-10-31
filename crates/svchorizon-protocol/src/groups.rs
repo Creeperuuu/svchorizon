@@ -81,7 +81,7 @@ pub fn encode_join_group(
     group_id: Uuid,
     password: Option<&str>,
 ) -> Result<Vec<u8>, GroupPayloadError> {
-    if password.is_some_and(|value| value.chars().count() > 512) {
+    if password.is_some_and(|value| value.chars().count() > 256) {
         return Err(GroupPayloadError::PasswordTooLong);
     }
     let mut w = Writer::default();
@@ -205,6 +205,16 @@ mod tests {
         let mut remove = Writer::default();
         remove.uuid(id);
         assert_eq!(decode_remove_group(&remove.data).unwrap(), id);
+    }
+
+    #[test]
+    fn enforces_upstream_join_password_limit() {
+        let id = Uuid::nil();
+        assert!(encode_join_group(id, Some(&"p".repeat(256))).is_ok());
+        assert!(matches!(
+            encode_join_group(id, Some(&"p".repeat(257))),
+            Err(GroupPayloadError::PasswordTooLong)
+        ));
     }
 
     #[test]
