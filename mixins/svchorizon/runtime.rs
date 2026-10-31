@@ -9,6 +9,7 @@ static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 static PTT_DOWN: AtomicBool = AtomicBool::new(false);
 static WHISPER_DOWN: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVATION: AtomicBool = AtomicBool::new(false);
+static VOICE_ACTIVATION_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -198,11 +199,15 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
             client.set_whispering(whispering);
         }
-    } else if pressed && key == game.native_mod_key("svchorizon", "voice_activation", "key.keyboard.c") {
-        let enabled = !VOICE_ACTIVATION.load(Ordering::Relaxed);
-        VOICE_ACTIVATION.store(enabled, Ordering::Relaxed);
-        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-            client.set_voice_activation(enabled, 0.025);
+    } else if key == game.native_mod_key("svchorizon", "voice_activation", "key.keyboard.c") {
+        if pressed && !VOICE_ACTIVATION_KEY_DOWN.swap(true, Ordering::AcqRel) {
+            let enabled = !VOICE_ACTIVATION.load(Ordering::Relaxed);
+            VOICE_ACTIVATION.store(enabled, Ordering::Relaxed);
+            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                client.set_voice_activation(enabled, 0.025);
+            }
+        } else if !pressed {
+            VOICE_ACTIVATION_KEY_DOWN.store(false, Ordering::Release);
         }
     }
 }
