@@ -268,6 +268,7 @@ fn preserve_player_controls(player: &mut NativePlayer, old: &[NativePlayer]) {
 fn on_player_payload(channel: &str, bytes: &[u8]) {
     let local_id = *local_player_uuid().lock().expect("SVC local player state poisoned");
     let mut state = group_state().lock().expect("SVC player state poisoned");
+    let mut reset_players = Vec::new();
     match channel {
         "voicechat:states" => {
             let mut cursor = Cursor::new(bytes);
@@ -284,6 +285,10 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
                 }
             }
             if !cursor.done() { return; }
+            reset_players = old.iter()
+                .filter(|previous| !players.iter().any(|player| player.id == previous.id))
+                .map(|previous| previous.id)
+                .collect();
             state.players = players;
             if state.players.is_empty() { state.selected_player = 0; }
             else { state.selected_player %= state.players.len(); }
@@ -319,6 +324,10 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
     let controls = state.players.iter().map(|p| (p.id, p.volume, p.ignored)).collect::<Vec<_>>();
     drop(state);
     if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        for id in reset_players {
+            client.set_player_volume(id, 1.0);
+            client.set_player_muted(id, false);
+        }
         for (id, volume, ignored) in controls {
             client.set_player_volume(id, volume);
             client.set_player_muted(id, ignored);
@@ -444,9 +453,19 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     REMOTE_ACTIVE.store(true, Ordering::Release);
 
     let playing = game.native_playing();
-    if !playing {
+    if !playing || !game.native_window() {
         PTT_DOWN.store(false, Ordering::Relaxed);
         WHISPER_DOWN.store(false, Ordering::Relaxed);
+        VOICE_ACTIVATION_KEY_DOWN.store(false, Ordering::Relaxed);
+        SELF_MUTE_KEY_DOWN.store(false, Ordering::Relaxed);
+        GROUP_CREATE_DOWN.store(false, Ordering::Relaxed);
+        GROUP_NEXT_DOWN.store(false, Ordering::Relaxed);
+        GROUP_JOIN_DOWN.store(false, Ordering::Relaxed);
+        GROUP_LEAVE_DOWN.store(false, Ordering::Relaxed);
+        PLAYER_NEXT_DOWN.store(false, Ordering::Relaxed);
+        PLAYER_IGNORE_DOWN.store(false, Ordering::Relaxed);
+        PLAYER_VOL_DOWN.store(false, Ordering::Relaxed);
+        PLAYER_VOL_UP.store(false, Ordering::Relaxed);
     }
 
     let player = game.native_player();
@@ -471,7 +490,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
 
 /// Push-to-talk is a hold binding. Releasing it always stops transmission.
 pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
-    if !game.native_on("svchorizon") || !game.native_window() {
+    if !game.native_on("svchorizon") || (!game.native_window() && pressed) {
         return;
     }
     let ptt_binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
