@@ -68,9 +68,8 @@ bindings = [
   { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "batch" }
 ]
 
-[[injection]]
-id = "voice-player-positions"
-kind = "TAIL"
-target = "horizon_client::game::remote::Game<'_>::handle_packet"
-helper = "player_positions.rs"
-bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "self" }]
+[[module]]
+id = "remote-positions"
+file = "crates/horizon-client/src/game/remote.rs"
+name = "svchorizon_voice"
+source = "remote.rs"
