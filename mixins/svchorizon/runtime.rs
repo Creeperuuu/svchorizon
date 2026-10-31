@@ -136,11 +136,15 @@ fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
     })
 }
 
+fn client_state_payload(muted: bool, disabled: bool) -> Vec<u8> {
+    vec![u8::from(muted), u8::from(disabled)]
+}
+
 fn send_client_state(game: &mut crate::game::Game<'_>, muted: bool, disabled: bool) {
     use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
     game.send(Serverbound::CustomPayload(CustomPayload {
         channel: "voicechat:client_state".to_owned(),
-        data: vec![u8::from(muted), u8::from(disabled)],
+        data: client_state_payload(muted, disabled),
     }));
 }
 
@@ -764,6 +768,13 @@ pub fn on_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_official_client_state_flags() {
+        assert_eq!(client_state_payload(false, false), vec![0, 0]);
+        assert_eq!(client_state_payload(true, false), vec![1, 0]);
+        assert_eq!(client_state_payload(false, true), vec![0, 1]);
+    }
 
     #[test]
     fn decodes_official_player_state_flags_and_optional_group() {
