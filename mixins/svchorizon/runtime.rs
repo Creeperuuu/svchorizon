@@ -48,7 +48,7 @@ fn start_reconnect() {
         return;
     };
     let generation = SESSION_GENERATION.load(Ordering::Acquire);
-    let _ = thread::Builder::new().name("svchorizon-reconnect".into()).spawn(move || {
+    let spawned = thread::Builder::new().name("svchorizon-reconnect".into()).spawn(move || {
         let mut delay_seconds = 1u64;
         while REMOTE_ACTIVE.load(Ordering::Acquire)
             && SESSION_GENERATION.load(Ordering::Acquire) == generation
@@ -83,6 +83,9 @@ fn start_reconnect() {
             RECONNECTING.store(false, Ordering::Release);
         }
     });
+    if spawned.is_err() {
+        RECONNECTING.store(false, Ordering::Release);
+    }
 }
 static GROUP_CREATE_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
