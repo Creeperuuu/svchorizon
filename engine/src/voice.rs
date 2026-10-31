@@ -73,6 +73,7 @@ struct ListenerPose {
 }
 
 struct AudioFrame {
+    sender: [u8; 16],
     pcm: [i16; FRAME_SAMPLES],
     position: Option<[f64; 3]>,
     max_distance: Option<f32>,
