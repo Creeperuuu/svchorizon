@@ -56,3 +56,14 @@ helper = "native_mods.rs"
 bindings = [
   { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "mods" }
 ]
+
+[[injection]]
+id = "voice-hud"
+hook = "hud"
+hook_version = 1
+kind = "HEAD"
+helper = "native_hud.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "batch" }
+]
