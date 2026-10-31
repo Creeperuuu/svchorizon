@@ -14,10 +14,10 @@ use uuid::Uuid;
 pub const REQUEST_SECRET_CHANNEL: &str = "voicechat:request_secret";
 pub const SECRET_CHANNEL: &str = "voicechat:secret";
 
-/// Current upstream compatibility number for Simple Voice Chat 2.6.28 / MC 26.3.
-/// Keep this tied to the tested upstream release; do not silently negotiate a
-/// different value when the server reports a mismatch.
-pub const COMPATIBILITY_VERSION: i32 = 20;
+/// Current upstream compatibility number for Simple Voice Chat 2.6.27+ / MC 26.3
+/// (upstream gradle.properties: voicechat_compatibility_version=21). The plugin
+/// requires an exact match before it sends the secret payload.
+pub const COMPATIBILITY_VERSION: i32 = 21;
 pub const MAX_VOICE_HOST_CHARS: usize = 32_767;
 
 #[derive(Debug, Error)]
@@ -63,6 +63,8 @@ impl TryFrom<u8> for VoiceCodec {
 #[derive(Clone)]
 pub struct VoiceServerInfo {
     pub secret: VoiceSecret,
+    /// The connection UUID that keys every UDP datagram this client sends.
+    pub connection_id: Uuid,
     pub server_port: u16,
     pub player_uuid: Uuid,
     pub codec: VoiceCodec,
@@ -78,6 +80,7 @@ impl std::fmt::Debug for VoiceServerInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VoiceServerInfo")
             .field("secret", &"[REDACTED]")
+            .field("connection_id", &self.connection_id)
             .field("server_port", &self.server_port)
             .field("player_uuid", &self.player_uuid)
             .field("codec", &self.codec)
@@ -96,6 +99,7 @@ impl VoiceServerInfo {
     pub fn decode(payload: &[u8]) -> Result<Self, HandshakeError> {
         let mut r = Reader::new(payload);
         let secret = VoiceSecret::from_bytes(r.take(16)?.try_into().expect("length checked"));
+        let connection_id = r.uuid()?;
         let server_port = r.i32()?;
         if !(1..=u16::MAX as i32).contains(&server_port) {
             return Err(HandshakeError::InvalidPort(server_port));
@@ -119,6 +123,7 @@ impl VoiceServerInfo {
         }
         Ok(Self {
             secret,
+            connection_id,
             server_port: server_port as u16,
             player_uuid,
             codec,
@@ -217,6 +222,7 @@ mod tests {
     fn secret_payload(host: &str) -> Vec<u8> {
         let mut w = Writer::default();
         w.raw(&[0x42; 16]);
+        w.uuid(Uuid::parse_str("99aa77bb-1111-2222-3333-445566778899").unwrap());
         w.i32(24454);
         w.uuid(Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap());
         w.u8(VoiceCodec::Voip as u8);
@@ -231,14 +237,15 @@ mod tests {
 
     #[test]
     fn request_secret_is_one_big_endian_i32() {
-        let payload = encode_request_secret(20);
-        assert_eq!(payload, [0, 0, 0, 20]);
-        assert_eq!(decode_request_secret(&payload).unwrap(), 20);
+        let payload = encode_request_secret(COMPATIBILITY_VERSION);
+        assert_eq!(payload, [0, 0, 0, 21]);
+        assert_eq!(decode_request_secret(&payload).unwrap(), 21);
     }
 
     #[test]
     fn decodes_secret_packet_fields_in_upstream_order() {
         let packet = VoiceServerInfo::decode(&secret_payload("")).unwrap();
+        assert_eq!(packet.connection_id.to_string(), "99aa77bb-1111-2222-3333-445566778899");
         assert_eq!(packet.server_port, 24454);
         assert_eq!(packet.player_uuid.to_string(), "00112233-4455-6677-8899-aabbccddeeff");
         assert_eq!(packet.codec, VoiceCodec::Voip);
@@ -264,8 +271,9 @@ mod tests {
     #[test]
     fn rejects_invalid_codec_and_extra_data() {
         let mut payload = secret_payload("");
-        payload[36] = 99;
+        // secret(16) + connection UUID(16) + port(4) + player UUID(16): the codec byte.
+        payload[52] = 99;
         assert!(matches!(VoiceServerInfo::decode(&payload), Err(HandshakeError::InvalidCodec(99))));
-        assert!(matches!(decode_request_secret(&[0, 0, 0, 20, 1]), Err(HandshakeError::TrailingBytes)));
+        assert!(matches!(decode_request_secret(&[0, 0, 0, 21, 1]), Err(HandshakeError::TrailingBytes)));
     }
 }

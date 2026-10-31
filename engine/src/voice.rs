@@ -43,6 +43,10 @@ const CONNECTION_CHECK_ACK: u8 = 0x0a;
 #[derive(Clone, Debug)]
 pub struct VoiceServerInfo {
     pub secret: [u8; 16],
+    /// The connection UUID the server assigned this client in the secret
+    /// payload. Every client datagram carries it before the encrypted body
+    /// (ClientNetworkMessage.writeClient), so the server can pick the key.
+    pub connection_id: [u8; 16],
     pub port: u16,
     pub player: [u8; 16],
     /// 0 = VOIP, 1 = AUDIO, 2 = RESTRICTED_LOWDELAY.
@@ -329,7 +333,7 @@ impl VoiceClient {
             Ok(worker) => worker,
             Err(error) => {
                 running.store(false, Ordering::Release);
-                if let Some(audio) = audio_worker { let _ = audio.join(); }
+                let _ = audio_worker.join();
                 return Err(VoiceError::Io(error));
             }
         };
@@ -337,7 +341,7 @@ impl VoiceClient {
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
             voice_activation, voice_activation_threshold, microphone_gain, connected,
-            worker: Some(worker), audio_worker, listener, player_positions, player_audio_settings,
+            worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
             audio_devices,
         })
     }
@@ -627,8 +631,7 @@ fn run_worker(
         if !running.load(Ordering::Acquire) { break; }
 
         if !authenticated && last_auth.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
-            let packet = Packet::Authenticate { player: info.player, secret: info.secret };
-            let _ = send_packet(&socket, &info, &packet);
+            let _ = send_packet(&socket, &info, &Packet::Authenticate);
             last_auth = Some(Instant::now());
         } else if authenticated && !validated
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
@@ -989,12 +992,12 @@ impl OutputAssembler {
         let attenuation = if max_distance > 0.0 {
             ((max_distance - distance) / max_distance).clamp(0.0, 1.0) as f32
         } else { 1.0 };
-        let pan = if distance > 0.001 {
-            ((dx * listener.yaw.cos() - dz * listener.yaw.sin()) / distance).clamp(-1.0, 1.0)
+        let pan: f32 = if distance > 0.001 {
+            ((dx * listener.yaw.cos() - dz * listener.yaw.sin()) / distance).clamp(-1.0, 1.0) as f32
         } else { 0.0 };
         (
-            attenuation * (1.0 - pan).clamp(0.0, 1.0),
-            attenuation * (1.0 + pan).clamp(0.0, 1.0),
+            attenuation * (1.0f32 - pan).clamp(0.0, 1.0),
+            attenuation * (1.0f32 + pan).clamp(0.0, 1.0),
         )
     }
 
@@ -1141,7 +1144,9 @@ fn build_output_stream(
 #[derive(Debug)]
 enum Packet {
     Mic { opus: Vec<u8>, sequence: i64, whispering: bool },
-    Authenticate { player: [u8; 16], secret: [u8; 16] },
+    /// Upstream AuthenticatePacket has no fields: the secret and connection
+    /// identity travel in the datagram envelope itself.
+    Authenticate,
     ConnectionCheck,
     KeepAlive,
     AuthenticateAck,
@@ -1175,7 +1180,9 @@ fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> R
         .map_err(|_| VoiceError::InvalidServerInfo("AES-GCM encryption failed"))?;
     let mut datagram = Vec::with_capacity(1 + 16 + 3 + NONCE_BYTES + encrypted.len());
     datagram.push(MAGIC);
-    datagram.extend_from_slice(&info.player);
+    // ClientNetworkMessage.writeClient writes the connection UUID, not the
+    // player's profile UUID: the server resolves the key by connection.
+    datagram.extend_from_slice(&info.connection_id);
     let mut body = Vec::with_capacity(NONCE_BYTES + encrypted.len());
     body.extend_from_slice(&nonce);
     body.extend_from_slice(&encrypted);
@@ -1204,9 +1211,7 @@ fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
             out.push(MIC); write_byte_array(&mut out, opus); out.extend_from_slice(&sequence.to_be_bytes());
             out.push(u8::from(*whispering));
         }
-        Packet::Authenticate { player, secret } => {
-            out.push(AUTHENTICATE); out.extend_from_slice(player); out.extend_from_slice(secret);
-        }
+        Packet::Authenticate => out.push(AUTHENTICATE),
         Packet::ConnectionCheck => out.push(CONNECTION_CHECK),
         Packet::KeepAlive => out.push(KEEP_ALIVE),
         Packet::Ping { id, timestamp } => {
@@ -1221,7 +1226,7 @@ fn decode_packet(bytes: &[u8]) -> Option<Packet> {
     let mut r = Reader::new(bytes);
     let packet = match r.u8()? {
         MIC => Packet::Mic { opus: r.byte_array(MAX_OPUS)?, sequence: r.i64()?, whispering: r.boolean()? },
-        AUTHENTICATE => Packet::Authenticate { player: r.array16()?, secret: r.array16()? },
+        AUTHENTICATE => Packet::Authenticate,
         CONNECTION_CHECK => Packet::ConnectionCheck,
         KEEP_ALIVE => Packet::KeepAlive,
         AUTHENTICATE_ACK => Packet::AuthenticateAck,
@@ -1345,20 +1350,17 @@ mod tests {
     }
 
     #[test]
-    fn outbound_auth_packet_matches_official_field_order() {
-        let player = [0x11; 16];
-        let secret = [0x22; 16];
-        let encoded = encode_packet(&Packet::Authenticate { player, secret }).unwrap();
-        assert_eq!(encoded[0], AUTHENTICATE);
-        assert_eq!(&encoded[1..17], &player);
-        assert_eq!(&encoded[17..33], &secret);
+    fn outbound_auth_packet_is_the_single_type_byte() {
+        // Upstream AuthenticatePacket.fromBytes/toBytes carry no fields.
+        let encoded = encode_packet(&Packet::Authenticate).unwrap();
+        assert_eq!(encoded, [AUTHENTICATE]);
     }
 
     #[test]
     fn mixes_speakers_but_keeps_each_speakers_packets_sequential() {
         let (tx, rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
-        let mut output = OutputAssembler::new(rx, SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())));
+        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())));
 
         let make_frame = |sender, sample| AudioFrame {
             sender,
@@ -1372,7 +1374,8 @@ mod tests {
         tx.send(make_frame([2; 16], 2_000)).unwrap();
 
         assert_eq!(output.next_stereo(), [3_000, 3_000]);
-        for _ in 1..FRAME_SAMPLES - 1 {
+        // Frame one spans exactly FRAME_SAMPLES outputs; drain the rest of it.
+        for _ in 1..FRAME_SAMPLES {
             let _ = output.next_stereo();
         }
         assert_eq!(output.next_stereo(), [4_000, 4_000]);

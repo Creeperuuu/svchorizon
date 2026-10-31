@@ -1,9 +1,46 @@
 use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, thread};
 use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
 
-const SVC_COMPATIBILITY_VERSION: i32 = 20;
+const SVC_COMPATIBILITY_VERSION: i32 = 21;
 const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
+const REGISTER: &str = "minecraft:register";
+/// Every custom-payload channel the official plugin registers (NetManager.init).
+/// Bukkit/Paper deliver a payload only for channels the client registered, so
+/// this must go out before the secret request on every server join.
+const REGISTERED_CHANNELS: &[&str] = &[
+    "voicechat:request_secret",
+    "voicechat:secret",
+    "voicechat:client_state",
+    "voicechat:state",
+    "voicechat:states",
+    "voicechat:remove_state",
+    "voicechat:create_group",
+    "voicechat:set_group",
+    "voicechat:leave_group",
+    "voicechat:joined_group",
+    "voicechat:add_group",
+    "voicechat:remove_group",
+    "voicechat:add_category",
+    "voicechat:remove_category",
+];
+
+fn register_channels_payload() -> Vec<u8> {
+    let mut data = Vec::new();
+    for (index, channel) in REGISTERED_CHANNELS.iter().enumerate() {
+        if index > 0 { data.push(0); }
+        data.extend_from_slice(channel.as_bytes());
+    }
+    data
+}
+
+fn send_channel_registration(game: &mut crate::game::Game<'_>) {
+    use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
+    game.send(Serverbound::CustomPayload(CustomPayload {
+        channel: REGISTER.to_owned(),
+        data: register_channels_payload(),
+    }));
+}
 
 static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 static PTT_DOWN: AtomicBool = AtomicBool::new(false);
@@ -216,6 +253,9 @@ impl<'a> Cursor<'a> {
 fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
     let mut c = Cursor::new(bytes);
     let secret: [u8; 16] = c.take(16)?.try_into().ok()?;
+    // SecretPacket.toBytes order: secret, connection UUID, port, player, ... The
+    // connection UUID keys every UDP datagram this client sends.
+    let connection_id: [u8; 16] = c.take(16)?.try_into().ok()?;
     let port = c.i32()?;
     let port = u16::try_from(port).ok().filter(|p| *p != 0)?;
     let player = c.take(16)?.try_into().ok()?;
@@ -230,8 +270,17 @@ fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
         return None;
     }
     Some(VoiceServerInfo {
-        secret, port, player, codec, mtu, distance, keep_alive_ms,
-        groups, host, allow_recording,
+        secret,
+        connection_id,
+        port,
+        player,
+        codec,
+        mtu,
+        distance,
+        keep_alive_ms,
+        groups,
+        host,
+        allow_recording,
     })
 }
 
@@ -314,7 +363,7 @@ fn send_join_group_password(
     password: Option<&str>,
 ) {
     if group.has_password && password.is_none() {
-        game.native_feedback(horizon_client::text::Text::literal("SVC: This group requires a password. Use /svchorizon group join <password>."));
+        game.native_chat("SVC: This group requires a password. Use /svchorizon group join <password>.");
         return;
     }
     send_group_payload(game, "voicechat:set_group", join_group_payload(group.id, password));
@@ -363,23 +412,17 @@ fn command_words(input: &str) -> Option<Vec<String>> {
     (words.len() <= 8).then_some(words)
 }
 
-pub fn on_commands(game: &crate::game::Game<'_>, commands: &mut Vec<&'static str>) {
-    if game.native_on("svchorizon") && !commands.contains(&"svchorizon") {
-        commands.push("svchorizon");
-    }
-}
-
 pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
     if !game.native_on("svchorizon") { return; }
     let Some(words) = command_words(command) else { return; };
     if words.first().map(String::as_str) != Some("svchorizon") { return; }
     *ran = true;
     if !game.native_playing() || !GROUPS_ENABLED.load(Ordering::Acquire) {
-        game.native_feedback(horizon_client::text::Text::literal("SVC: Join a server with Simple Voice Chat enabled first."));
+        game.native_chat("SVC: Join a server with Simple Voice Chat enabled first.");
         return;
     }
     if words.get(1).map(String::as_str) != Some("group") {
-        game.native_feedback(horizon_client::text::Text::literal("Usage: /svchorizon group <list|join|create|leave>"));
+        game.native_chat("Usage: /svchorizon group <list|join|create|leave>");
         return;
     }
     match words.get(2).map(String::as_str) {
@@ -391,7 +434,7 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
             let message = if names.is_empty() { "SVC: No visible groups.".to_owned() }
                 else { format!("SVC groups: {}", names.join(", ")) };
             drop(state);
-            game.native_feedback(horizon_client::text::Text::literal(message));
+            game.native_chat(&message);
         }
         Some("join") => {
             let selected = {
@@ -402,36 +445,39 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
                 Some(group) => {
                     let password = words.get(3).map(String::as_str);
                     if password.is_some_and(|p| p.chars().count() > 256) {
-                        game.native_feedback(horizon_client::text::Text::literal("SVC: Password must be 256 characters or fewer."));
+                        game.native_chat("SVC: Password must be 256 characters or fewer.");
                     } else {
                         send_join_group_password(game, &group, password);
                     }
                 }
-                None => game.native_feedback(horizon_client::text::Text::literal("SVC: Select a visible group first with N.")),
+                None => game.native_chat("SVC: Select a visible group first with N."),
             }
         }
         Some("create") => {
             let Some(name) = words.get(3).filter(|name| !name.is_empty()) else {
-                game.native_feedback(horizon_client::text::Text::literal("Usage: /svchorizon group create <name> [password] [normal|open|isolated]"));
+                game.native_chat("Usage: /svchorizon group create <name> [password] [normal|open|isolated]");
                 return;
             };
             let password = words.get(4).filter(|p| p.as_str() != "-").map(String::as_str);
             let kind = words.get(5).map(String::as_str).unwrap_or("normal");
             let group_type = match kind { "normal" => 0, "open" => 1, "isolated" => 2, _ => {
-                game.native_feedback(horizon_client::text::Text::literal("SVC: Group type must be normal, open, or isolated."));
+                game.native_chat("SVC: Group type must be normal, open, or isolated.");
                 return;
             }};
             let invalid_name = name.chars().next().is_none_or(|c| c.is_control() || c.is_whitespace())
                 || name.chars().any(|c| c.is_control());
-            if invalid_name || name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 256) {
-                game.native_feedback(horizon_client::text::Text::literal("SVC: Group names must start with a visible character, contain no control characters, and be 24 characters or fewer; passwords may be up to 256 characters."));
+            // Upstream's CreateGroupPacket writes both name and password with
+            // MAX_GROUP_NAME_LENGTH (24); JoinGroupPacket allows 256. A create
+            // password above 24 would abort the official client's write.
+            if invalid_name || name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 24) {
+                game.native_chat("SVC: Group names must start with a visible character, contain no control characters, and be 24 characters or fewer; create passwords may be up to 24 characters (join passwords up to 256).");
                 return;
             }
             send_create_group_custom(game, name, password, group_type);
-            game.native_feedback(horizon_client::text::Text::literal(format!("SVC: Creating group {name}.")));
+            game.native_chat(&format!("SVC: Creating group {name}."));
         }
         Some("leave") => send_leave_group(game),
-        _ => game.native_feedback(horizon_client::text::Text::literal("Usage: /svchorizon group <list|join|create|leave>")),
+        _ => game.native_chat("Usage: /svchorizon group <list|join|create|leave>"),
     }
 }
 
@@ -1074,7 +1120,11 @@ pub fn on_packet(
             GROUPS_ENABLED.store(false, Ordering::Release);
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
-            if game.native_on("svchorizon") { send_secret_request(game); }
+            if game.native_on("svchorizon") {
+                // Bukkit/Paper only deliver payloads the client registered.
+                send_channel_registration(game);
+                send_secret_request(game);
+            }
         }
         Clientbound::CustomPayload(payload) if payload.channel == SECRET && game.native_on("svchorizon") => {
             match decode_secret(&payload.data) {
@@ -1228,8 +1278,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_secret_payload_in_upstream_field_order() {
+    fn registers_every_official_channel_before_requesting_the_secret() {
+        let data = register_channels_payload();
+        let channels: Vec<&str> = data.split(|byte| *byte == 0)
+            .map(|channel| std::str::from_utf8(channel).unwrap()).collect();
+        assert_eq!(channels.first().copied(), Some("voicechat:request_secret"));
+        assert!(channels.contains(&"voicechat:secret"));
+        assert!(channels.contains(&"voicechat:client_state"));
+        assert!(channels.contains(&"voicechat:states"));
+        assert!(channels.contains(&"voicechat:remove_state"));
+        assert!(channels.contains(&"voicechat:joined_group"));
+        assert!(channels.contains(&"voicechat:add_category"));
+        assert_eq!(channels.len(), REGISTERED_CHANNELS.len());
+    }
+
+    #[test]
+    fn decodes_secret_payload_with_connection_id_in_upstream_field_order() {
         let mut bytes = vec![0x42; 16];
+        bytes.extend_from_slice(&[0x77; 16]);
         bytes.extend_from_slice(&24454i32.to_be_bytes());
         bytes.extend_from_slice(&[0x11; 16]);
         bytes.push(0);
@@ -1237,10 +1303,11 @@ mod tests {
         bytes.extend_from_slice(&48.0f64.to_bits().to_be_bytes());
         bytes.extend_from_slice(&1000i32.to_be_bytes());
         bytes.push(1);
-        bytes.push(19);
+        bytes.push(b"voice.example.test".len() as u8);
         bytes.extend_from_slice(b"voice.example.test");
         bytes.push(0);
         let info = decode_secret(&bytes).unwrap();
+        assert_eq!(info.connection_id, [0x77; 16]);
         assert_eq!(info.port, 24454);
         assert_eq!(info.mtu, 1200);
         assert_eq!(info.distance, 48.0);
@@ -1252,6 +1319,7 @@ mod tests {
     fn rejects_truncated_or_trailing_payloads() {
         assert!(decode_secret(&[0; 8]).is_none());
         let mut bytes = vec![0x42; 16];
+        bytes.extend_from_slice(&[0x77; 16]);
         bytes.extend_from_slice(&24454i32.to_be_bytes());
         bytes.extend_from_slice(&[0x11; 16]);
         bytes.push(0);

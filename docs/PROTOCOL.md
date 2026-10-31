@@ -4,31 +4,37 @@ These notes track the implementation against the official `henkelmax/simple-voic
 
 ## TCP initialization
 
-The native Horizon hook sends:
+Bukkit/Paper deliver a custom payload only for channels the client registered, so on every play
+`Login` the mod first sends the vanilla channel-registration payload and then the secret request:
 
-- Channel: `voicechat:request_secret`
-- Body: 32-bit big-endian compatibility version `20` (upstream Simple Voice Chat 2.6.27+26.3).
+1. Channel: `minecraft:register`, body: every `voicechat:*` channel the official plugin
+   registers (NetManager.init), NUL-separated, mirroring the official client.
+2. Channel: `voicechat:request_secret`, body: 32-bit big-endian compatibility version `21`
+   (upstream gradle.properties `voicechat_compatibility_version=21` for 2.6.27+ / MC 26.3).
+   The plugin compares the client version exactly and sends an incompatibility notice instead
+   of a secret on any mismatch.
 
-The server replies on `voicechat:secret` with:
+The server replies on `voicechat:secret` with (SecretPacket.toBytes order):
 
 1. 16-byte AES secret
-2. UDP port (32-bit integer)
-3. Player UUID (16 bytes)
-4. Codec ordinal (byte)
-5. MTU (32-bit integer)
-6. Voice distance (64-bit double)
-7. Keepalive interval (32-bit integer, milliseconds)
-8. Groups-enabled boolean
-9. Voice host (Minecraft VarInt-length-prefixed UTF-8)
-10. Allow-recording boolean
+2. Connection UUID (16 bytes): keys every UDP datagram this client sends
+3. UDP port (32-bit integer)
+4. Player UUID (16 bytes)
+5. Codec ordinal (byte)
+6. MTU (32-bit integer)
+7. Voice distance (64-bit double)
+8. Keepalive interval (32-bit integer, milliseconds)
+9. Groups-enabled boolean
+10. Voice host (Minecraft VarInt-length-prefixed UTF-8)
+11. Allow-recording boolean
 
-The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, truncated values and trailing bytes.
+The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, truncated values and trailing bytes. The voice host resolves like the official client: empty means the game server's host and port, a bare number means a port override, otherwise `host[:port]` (bracketed IPv6 supported).
 
 ## Implemented TCP custom payloads
 
 | Channel | Direction | Current behavior |
 |---|---|---|
-| `voicechat:request_secret` | Client → server | Requests the voice session using compatibility version 20 |
+| `voicechat:request_secret` | Client → server | Requests the voice session using compatibility version 21 |
 | `voicechat:secret` | Server → client | Decodes session secret and UDP metadata; starts voice workers |
 | `voicechat:client_state` | Client → server | Synchronizes local microphone mute/disabled flags |
 | `voicechat:states` | Server → client | Parses bounded player-state snapshots |
@@ -47,20 +53,20 @@ Category metadata is currently surfaced as a compact HUD summary; category-speci
 
 ## UDP envelope and encryption
 
-Client to server:
+Client to server (ClientNetworkMessage.writeClient):
 
 1. Magic byte `0xff`
-2. Player UUID (16 bytes)
+2. Connection UUID (16 bytes) — the UUID from the secret payload, NOT the player's profile UUID
 3. Minecraft VarInt-length-prefixed encrypted NetworkMessage
 
-Server to client:
+Server to client (ClientNetworkMessage.readPacketClient):
 
 1. Magic byte `0xff`
 2. Minecraft VarInt-length-prefixed encrypted NetworkMessage
 
 The encrypted message is a packet ID followed by its packet body. AES-128-GCM uses the 16-byte secret, a fresh random 12-byte IV prepended to ciphertext, and the 16-byte authentication tag. No additional AAD is used by upstream.
 
-The client repeats AuthenticatePacket until AuthenticateAckPacket, then repeats ConnectionCheckPacket until ConnectionCheckAckPacket. It responds to PingPacket and KeepAlivePacket and enforces the server's keepalive timeout. Automatic reconnect uses exponential backoff while the Minecraft play session remains active.
+Upstream's AuthenticatePacket carries no fields: its body is exactly the single packet ID byte. The client repeats AuthenticatePacket until AuthenticateAckPacket, then repeats ConnectionCheckPacket until ConnectionCheckAckPacket. It responds to PingPacket and KeepAlivePacket and enforces the server's keepalive timeout. Automatic reconnect uses exponential backoff while the Minecraft play session remains active.
 
 ## UDP packet coverage
 

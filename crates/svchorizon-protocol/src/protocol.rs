@@ -30,7 +30,7 @@ pub enum ProtocolError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoicePacket {
     Mic { opus: Vec<u8>, sequence: i64, whispering: bool },
-    Authenticate { player_id: Uuid, secret: [u8; 16] },
+    Authenticate,
     ConnectionCheck,
     KeepAlive,
     AuthenticateAck,
@@ -62,9 +62,7 @@ impl VoicePacket {
                 if opus.len() > MAX_OPUS_PAYLOAD { return Err(ProtocolError::InvalidPacket); }
                 w.u8(MIC); w.byte_array(opus); w.i64(*sequence); w.bool(*whispering);
             }
-            Self::Authenticate { player_id, secret } => {
-                w.u8(AUTHENTICATE); w.uuid(*player_id); w.raw(secret);
-            }
+            Self::Authenticate => w.u8(AUTHENTICATE),
             Self::ConnectionCheck => w.u8(CONNECTION_CHECK),
             Self::KeepAlive => w.u8(KEEP_ALIVE),
             Self::AuthenticateAck => w.u8(AUTHENTICATE_ACK),
@@ -97,7 +95,7 @@ impl VoicePacket {
         let mut r = Reader::new(bytes);
         let packet = match r.u8()? {
             MIC => Self::Mic { opus: r.byte_array(MAX_OPUS_PAYLOAD)?, sequence: r.i64()?, whispering: r.bool()? },
-            AUTHENTICATE => Self::Authenticate { player_id: r.uuid()?, secret: r.take(16)?.try_into().expect("length checked") },
+            AUTHENTICATE => Self::Authenticate,
             CONNECTION_CHECK => Self::ConnectionCheck,
             KEEP_ALIVE => Self::KeepAlive,
             AUTHENTICATE_ACK => Self::AuthenticateAck,
@@ -132,12 +130,12 @@ impl VoicePacket {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClientDatagram { pub player_id: Uuid, pub packet: VoicePacket }
+pub struct ClientDatagram { pub connection_id: Uuid, pub packet: VoicePacket }
 impl ClientDatagram {
-    /// ClientNetworkMessage.writeClient: magic + player UUID + encrypted byte array.
+    /// ClientNetworkMessage.writeClient: magic + connection UUID + encrypted byte array.
     pub fn encode(&self, secret: &VoiceSecret) -> Result<Vec<u8>, ProtocolError> {
         let encrypted = secret.encrypt(&self.packet.encode_plain()?)?;
-        let mut w = Writer::default(); w.u8(MAGIC); w.uuid(self.player_id); w.byte_array(&encrypted);
+        let mut w = Writer::default(); w.u8(MAGIC); w.uuid(self.connection_id); w.byte_array(&encrypted);
         Ok(w.data)
     }
 }
@@ -165,12 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn client_datagram_prefix_is_magic_and_uuid() {
-        let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        let d = ClientDatagram { player_id: id,
-            packet: VoicePacket::Authenticate { player_id: id, secret: [0x77; 16] } };
+    fn client_datagram_prefix_is_magic_and_connection_id() {
+        let connection = Uuid::parse_str("99aa77bb-1111-2222-3333-445566778899").unwrap();
+        let d = ClientDatagram { connection_id: connection,
+            packet: VoicePacket::Authenticate };
         let bytes = d.encode(&secret()).unwrap();
-        assert_eq!(bytes[0], MAGIC); assert_eq!(&bytes[1..17], id.as_bytes());
+        assert_eq!(bytes[0], MAGIC); assert_eq!(&bytes[1..17], connection.as_bytes());
         assert!(bytes.len() > 17 + 12 + 16);
     }
 

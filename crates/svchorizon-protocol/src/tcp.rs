@@ -2,9 +2,9 @@ use crate::wire::{Reader, WireError, Writer};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Compatibility version in Simple Voice Chat 2.6.27+26.3
-/// (upstream gradle.properties: voicechat_compatibility_version=20).
-pub const COMPATIBILITY_VERSION: i32 = 20;
+/// Compatibility version in Simple Voice Chat 2.6.27+ / MC 26.3
+/// (upstream gradle.properties: voicechat_compatibility_version=21).
+pub const COMPATIBILITY_VERSION: i32 = 21;
 pub const REQUEST_SECRET_CHANNEL: &str = "voicechat:request_secret";
 pub const SECRET_CHANNEL: &str = "voicechat:secret";
 
@@ -21,6 +21,8 @@ pub enum TcpPayloadError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoiceServerInfo {
     pub secret: [u8; 16],
+    /// The connection UUID that keys every client UDP datagram.
+    pub connection_id: Uuid,
     pub server_port: u16,
     pub player_uuid: Uuid,
     pub codec_ordinal: u8,
@@ -43,6 +45,7 @@ impl VoiceServerInfo {
     pub fn decode(data: &[u8]) -> Result<Self, TcpPayloadError> {
         let mut r = Reader::new(data);
         let secret = r.take(16)?.try_into().expect("length checked");
+        let connection_id = r.uuid()?;
         let port = r.i32()?;
         let server_port = u16::try_from(port).map_err(|_| TcpPayloadError::InvalidPort(port))?;
         if server_port == 0 { return Err(TcpPayloadError::InvalidPort(port)); }
@@ -58,7 +61,7 @@ impl VoiceServerInfo {
         if mtu_size <= 0 || keep_alive_seconds <= 0 || !voice_chat_distance.is_finite() || voice_chat_distance < 0.0 {
             return Err(TcpPayloadError::InvalidMetadata);
         }
-        Ok(Self { secret, server_port, player_uuid, codec_ordinal, mtu_size,
+        Ok(Self { secret, connection_id, server_port, player_uuid, codec_ordinal, mtu_size,
             voice_chat_distance, keep_alive_seconds, groups_enabled, voice_host, allow_recording })
     }
 }
@@ -75,12 +78,14 @@ mod tests {
     #[test]
     fn decodes_secret_packet_fields_in_upstream_order() {
         let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let connection = Uuid::parse_str("99aa77bb-1111-2222-3333-445566778899").unwrap();
         let mut w = Writer::default();
-        w.raw(&[0x44; 16]); w.i32(24454); w.uuid(id); w.u8(0);
+        w.raw(&[0x44; 16]); w.uuid(connection); w.i32(24454); w.uuid(id); w.u8(0);
         w.i32(1200); w.f64(48.0); w.i32(1000); w.bool(true);
         w.utf("voice.example.test"); w.bool(false);
         let parsed = VoiceServerInfo::decode(&w.data).unwrap();
         assert_eq!(parsed.secret, [0x44; 16]);
+        assert_eq!(parsed.connection_id, connection);
         assert_eq!(parsed.server_port, 24454);
         assert_eq!(parsed.player_uuid, id);
         assert_eq!(parsed.mtu_size, 1200);
@@ -94,7 +99,7 @@ mod tests {
     #[test]
     fn rejects_invalid_port() {
         let mut w = Writer::default();
-        w.raw(&[0; 16]); w.i32(70_000); w.uuid(Uuid::nil()); w.u8(0);
+        w.raw(&[0; 16]); w.uuid(Uuid::nil()); w.i32(70_000); w.uuid(Uuid::nil()); w.u8(0);
         w.i32(1200); w.f64(48.0); w.i32(1000); w.bool(false); w.utf(""); w.bool(false);
         assert!(matches!(VoiceServerInfo::decode(&w.data), Err(TcpPayloadError::InvalidPort(_))));
     }

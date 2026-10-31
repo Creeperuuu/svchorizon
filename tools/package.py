@@ -25,7 +25,9 @@ def prepare_bundle(bundle: Path) -> None:
         if tests_target.exists():
             shutil.rmtree(tests_target)
         shutil.copytree(tests_source, tests_target)
-    shutil.copy2(ROOT / "engine" / "COPYING", bundle / "engine" / "COPYING")
+    # The bundle may only contain .rs and .toml files (horizon_mods::index::native
+    # rejects anything else), so the BSD license text stays in engine/COPYING at
+    # the repository root and travels in the crate's license field instead.
 
 def package():
     compat = json.loads((ROOT / "compatibility.json").read_text())

@@ -69,24 +69,15 @@ bindings = [
 ]
 
 [[injection]]
-id = "voice-commands"
-kind = "HEAD"
-target = "horizon_client::game::native_hooks::Game<'_>::native_commands"
-helper = "native_commands.rs"
-bindings = [
-  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
-  { name = "commands", ty = "&mut Vec<&'static str>", value = "commands" }
-]
-
-[[injection]]
 id = "voice-hud"
 hook = "hud"
 hook_version = 1
 kind = "HEAD"
 helper = "native_hud.rs"
 bindings = [
-  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
-  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "batch" }
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "batch" },
+  { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "corners" }
 ]
 
 [[module]]

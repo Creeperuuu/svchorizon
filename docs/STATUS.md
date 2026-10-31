@@ -37,7 +37,7 @@ Last updated: 2026-10-31.
 ## Still missing before a complete Simple Voice Chat client
 
 - [ ] Real Paper/Spigot interoperability tests against the official plugin and unmodified Fabric/Forge/NeoForge clients.
-- [ ] Run and pass the manual GitHub Actions workflow; the source has not yet been build-validated.
+- [ ] Run the manual GitHub Actions workflow on CI runners (Windows engine compile + packaging matrix); the source is now build-validated locally (see below).
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Group invites, persistent group settings and a full graphical group UI. Password entry and custom group names/types are available through `/svchorizon group` chat commands; basic discovery/cycling and quick controls remain keybind-driven.
 - [ ] Remaining TCP custom payloads for recording-related controls and any newly introduced upstream extensions. Player-state and volume-category payloads are now decoded; the official UDP microphone/player/group/location sound variants and connection packets are implemented.
@@ -48,10 +48,29 @@ Last updated: 2026-10-31.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version 20 from upstream 2.6.27+26.3. This value is release-specific, not a universal protocol version.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version 21 from upstream gradle.properties (2.6.27+ / MC 26.3); the plugin requires an exact match. This value is release-specific, not a universal protocol version.
+
+## Interop-critical wire details (verified against upstream 2.6.27+ source)
+
+- The client sends `minecraft:register` with every `voicechat:*` channel before requesting the secret; Bukkit/Paper deliver payloads only to channels the client registered.
+- The `voicechat:secret` payload carries a connection UUID between the AES secret and the UDP port; every client UDP datagram prefixes that connection UUID (not the player UUID), mirroring `ClientNetworkMessage.writeClient`.
+- `AuthenticatePacket` (0x05) has an empty body: the encrypted plaintext is the single packet-ID byte.
+- The command registration hook (`native_commands`) does not exist at the pinned Horizon commit (hooks API 3), so `/svchorizon` runs through the `native_command` hook alone; chat feedback uses `native_chat`.
 
 The vendored Opus implementation is from [restsend/opus-rs](https://github.com/restsend/opus-rs) and retains its BSD license in the engine bundle.
 
+## Local build validation (2026-10-31, branch dev/continue-port)
+
+Validated against Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c` with horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e` (Rust 1.99.1, Linux x86-64):
+
+- `horizon-mixins plan` and `apply` pass on the pinned source (6 injections, 2 modules, 1 bundle crate).
+- The modded `horizon-client` compiles; `cargo test -p horizon-client` runs the game's own suites green (733 lib + 215 bin tests, 0 failures), including this mod's 9 runtime tests.
+- `svchorizon-engine` compiles inside the staged workspace and passes its suites (81 lib + 2 roundtrip tests standalone; 18 + 8 + 4 + 2 + 1 via the staged workspace run).
+- `cargo clippy --workspace --all-targets -- -D warnings` is clean on the protocol workspace.
+- `tools/package.py` produces `target/svchorizon-0.1.0.hnmod`; every bundle path passes the launcher's `mixins/<id>/` `.rs`/`.toml` file rule (the vendored BSD license text stays outside the bundle, in `engine/COPYING`).
+
+Protocol fixes found by the audit against upstream `henkelmax/simple-voice-chat` (2.6.27+ / MC 26.3): compatibility version 20 -> 21; the secret payload's connection UUID is now decoded and used as the datagram prefix (was the player UUID); `AuthenticatePacket` is sent with an empty body; the client registers all official `voicechat:*` channels via `minecraft:register` before requesting the secret (Bukkit/Paper deliver payloads only to registered channels); create-group passwords are limited to the upstream 24-character name limit.
+
 ## Validation policy
 
-Protocol unit tests and source-level integration do not prove server interoperability. No usable-client or interoperability claim is made until the manual workflow passes and the resulting bundle is tested against a real Paper server running the official plugin.
+Protocol unit tests and source-level integration do not prove server interoperability. No usable-client or interoperability claim is made until the resulting bundle is tested against a real Paper server running the official plugin.

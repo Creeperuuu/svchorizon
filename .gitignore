@@ -2,3 +2,8 @@
 *.hnmod
 *.log
 .DS_Store
+mixins/svchorizon/engine/Cargo.lock
+/Cargo.lock
+mixins/svchorizon/engine/src/
+mixins/svchorizon/engine/tests/
+mixins/svchorizon/engine/target/

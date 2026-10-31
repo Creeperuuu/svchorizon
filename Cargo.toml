@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/svchorizon-protocol"]
+# The bundle engine is its own crate (staged into Horizon by horizon-mixins);
+# keep it out of this workspace so it can be tested standalone.
+exclude = ["mixins/svchorizon/engine"]
 resolver = "2"
 
 [workspace.package]
