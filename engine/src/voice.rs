@@ -244,6 +244,9 @@ impl Drop for VoiceClient {
 fn resolve_voice_address(host: &str, port: u16) -> Result<SocketAddr, VoiceError> {
     let host = host.trim();
     if host.is_empty() { return Err(VoiceError::Resolve("empty host".into())); }
+    if host == "rtc-local" || host == "rtc-remote" {
+        return Ok(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port));
+    }
     if let Ok(address) = host.parse::<SocketAddr>() {
         return Ok(SocketAddr::new(address.ip(), port));
     }
