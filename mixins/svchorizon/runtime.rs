@@ -279,18 +279,29 @@ fn send_group_payload(game: &mut crate::game::Game<'_>, channel: &str, data: Vec
     }));
 }
 
+fn create_group_payload(name: &str, password: Option<&str>, group_type: i16) -> Vec<u8> {
+    let mut data = Vec::new();
+    write_utf(&mut data, name);
+    data.push(u8::from(password.is_some()));
+    if let Some(password) = password { write_utf(&mut data, password); }
+    data.extend_from_slice(&group_type.to_be_bytes());
+    data
+}
+
+fn join_group_payload(group_id: [u8; 16], password: Option<&str>) -> Vec<u8> {
+    let mut data = group_id.to_vec();
+    data.push(u8::from(password.is_some()));
+    if let Some(password) = password { write_utf(&mut data, password); }
+    data
+}
+
 fn send_create_group_custom(
     game: &mut crate::game::Game<'_>,
     name: &str,
     password: Option<&str>,
     group_type: i16,
 ) {
-    let mut data = Vec::new();
-    write_utf(&mut data, name);
-    data.push(u8::from(password.is_some()));
-    if let Some(password) = password { write_utf(&mut data, password); }
-    data.extend_from_slice(&group_type.to_be_bytes());
-    send_group_payload(game, "voicechat:create_group", data);
+    send_group_payload(game, "voicechat:create_group", create_group_payload(name, password, group_type));
 }
 
 fn send_create_group(game: &mut crate::game::Game<'_>) {
@@ -306,10 +317,7 @@ fn send_join_group_password(
         game.native_feedback(horizon_client::text::Text::literal("SVC: This group requires a password. Use /svchorizon group join <password>."));
         return;
     }
-    let mut data = group.id.to_vec();
-    data.push(u8::from(password.is_some()));
-    if let Some(password) = password { write_utf(&mut data, password); }
-    send_group_payload(game, "voicechat:set_group", data);
+    send_group_payload(game, "voicechat:set_group", join_group_payload(group.id, password));
 }
 
 fn send_join_group(game: &mut crate::game::Game<'_>, group: &NativeGroup) {
@@ -1159,6 +1167,31 @@ mod tests {
         truncated_icon.extend_from_slice(&[0, 0, 0, 1]);
         let mut cursor = Cursor::new(&truncated_icon);
         assert!(decode_category(&mut cursor).is_none());
+    }
+
+    #[test]
+    fn encodes_group_create_and_password_join_payloads() {
+        let create = create_group_payload("Friends", Some("s3cret phrase"), 2);
+        let mut cursor = Cursor::new(&create);
+        assert_eq!(cursor.string(24).as_deref(), Some("Friends"));
+        assert_eq!(cursor.bool(), Some(true));
+        assert_eq!(cursor.string(256).as_deref(), Some("s3cret phrase"));
+        assert_eq!(cursor.i16(), Some(2));
+        assert!(cursor.done());
+
+        let join = join_group_payload([0xAB; 16], Some("pass"));
+        let mut cursor = Cursor::new(&join);
+        assert_eq!(cursor.uuid(), Some([0xAB; 16]));
+        assert_eq!(cursor.bool(), Some(true));
+        assert_eq!(cursor.string(256).as_deref(), Some("pass"));
+        assert!(cursor.done());
+    }
+
+    #[test]
+    fn parses_quoted_group_names_and_passwords() {
+        let words = command_words(r#"svchorizon group create "Friends Group" "a password" open"#).unwrap();
+        assert_eq!(words, vec!["svchorizon", "group", "create", "Friends Group", "a password", "open"]);
+        assert!(command_words(r#"svchorizon group create "unfinished"#).is_none());
     }
 
     #[test]
