@@ -1074,7 +1074,7 @@ mod tests {
     fn mixes_speakers_but_keeps_each_speakers_packets_sequential() {
         let (tx, rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
-        let mut output = OutputAssembler::new(rx, SAMPLE_RATE as u32, listener);
+        let mut output = OutputAssembler::new(rx, SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())));
 
         let make_frame = |sender, sample| AudioFrame {
             sender,
