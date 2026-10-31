@@ -34,7 +34,7 @@ Last updated: 2026-10-31.
 - [ ] Run and pass the manual GitHub Actions workflow; the source has not yet been build-validated.
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Wire group payload codecs into native controls; add group discovery, password prompts, invites, group settings and full group UI. Group sound reception and the official group packet codecs are implemented, but group actions are not yet exposed in-game.
-- [ ] Static/entity sound packet variants and the rest of the official packet catalogue.
+- [ ] Remaining TCP custom payloads for player states, categories and recording-related controls. The official UDP microphone/player/group/location sound variants and connection packets are implemented.
 - [ ] Per-player ignore UI/persistence, whisper-target selection, and recording controls. Native per-player volume/mute setters and outgoing whisper flag control exist, but are not yet exposed through a complete in-game player menu.
 - [ ] Microphone/speaker device selection, persistent audio settings UI and in-game gain/voice-activation threshold sliders. Engine setters for microphone gain and RMS threshold are implemented.
 - [ ] Disconnect/reconfigure edge cases, reconnect backoff and server transfer testing.
