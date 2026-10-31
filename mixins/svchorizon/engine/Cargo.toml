@@ -8,6 +8,8 @@ description = "Simple Voice Chat UDP and Opus engine embedded into Horizon"
 
 [lib]
 path = "src/lib.rs"
+test = false
+doctest = false
 
 [features]
 default = ["std", "heap"]
