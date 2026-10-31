@@ -10,6 +10,7 @@ Last updated: 2026-10-31.
 - [x] Official client/server UDP datagram envelopes and packet framing.
 - [x] Authentication, connection-check, keepalive, ping, microphone and player/group/location sound packet codecs.
 - [x] TCP `voicechat:request_secret` payload and `voicechat:secret` metadata decoder.
+- [x] Official group create/join/leave request codecs and joined/add/remove group response decoders.
 - [x] Native Horizon packet hook sends the request on play login and consumes the server's secret response.
 - [x] UDP worker with authentication retry, connection validation, ping echo, keepalive response and timeout handling.
 - [x] Vendored pure-Rust Opus encoder/decoder, with tests for 48 kHz 20 ms VOIP frames and all upstream codec modes.
@@ -30,7 +31,7 @@ Last updated: 2026-10-31.
 - [ ] Real Paper/Spigot interoperability tests against the official plugin and unmodified Fabric/Forge/NeoForge clients.
 - [ ] Run and pass the manual GitHub Actions workflow; the source has not yet been build-validated.
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
-- [ ] Group creation, join/leave, invites, group settings and full group UI. Group sound reception is implemented, but group management is not.
+- [ ] Wire group payload codecs into native controls; add group discovery, password prompts, invites, group settings and full group UI. Group sound reception and the official group packet codecs are implemented, but group actions are not yet exposed in-game.
 - [ ] Static/entity sound packet variants and the rest of the official packet catalogue.
 - [ ] Per-player ignore UI/persistence, whisper-target selection, and recording controls. Native per-player volume/mute setters and outgoing whisper flag control exist, but are not yet exposed through a complete in-game player menu.
 - [ ] Microphone/speaker device selection, persistent audio settings UI and voice-activation threshold slider. Basic RMS voice activation is implemented and toggleable.
