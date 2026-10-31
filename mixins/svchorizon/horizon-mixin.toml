@@ -18,7 +18,7 @@ kind = "HEAD"
 target = "horizon_client::game::remote::Game<'_>::handle_packet"
 helper = "handle_packet.rs"
 bindings = [
-  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
   { name = "packet", ty = "&horizon_protocol::packets::play::Clientbound", value = "&packet" }
 ]
 
@@ -26,3 +26,33 @@ bindings = [
 id = "engine"
 path = "engine"
 dependent = "horizon-client"
+
+[[injection]]
+id = "voice-tick"
+hook = "tick"
+hook_version = 1
+kind = "HEAD"
+helper = "native_tick.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "self" }]
+
+[[injection]]
+id = "voice-key"
+hook = "key"
+hook_version = 1
+kind = "HEAD"
+helper = "native_key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" }
+]
+
+[[injection]]
+id = "voice-mods-page"
+hook = "mods"
+hook_version = 1
+kind = "HEAD"
+helper = "native_mods.rs"
+bindings = [
+  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "mods" }
+]
