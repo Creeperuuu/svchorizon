@@ -686,6 +686,16 @@ pub fn on_packet(
                     let _ = thread::Builder::new().name("svchorizon-connect".into()).spawn(move || {
                         match VoiceClient::connect(info, &fallback_host) {
                             Ok(client) => {
+                                let controls = {
+                                    let state = group_state().lock().expect("SVC player state poisoned");
+                                    state.players.iter().map(|player| {
+                                        (player.id, player.volume, player.ignored)
+                                    }).collect::<Vec<_>>()
+                                };
+                                for (id, volume, ignored) in controls {
+                                    client.set_player_volume(id, volume);
+                                    client.set_player_muted(id, ignored);
+                                }
                                 if SESSION_GENERATION.load(Ordering::Acquire) == generation {
                                     *voice_client().lock().expect("SVC client state poisoned") = Some(client);
                                     eprintln!("[svchorizon] Voice UDP/audio workers started.");
