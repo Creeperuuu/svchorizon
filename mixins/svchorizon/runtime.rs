@@ -620,6 +620,8 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         PLAYER_IGNORE_DOWN.store(false, Ordering::Relaxed);
         PLAYER_VOL_DOWN.store(false, Ordering::Relaxed);
         PLAYER_VOL_UP.store(false, Ordering::Relaxed);
+        INPUT_DEVICE_NEXT_DOWN.store(false, Ordering::Relaxed);
+        OUTPUT_DEVICE_NEXT_DOWN.store(false, Ordering::Relaxed);
     }
 
     let player = game.native_player();
