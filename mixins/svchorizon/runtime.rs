@@ -14,6 +14,33 @@ static SELF_MUTED: AtomicBool = AtomicBool::new(false);
 static SELF_MUTE_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static GROUP_CREATE_DOWN: AtomicBool = AtomicBool::new(false);
+static GROUP_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
+static GROUP_JOIN_DOWN: AtomicBool = AtomicBool::new(false);
+static GROUP_LEAVE_DOWN: AtomicBool = AtomicBool::new(false);
+static GROUP_STATE: OnceLock<Mutex<GroupState>> = OnceLock::new();
+
+#[derive(Clone)]
+struct NativeGroup {
+    id: [u8; 16],
+    name: String,
+    has_password: bool,
+    persistent: bool,
+    hidden: bool,
+    group_type: i16,
+}
+
+#[derive(Default)]
+struct GroupState {
+    groups: Vec<NativeGroup>,
+    selected: usize,
+    active: Option<[u8; 16]>,
+    wrong_password: bool,
+}
+
+fn group_state() -> &'static Mutex<GroupState> {
+    GROUP_STATE.get_or_init(|| Mutex::new(GroupState::default()))
+}
 
 fn voice_client() -> &'static Mutex<Option<VoiceClient>> {
     VOICE_CLIENT.get_or_init(|| Mutex::new(None))
@@ -36,7 +63,9 @@ impl<'a> Cursor<'a> {
     fn bool(&mut self) -> Option<bool> {
         match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None }
     }
+    fn i16(&mut self) -> Option<i16> { Some(i16::from_be_bytes(self.take(2)?.try_into().ok()?)) }
     fn i32(&mut self) -> Option<i32> { Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?)) }
+    fn uuid(&mut self) -> Option<[u8; 16]> { self.take(16)?.try_into().ok() }
     fn f64(&mut self) -> Option<f64> {
         Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?)))
     }
@@ -93,6 +122,98 @@ fn send_secret_request(game: &mut crate::game::Game<'_>) {
     }));
 }
 
+fn write_varint(out: &mut Vec<u8>, mut value: usize) {
+    while value > 0x7f {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_utf(out: &mut Vec<u8>, value: &str) {
+    write_varint(out, value.len());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn send_group_payload(game: &mut crate::game::Game<'_>, channel: &str, data: Vec<u8>) {
+    use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
+    game.send(Serverbound::CustomPayload(CustomPayload {
+        channel: channel.to_owned(),
+        data,
+    }));
+}
+
+fn send_create_group(game: &mut crate::game::Game<'_>) {
+    let mut data = Vec::new();
+    write_utf(&mut data, "Horizon");
+    data.push(0); // no password
+    data.extend_from_slice(&0i16.to_be_bytes()); // Group.Type.NORMAL
+    send_group_payload(game, "voicechat:create_group", data);
+}
+
+fn send_join_group(game: &mut crate::game::Game<'_>, group: &NativeGroup) {
+    if group.has_password {
+        group_state().lock().expect("SVC group state poisoned").wrong_password = true;
+        return;
+    }
+    let mut data = group.id.to_vec();
+    data.push(0); // no password
+    send_group_payload(game, "voicechat:set_group", data);
+}
+
+fn send_leave_group(game: &mut crate::game::Game<'_>) {
+    send_group_payload(game, "voicechat:leave_group", Vec::new());
+}
+
+fn on_group_payload(channel: &str, bytes: &[u8]) {
+    let mut state = group_state().lock().expect("SVC group state poisoned");
+    let mut cursor = Cursor::new(bytes);
+    match channel {
+        "voicechat:joined_group" => {
+            let group_id = if cursor.bool().unwrap_or(false) {
+                cursor.uuid()
+            } else {
+                Some([0; 16])
+            };
+            let Some(wrong_password) = cursor.bool() else { return; };
+            if !cursor.done() { return; }
+            state.active = group_id.filter(|id| *id != [0; 16]);
+            state.wrong_password = wrong_password;
+        }
+        "voicechat:add_group" => {
+            let Some(id) = cursor.uuid() else { return; };
+            let Some(name) = cursor.string(24) else { return; };
+            let Some(has_password) = cursor.bool() else { return; };
+            let Some(persistent) = cursor.bool() else { return; };
+            let Some(hidden) = cursor.bool() else { return; };
+            let Some(group_type) = cursor.i16() else { return; };
+            if !cursor.done() { return; }
+            let group = NativeGroup { id, name, has_password, persistent, hidden, group_type };
+            if let Some(existing) = state.groups.iter_mut().find(|entry| entry.id == id) {
+                *existing = group;
+            } else if state.groups.len() < 128 {
+                state.groups.push(group);
+                if state.groups.len() == 1 { state.selected = 0; }
+            }
+            if !state.groups.is_empty() {
+                state.selected %= state.groups.len();
+            }
+        }
+        "voicechat:remove_group" => {
+            let Some(id) = cursor.uuid() else { return; };
+            if !cursor.done() { return; }
+            state.groups.retain(|group| group.id != id);
+            if state.groups.is_empty() {
+                state.selected = 0;
+            } else {
+                state.selected %= state.groups.len();
+            }
+            if state.active == Some(id) { state.active = None; }
+        }
+        _ => {}
+    }
+}
+
 fn poll_voice_events() {
     let mut guard = voice_client().lock().expect("SVC client state poisoned");
     let mut disconnected = false;
@@ -140,6 +261,26 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
                 "Toggle microphone mute".to_owned(),
                 "key.keyboard.m".to_owned(),
             ],
+            [
+                "group_create".to_owned(),
+                "Create a public voice group".to_owned(),
+                "key.keyboard.g".to_owned(),
+            ],
+            [
+                "group_next".to_owned(),
+                "Select next available voice group".to_owned(),
+                "key.keyboard.n".to_owned(),
+            ],
+            [
+                "group_join".to_owned(),
+                "Join selected public voice group".to_owned(),
+                "key.keyboard.j".to_owned(),
+            ],
+            [
+                "group_leave".to_owned(),
+                "Leave current voice group".to_owned(),
+                "key.keyboard.h".to_owned(),
+            ],
         ],
     });
 }
@@ -164,6 +305,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             .expect("SVC client state poisoned")
             .take();
         drop(old_client);
+        *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
         return;
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
@@ -234,6 +376,38 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         } else if !pressed {
             SELF_MUTE_KEY_DOWN.store(false, Ordering::Release);
         }
+    } else if key == game.native_mod_key("svchorizon", "group_create", "key.keyboard.g") {
+        if pressed && !GROUP_CREATE_DOWN.swap(true, Ordering::AcqRel) && game.native_playing() {
+            send_create_group(game);
+        } else if !pressed {
+            GROUP_CREATE_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "group_next", "key.keyboard.n") {
+        if pressed && !GROUP_NEXT_DOWN.swap(true, Ordering::AcqRel) {
+            let mut state = group_state().lock().expect("SVC group state poisoned");
+            if !state.groups.is_empty() {
+                state.selected = (state.selected + 1) % state.groups.len();
+            }
+            state.wrong_password = false;
+        } else if !pressed {
+            GROUP_NEXT_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "group_join", "key.keyboard.j") {
+        if pressed && !GROUP_JOIN_DOWN.swap(true, Ordering::AcqRel) && game.native_playing() {
+            let selected = {
+                let state = group_state().lock().expect("SVC group state poisoned");
+                state.groups.get(state.selected).cloned()
+            };
+            if let Some(group) = selected { send_join_group(game, &group); }
+        } else if !pressed {
+            GROUP_JOIN_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "group_leave", "key.keyboard.h") {
+        if pressed && !GROUP_LEAVE_DOWN.swap(true, Ordering::AcqRel) && game.native_playing() {
+            send_leave_group(game);
+        } else if !pressed {
+            GROUP_LEAVE_DOWN.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -258,6 +432,21 @@ pub fn on_hud(
         ("SVC: Connecting", 0xFFCC55)
     };
     game.native_text(batch, label, [8.0, 42.0], color, true);
+    let groups = group_state().lock().expect("SVC group state poisoned");
+    let group_label = if let Some(active) = groups.active {
+        groups.groups.iter().find(|group| group.id == active)
+            .map(|group| format!("SVC Group: {}", group.name))
+            .unwrap_or_else(|| "SVC Group: joined".to_owned())
+    } else if groups.wrong_password {
+        "SVC Group: password required (password entry not available yet)".to_owned()
+    } else if let Some(group) = groups.groups.get(groups.selected) {
+        let suffix = if group.has_password { " [locked]" } else { "" };
+        format!("SVC Group: {}{} ({}/{})", group.name, suffix, groups.selected + 1, groups.groups.len())
+    } else {
+        "SVC Group: none | G create, N select, J join, H leave".to_owned()
+    };
+    let _group_metadata = (groups.groups.get(groups.selected).map(|g| (g.persistent, g.hidden, g.group_type)));
+    game.native_text(batch, &group_label, [8.0, 54.0], 0xFFFFFF, true);
 }
 
 pub fn on_packet(
@@ -273,6 +462,7 @@ pub fn on_packet(
             REMOTE_ACTIVE.store(true, Ordering::Release);
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
             voice_client().lock().expect("SVC client state poisoned").take();
+            *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") { send_secret_request(game); }
@@ -298,6 +488,12 @@ pub fn on_packet(
                 }
                 None => eprintln!("[svchorizon] Rejected malformed voicechat:secret payload."),
             }
+        }
+        Clientbound::CustomPayload(payload) if matches!(
+            payload.channel.as_str(),
+            "voicechat:joined_group" | "voicechat:add_group" | "voicechat:remove_group"
+        ) && game.native_on("svchorizon") => {
+            on_group_payload(&payload.channel, &payload.data);
         }
         _ => {}
     }
