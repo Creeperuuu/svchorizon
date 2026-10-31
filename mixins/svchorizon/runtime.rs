@@ -279,12 +279,37 @@ fn send_group_payload(game: &mut crate::game::Game<'_>, channel: &str, data: Vec
     }));
 }
 
-fn send_create_group(game: &mut crate::game::Game<'_>) {
+fn send_create_group_custom(
+    game: &mut crate::game::Game<'_>,
+    name: &str,
+    password: Option<&str>,
+    group_type: i16,
+) {
     let mut data = Vec::new();
-    write_utf(&mut data, "Horizon");
-    data.push(0); // no password
-    data.extend_from_slice(&0i16.to_be_bytes()); // Group.Type.NORMAL
+    write_utf(&mut data, name);
+    data.push(u8::from(password.is_some()));
+    if let Some(password) = password { write_utf(&mut data, password); }
+    data.extend_from_slice(&group_type.to_be_bytes());
     send_group_payload(game, "voicechat:create_group", data);
+}
+
+fn send_create_group(game: &mut crate::game::Game<'_>) {
+    send_create_group_custom(game, "Horizon", None, 0);
+}
+
+fn send_join_group_password(
+    game: &mut crate::game::Game<'_>,
+    group: &NativeGroup,
+    password: Option<&str>,
+) {
+    if group.has_password && password.is_none() {
+        game.native_feedback(horizon_client::text::Text::literal("SVC: This group requires a password. Use /svchorizon group join <password>."));
+        return;
+    }
+    let mut data = group.id.to_vec();
+    data.push(u8::from(password.is_some()));
+    if let Some(password) = password { write_utf(&mut data, password); }
+    send_group_payload(game, "voicechat:set_group", data);
 }
 
 fn send_join_group(game: &mut crate::game::Game<'_>, group: &NativeGroup) {
@@ -299,6 +324,102 @@ fn send_join_group(game: &mut crate::game::Game<'_>, group: &NativeGroup) {
 
 fn send_leave_group(game: &mut crate::game::Game<'_>) {
     send_group_payload(game, "voicechat:leave_group", Vec::new());
+}
+
+fn command_words(input: &str) -> Option<Vec<String>> {
+    if input.len() > 256 { return None; }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch.is_whitespace() && !quoted {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+                if words.len() > 8 { return None; }
+            }
+        } else {
+            current.push(ch);
+        }
+        if current.chars().count() > 64 { return None; }
+    }
+    if escaped || quoted { return None; }
+    if !current.is_empty() { words.push(current); }
+    (words.len() <= 8).then_some(words)
+}
+
+pub fn on_commands(commands: &mut Vec<&'static str>) {
+    if !commands.contains(&"svchorizon") { commands.push("svchorizon"); }
+}
+
+pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
+    let Some(words) = command_words(command) else { return; };
+    if words.first().map(String::as_str) != Some("svchorizon") { return; }
+    *ran = true;
+    if !game.native_playing() || !GROUPS_ENABLED.load(Ordering::Acquire) {
+        game.native_feedback(horizon_client::text::Text::literal("SVC: Join a server with Simple Voice Chat enabled first."));
+        return;
+    }
+    if words.get(1).map(String::as_str) != Some("group") {
+        game.native_feedback(horizon_client::text::Text::literal("Usage: /svchorizon group <list|join|create|leave>"));
+        return;
+    }
+    match words.get(2).map(String::as_str) {
+        Some("list") => {
+            let state = group_state().lock().expect("SVC group state poisoned");
+            let names = state.groups.iter().filter(|g| !g.hidden)
+                .map(|g| if g.has_password { format!("{} [locked]", g.name) } else { g.name.clone() })
+                .collect::<Vec<_>>();
+            let message = if names.is_empty() { "SVC: No visible groups.".to_owned() }
+                else { format!("SVC groups: {}", names.join(", ")) };
+            drop(state);
+            game.native_feedback(horizon_client::text::Text::literal(message));
+        }
+        Some("join") => {
+            let selected = {
+                let state = group_state().lock().expect("SVC group state poisoned");
+                state.groups.get(state.selected).filter(|g| !g.hidden).cloned()
+            };
+            match selected {
+                Some(group) => {
+                    let password = words.get(3).map(String::as_str);
+                    if password.is_some_and(|p| p.chars().count() > 16) {
+                        game.native_feedback(horizon_client::text::Text::literal("SVC: Password must be 16 characters or fewer."));
+                    } else {
+                        send_join_group_password(game, &group, password);
+                    }
+                }
+                None => game.native_feedback(horizon_client::text::Text::literal("SVC: Select a visible group first with N.")),
+            }
+        }
+        Some("create") => {
+            let Some(name) = words.get(3).filter(|name| !name.is_empty()) else {
+                game.native_feedback(horizon_client::text::Text::literal("Usage: /svchorizon group create <name> [password] [normal|open|isolated]"));
+                return;
+            };
+            let password = words.get(4).filter(|p| p.as_str() != "-").map(String::as_str);
+            let kind = words.get(5).map(String::as_str).unwrap_or("normal");
+            let group_type = match kind { "normal" => 0, "open" => 1, "isolated" => 2, _ => {
+                game.native_feedback(horizon_client::text::Text::literal("SVC: Group type must be normal, open, or isolated."));
+                return;
+            }};
+            if name.chars().count() > 16 || password.is_some_and(|p| p.chars().count() > 16) {
+                game.native_feedback(horizon_client::text::Text::literal("SVC: Group names and passwords must be 16 characters or fewer."));
+                return;
+            }
+            send_create_group_custom(game, name, password, group_type);
+            game.native_feedback(horizon_client::text::Text::literal(format!("SVC: Creating group {name}.")));
+        }
+        Some("leave") => send_leave_group(game),
+        _ => game.native_feedback(horizon_client::text::Text::literal("Usage: /svchorizon group <list|join|create|leave>")),
+    }
 }
 
 fn on_group_payload(channel: &str, bytes: &[u8]) {
