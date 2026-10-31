@@ -788,6 +788,36 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         } else if !pressed {
             PLAYER_VOL_UP.store(false, Ordering::Release);
         }
+    } else if key == game.native_mod_key("svchorizon", "input_device_next", "key.keyboard.f6") {
+        if pressed && !INPUT_DEVICE_NEXT_DOWN.swap(true, Ordering::AcqRel) {
+            let devices = VoiceClient::input_devices();
+            if !devices.is_empty() {
+                let step = INPUT_DEVICE_INDEX.fetch_add(1, Ordering::AcqRel);
+                let slot = step % (devices.len() + 1);
+                let selection = if slot == devices.len() { None } else { Some(devices[slot].clone()) };
+                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                    client.set_input_device(selection.clone());
+                }
+                eprintln!("[svchorizon] Microphone: {}", selection.as_deref().unwrap_or("OS default"));
+            }
+        } else if !pressed {
+            INPUT_DEVICE_NEXT_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "output_device_next", "key.keyboard.f7") {
+        if pressed && !OUTPUT_DEVICE_NEXT_DOWN.swap(true, Ordering::AcqRel) {
+            let devices = VoiceClient::output_devices();
+            if !devices.is_empty() {
+                let step = OUTPUT_DEVICE_INDEX.fetch_add(1, Ordering::AcqRel);
+                let slot = step % (devices.len() + 1);
+                let selection = if slot == devices.len() { None } else { Some(devices[slot].clone()) };
+                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                    client.set_output_device(selection.clone());
+                }
+                eprintln!("[svchorizon] Speaker: {}", selection.as_deref().unwrap_or("OS default"));
+            }
+        } else if !pressed {
+            OUTPUT_DEVICE_NEXT_DOWN.store(false, Ordering::Release);
+        }
     }
 }
 
