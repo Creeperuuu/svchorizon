@@ -282,6 +282,7 @@ impl VoiceClient {
         let worker_running = Arc::clone(&running);
         let worker_transmitting = Arc::clone(&transmitting);
         let worker_whispering = Arc::clone(&whispering);
+        let worker_voice_activation = Arc::clone(&voice_activation);
         let worker_connected = Arc::clone(&connected);
         let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
@@ -289,7 +290,8 @@ impl VoiceClient {
             .spawn(move || {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
-                    worker_running, worker_transmitting, worker_whispering, worker_connected, worker_positions,
+                    worker_running, worker_transmitting, worker_whispering, worker_voice_activation,
+                    worker_connected, worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -497,6 +499,7 @@ fn run_worker(
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     whispering: Arc<AtomicBool>,
+    voice_activation: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
@@ -525,7 +528,10 @@ fn run_worker(
         loop {
             match commands.try_recv() {
                 Ok(Command::Pcm(pcm)) => {
-                    if validated && transmitting.load(Ordering::Relaxed) {
+                    if validated && (
+                        transmitting.load(Ordering::Relaxed)
+                            || voice_activation.load(Ordering::Relaxed)
+                    ) {
                         let mut opus = [0u8; 1276];
                         if let Ok(length) = encoder.encode_i16(&pcm, FRAME_SAMPLES, &mut opus[..payload_limit]) {
                             let packet = Packet::Mic {
