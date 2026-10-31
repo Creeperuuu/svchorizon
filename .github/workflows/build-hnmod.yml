@@ -40,6 +40,8 @@ jobs:
           ref: d9c83d7096b7ea5b83678da2efdfd6161f74997e
           path: horizon-mixins
       - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install Linux audio build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -52,6 +54,8 @@ jobs:
         run: python tools/prepare_bundle.py
       - name: Build mixin CLI
         run: cargo build --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli
+      - name: Prepare plan output directory
+        run: mkdir -p target/mixins
       - name: Plan native hooks
         run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- plan --workspace horizon --mods mixins --out target/mixins/plan.json
       - name: Apply native hooks
@@ -59,8 +63,21 @@ jobs:
       - name: Compile and test the actual native mixin
         run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- check --workspace horizon --mods mixins --out target/mixins/modded --trust-native-mods
 
+  engine-windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Stage bundled engine
+        run: python tools/prepare_bundle.py
+      - name: Compile Opus, AES-GCM and CPAL on Windows
+        run: cargo check --manifest-path mixins/svchorizon/engine/Cargo.toml
+
   package:
-    needs: [protocol-tests, native-mixin-check]
+    needs: [protocol-tests, native-mixin-check, engine-windows-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
