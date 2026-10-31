@@ -299,6 +299,7 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
             state.players.retain(|player| player.id != id);
             if state.players.is_empty() { state.selected_player = 0; }
             else { state.selected_player %= state.players.len(); }
+            drop(state);
             if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
                 client.set_player_volume(id, 1.0);
                 client.set_player_muted(id, false);
