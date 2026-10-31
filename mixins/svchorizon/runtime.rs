@@ -724,17 +724,22 @@ pub fn on_hud(
 ) {
     if !game.native_playing() || !game.native_on("svchorizon") { return; }
     let guard = voice_client().lock().expect("SVC client state poisoned");
-    let Some(client) = guard.as_ref() else { return; };
     let (label, color) = if SELF_MUTED.load(Ordering::Relaxed) {
         ("SVC: Microphone muted", 0xFF5555)
-    } else if client.is_transmitting() && client.is_whispering() {
-        ("SVC: Whispering", 0x55FF55)
-    } else if client.is_transmitting() {
-        ("SVC: Transmitting", 0x55FF55)
-    } else if client.is_voice_activation_enabled() {
-        ("SVC: Voice activation", 0x55FF55)
-    } else if client.is_connected() {
-        ("SVC: Connected", 0xFFFFFF)
+    } else if let Some(client) = guard.as_ref() {
+        if client.is_transmitting() && client.is_whispering() {
+            ("SVC: Whispering", 0x55FF55)
+        } else if client.is_transmitting() {
+            ("SVC: Transmitting", 0x55FF55)
+        } else if client.is_voice_activation_enabled() {
+            ("SVC: Voice activation", 0x55FF55)
+        } else if client.is_connected() {
+            ("SVC: Connected", 0xFFFFFF)
+        } else {
+            ("SVC: Connecting", 0xFFCC55)
+        }
+    } else if RECONNECTING.load(Ordering::Acquire) {
+        ("SVC: Reconnecting", 0xFFCC55)
     } else {
         ("SVC: Connecting", 0xFFCC55)
     };
