@@ -58,6 +58,26 @@ bindings = [
 ]
 
 [[injection]]
+id = "voice-command"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_command"
+helper = "native_command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "ran" }
+]
+
+[[injection]]
+id = "voice-commands"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_commands"
+helper = "native_commands.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<&'static str>", value = "commands" }
+]
+
+[[injection]]
 id = "voice-hud"
 hook = "hud"
 hook_version = 1
