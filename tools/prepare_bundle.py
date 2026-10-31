@@ -18,6 +18,12 @@ def main():
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(SOURCE / "src", target)
+    tests_source = SOURCE / "tests"
+    if tests_source.is_dir():
+        tests_target = DEST / "tests"
+        if tests_target.exists():
+            shutil.rmtree(tests_target)
+        shutil.copytree(tests_source, tests_target)
     shutil.copy2(SOURCE / "COPYING", DEST / "COPYING")
     print(f"Prepared native engine sources in {DEST}")
 
