@@ -18,6 +18,10 @@ static GROUP_CREATE_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_JOIN_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_LEAVE_DOWN: AtomicBool = AtomicBool::new(false);
+static PLAYER_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
+static PLAYER_IGNORE_DOWN: AtomicBool = AtomicBool::new(false);
+static PLAYER_VOL_DOWN: AtomicBool = AtomicBool::new(false);
+static PLAYER_VOL_UP: AtomicBool = AtomicBool::new(false);
 static GROUP_STATE: OnceLock<Mutex<GroupState>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -30,12 +34,28 @@ struct NativeGroup {
     group_type: i16,
 }
 
+#[derive(Clone)]
+struct NativePlayer {
+    id: [u8; 16],
+    name: String,
+    server_muted: bool,
+    force_muted: bool,
+    disabled: bool,
+    force_disabled: bool,
+    disconnected: bool,
+    group: Option<[u8; 16]>,
+    volume: f32,
+    ignored: bool,
+}
+
 #[derive(Default)]
 struct GroupState {
     groups: Vec<NativeGroup>,
     selected: usize,
     active: Option<[u8; 16]>,
     wrong_password: bool,
+    players: Vec<NativePlayer>,
+    selected_player: usize,
 }
 
 fn group_state() -> &'static Mutex<GroupState> {
@@ -214,6 +234,89 @@ fn on_group_payload(channel: &str, bytes: &[u8]) {
     }
 }
 
+fn decode_player_state(cursor: &mut Cursor<'_>) -> Option<NativePlayer> {
+    let flags = cursor.u8()?;
+    let id = cursor.uuid()?;
+    let name = cursor.string(256)?;
+    let group = if flags & (1 << 5) != 0 { Some(cursor.uuid()?) } else { None };
+    Some(NativePlayer {
+        id,
+        name,
+        server_muted: flags & (1 << 0) != 0,
+        force_muted: flags & (1 << 1) != 0,
+        disabled: flags & (1 << 2) != 0,
+        force_disabled: flags & (1 << 3) != 0,
+        disconnected: flags & (1 << 4) != 0,
+        group,
+        volume: 1.0,
+        ignored: false,
+    })
+}
+
+fn preserve_player_controls(player: &mut NativePlayer, old: &[NativePlayer]) {
+    if let Some(previous) = old.iter().find(|entry| entry.id == player.id) {
+        player.volume = previous.volume;
+        player.ignored = previous.ignored;
+    }
+}
+
+fn on_player_payload(channel: &str, bytes: &[u8]) {
+    let mut state = group_state().lock().expect("SVC player state poisoned");
+    match channel {
+        "voicechat:states" => {
+            let mut cursor = Cursor::new(bytes);
+            let Some(count) = cursor.i32().and_then(|n| usize::try_from(n).ok()) else { return; };
+            if count > 512 { return; }
+            let old = state.players.clone();
+            let mut players = Vec::with_capacity(count.min(128));
+            for _ in 0..count {
+                let Some(mut player) = decode_player_state(&mut cursor) else { return; };
+                preserve_player_controls(&mut player, &old);
+                if players.len() < 128 && !players.iter().any(|entry: &NativePlayer| entry.id == player.id) {
+                    players.push(player);
+                }
+            }
+            if !cursor.done() { return; }
+            state.players = players;
+            if state.players.is_empty() { state.selected_player = 0; }
+            else { state.selected_player %= state.players.len(); }
+        }
+        "voicechat:state" => {
+            let mut cursor = Cursor::new(bytes);
+            let Some(mut player) = decode_player_state(&mut cursor) else { return; };
+            if !cursor.done() { return; }
+            preserve_player_controls(&mut player, &state.players);
+            if let Some(existing) = state.players.iter_mut().find(|entry| entry.id == player.id) {
+                *existing = player;
+            } else if state.players.len() < 128 {
+                state.players.push(player);
+            }
+        }
+        "voicechat:remove_state" => {
+            let mut cursor = Cursor::new(bytes);
+            let Some(id) = cursor.uuid() else { return; };
+            if !cursor.done() { return; }
+            state.players.retain(|player| player.id != id);
+            if state.players.is_empty() { state.selected_player = 0; }
+            else { state.selected_player %= state.players.len(); }
+            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                client.set_player_volume(id, 1.0);
+                client.set_player_muted(id, false);
+            }
+            return;
+        }
+        _ => return,
+    }
+    let controls = state.players.iter().map(|p| (p.id, p.volume, p.ignored)).collect::<Vec<_>>();
+    drop(state);
+    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        for (id, volume, ignored) in controls {
+            client.set_player_volume(id, volume);
+            client.set_player_muted(id, ignored);
+        }
+    }
+}
+
 fn poll_voice_events() {
     let mut guard = voice_client().lock().expect("SVC client state poisoned");
     let mut disconnected = false;
@@ -280,6 +383,26 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
                 "group_leave".to_owned(),
                 "Leave current voice group".to_owned(),
                 "key.keyboard.h".to_owned(),
+            ],
+            [
+                "player_next".to_owned(),
+                "Select next voice-chat player".to_owned(),
+                "key.keyboard.p".to_owned(),
+            ],
+            [
+                "player_ignore".to_owned(),
+                "Toggle selected player's local mute".to_owned(),
+                "key.keyboard.o".to_owned(),
+            ],
+            [
+                "player_volume_down".to_owned(),
+                "Lower selected player's volume".to_owned(),
+                "key.keyboard.page.down".to_owned(),
+            ],
+            [
+                "player_volume_up".to_owned(),
+                "Raise selected player's volume".to_owned(),
+                "key.keyboard.page.up".to_owned(),
             ],
         ],
     });
@@ -408,6 +531,69 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         } else if !pressed {
             GROUP_LEAVE_DOWN.store(false, Ordering::Release);
         }
+    } else if key == game.native_mod_key("svchorizon", "player_next", "key.keyboard.p") {
+        if pressed && !PLAYER_NEXT_DOWN.swap(true, Ordering::AcqRel) {
+            let mut state = group_state().lock().expect("SVC player state poisoned");
+            if !state.players.is_empty() {
+                state.selected_player = (state.selected_player + 1) % state.players.len();
+            }
+        } else if !pressed {
+            PLAYER_NEXT_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "player_ignore", "key.keyboard.o") {
+        if pressed && !PLAYER_IGNORE_DOWN.swap(true, Ordering::AcqRel) {
+            let control = {
+                let mut state = group_state().lock().expect("SVC player state poisoned");
+                let index = state.selected_player;
+                state.players.get_mut(index).map(|player| {
+                    player.ignored = !player.ignored;
+                    (player.id, player.ignored)
+                })
+            };
+            if let Some((id, ignored)) = control {
+                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                    client.set_player_muted(id, ignored);
+                }
+            }
+        } else if !pressed {
+            PLAYER_IGNORE_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "player_volume_down", "key.keyboard.page.down") {
+        if pressed && !PLAYER_VOL_DOWN.swap(true, Ordering::AcqRel) {
+            let control = {
+                let mut state = group_state().lock().expect("SVC player state poisoned");
+                let index = state.selected_player;
+                state.players.get_mut(index).map(|player| {
+                    player.volume = (player.volume - 0.1).clamp(0.0, 2.0);
+                    (player.id, player.volume)
+                })
+            };
+            if let Some((id, volume)) = control {
+                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                    client.set_player_volume(id, volume);
+                }
+            }
+        } else if !pressed {
+            PLAYER_VOL_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "player_volume_up", "key.keyboard.page.up") {
+        if pressed && !PLAYER_VOL_UP.swap(true, Ordering::AcqRel) {
+            let control = {
+                let mut state = group_state().lock().expect("SVC player state poisoned");
+                let index = state.selected_player;
+                state.players.get_mut(index).map(|player| {
+                    player.volume = (player.volume + 0.1).clamp(0.0, 2.0);
+                    (player.id, player.volume)
+                })
+            };
+            if let Some((id, volume)) = control {
+                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                    client.set_player_volume(id, volume);
+                }
+            }
+        } else if !pressed {
+            PLAYER_VOL_UP.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -447,6 +633,17 @@ pub fn on_hud(
     };
     let _group_metadata = (groups.groups.get(groups.selected).map(|g| (g.persistent, g.hidden, g.group_type)));
     game.native_text(batch, &group_label, [8.0, 54.0], 0xFFFFFF, true);
+    let player_label = if let Some(player) = groups.players.get(groups.selected_player) {
+        let status = if player.ignored { "ignored" }
+            else if player.force_muted || player.server_muted { "server-muted" }
+            else if player.force_disabled || player.disabled { "voice-disabled" }
+            else if player.disconnected { "disconnected" }
+            else { "active" };
+        format!("SVC Player: {} | {} | {:.0}%", player.name, status, player.volume * 100.0)
+    } else {
+        "SVC Player: none | P select, O ignore, PgUp/PgDn volume".to_owned()
+    };
+    game.native_text(batch, &player_label, [8.0, 66.0], 0xFFFFFF, true);
 }
 
 pub fn on_packet(
@@ -494,6 +691,12 @@ pub fn on_packet(
             "voicechat:joined_group" | "voicechat:add_group" | "voicechat:remove_group"
         ) && game.native_on("svchorizon") => {
             on_group_payload(&payload.channel, &payload.data);
+        }
+        Clientbound::CustomPayload(payload) if matches!(
+            payload.channel.as_str(),
+            "voicechat:states" | "voicechat:state" | "voicechat:remove_state"
+        ) && game.native_on("svchorizon") => {
+            on_player_payload(&payload.channel, &payload.data);
         }
         _ => {}
     }
