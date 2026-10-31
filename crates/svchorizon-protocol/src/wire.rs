@@ -8,11 +8,11 @@ pub enum WireError {
     #[error("declared byte array length {declared} exceeds limit {limit}")]
     LengthLimit { declared: usize, limit: usize },
     #[error("invalid UTF-8")] InvalidUtf8,
+    #[error("invalid boolean value {0}")] InvalidBoolean(u8),
     #[error("packet contains trailing bytes")] TrailingBytes,
 }
 
 pub struct Reader<'a> { data: &'a [u8], pos: usize }
-
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
     pub fn is_empty(&self) -> bool { self.pos == self.data.len() }
@@ -23,13 +23,19 @@ impl<'a> Reader<'a> {
     }
     pub fn u8(&mut self) -> Result<u8, WireError> { Ok(self.take(1)?[0]) }
     pub fn bool(&mut self) -> Result<bool, WireError> {
-        match self.u8()? { 0 => Ok(false), 1 => Ok(true), _ => Err(WireError::TrailingBytes) }
+        match self.u8()? { 0 => Ok(false), 1 => Ok(true), v => Err(WireError::InvalidBoolean(v)) }
+    }
+    pub fn i32(&mut self) -> Result<i32, WireError> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().expect("length checked")))
     }
     pub fn i64(&mut self) -> Result<i64, WireError> {
         Ok(i64::from_be_bytes(self.take(8)?.try_into().expect("length checked")))
     }
     pub fn f32(&mut self) -> Result<f32, WireError> {
         Ok(f32::from_bits(u32::from_be_bytes(self.take(4)?.try_into().expect("length checked"))))
+    }
+    pub fn f64(&mut self) -> Result<f64, WireError> {
+        Ok(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().expect("length checked"))))
     }
     pub fn uuid(&mut self) -> Result<Uuid, WireError> {
         Ok(Uuid::from_bytes(self.take(16)?.try_into().expect("length checked")))
@@ -63,12 +69,13 @@ impl<'a> Reader<'a> {
 
 #[derive(Default)]
 pub struct Writer { pub data: Vec<u8> }
-
 impl Writer {
     pub fn u8(&mut self, value: u8) { self.data.push(value); }
     pub fn bool(&mut self, value: bool) { self.u8(u8::from(value)); }
+    pub fn i32(&mut self, value: i32) { self.data.extend_from_slice(&value.to_be_bytes()); }
     pub fn i64(&mut self, value: i64) { self.data.extend_from_slice(&value.to_be_bytes()); }
     pub fn f32(&mut self, value: f32) { self.data.extend_from_slice(&value.to_bits().to_be_bytes()); }
+    pub fn f64(&mut self, value: f64) { self.data.extend_from_slice(&value.to_bits().to_be_bytes()); }
     pub fn uuid(&mut self, value: Uuid) { self.data.extend_from_slice(value.as_bytes()); }
     pub fn raw(&mut self, value: &[u8]) { self.data.extend_from_slice(value); }
     pub fn varint(&mut self, mut value: u32) {
@@ -97,7 +104,7 @@ mod tests {
         assert_eq!(Reader::new(&w.data).uuid().unwrap(), id);
     }
     #[test]
-    fn oversized_array_is_rejected() {
+    fn rejects_oversized_array() {
         assert!(matches!(Reader::new(&[0xff, 0x7f]).byte_array(64),
             Err(WireError::LengthLimit { .. })));
     }
