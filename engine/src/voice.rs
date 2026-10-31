@@ -674,6 +674,7 @@ fn run_worker(
         for frame in jitter.poll(Instant::now()) {
             emit_audio(&mut decoders, &audio, frame);
         }
+        decoders.retain(|sender, _| jitter.senders.contains_key(sender));
     }
     connected.store(false, Ordering::Release);
     running.store(false, Ordering::Release);
