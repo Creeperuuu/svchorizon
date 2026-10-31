@@ -1006,7 +1006,7 @@ pub fn on_hud(
             .map(|group| format!("SVC Group: {}", group.name))
             .unwrap_or_else(|| "SVC Group: joined".to_owned())
     } else if groups.wrong_password {
-        "SVC Group: password required (password entry not available yet)".to_owned()
+        "SVC Group: password required | /svchorizon group join <password>".to_owned()
     } else if let Some(group) = groups.groups.get(groups.selected).filter(|group| !group.hidden) {
         let lock = if group.has_password { " [locked]" } else { "" };
         let persistent = if group.persistent { " [persistent]" } else { "" };
