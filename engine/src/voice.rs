@@ -625,33 +625,33 @@ fn build_input_stream(
     }
 }
 
-struct OutputAssembler {
-    rx: Receiver<AudioFrame>,
-    current: Option<AudioFrame>,
+struct PlaybackFrame {
+    frame: AudioFrame,
     position: f64,
-    step: f64,
-    listener: Arc<Mutex<ListenerPose>>,
     left_gain: f32,
     right_gain: f32,
 }
+
+struct OutputAssembler {
+    rx: Receiver<AudioFrame>,
+    active: Vec<PlaybackFrame>,
+    step: f64,
+    listener: Arc<Mutex<ListenerPose>>,
+}
 impl OutputAssembler {
     fn new(rx: Receiver<AudioFrame>, output_rate: u32, listener: Arc<Mutex<ListenerPose>>) -> Self {
-        Self { rx, current: None, position: 0.0,
+        Self {
+            rx,
+            active: Vec::with_capacity(8),
             step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)),
-            listener, left_gain: 1.0, right_gain: 1.0 }
+            listener,
+        }
     }
 
-    fn update_spatial_gain(&mut self) {
-        let Some(frame) = self.current.as_ref() else {
-            self.left_gain = 0.0; self.right_gain = 0.0; return;
-        };
-        let Some(source) = frame.position else {
-            self.left_gain = 1.0; self.right_gain = 1.0; return;
-        };
-        let Ok(listener) = self.listener.lock() else { return; };
-        if !listener.active {
-            self.left_gain = 1.0; self.right_gain = 1.0; return;
-        }
+    fn gains_for(&self, frame: &AudioFrame) -> (f32, f32) {
+        let Some(source) = frame.position else { return (1.0, 1.0); };
+        let Ok(listener) = self.listener.lock() else { return (1.0, 1.0); };
+        if !listener.active { return (1.0, 1.0); }
         let dx = source[0] - listener.x;
         let dy = source[1] - listener.y;
         let dz = source[2] - listener.z;
@@ -663,30 +663,42 @@ impl OutputAssembler {
         let pan = if distance > 0.001 {
             ((dx * listener.yaw.cos() - dz * listener.yaw.sin()) / distance).clamp(-1.0, 1.0)
         } else { 0.0 };
-        self.left_gain = attenuation * (1.0 - pan).clamp(0.0, 1.0) as f32;
-        self.right_gain = attenuation * (1.0 + pan).clamp(0.0, 1.0) as f32;
+        (
+            attenuation * (1.0 - pan).clamp(0.0, 1.0),
+            attenuation * (1.0 + pan).clamp(0.0, 1.0),
+        )
     }
 
+    /// Mix active speakers on the same timeline instead of serializing each
+    /// received frame into a single-speaker playback queue.
     fn next_stereo(&mut self) -> [i16; 2] {
-        if self.current.is_none() || self.position >= FRAME_SAMPLES as f64 {
-            self.current = self.rx.try_recv().ok();
-            self.position = 0.0;
-            self.update_spatial_gain();
+        for frame in self.rx.try_iter() {
+            if self.active.len() >= 32 { break; }
+            let (left_gain, right_gain) = self.gains_for(&frame);
+            self.active.push(PlaybackFrame { frame, position: 0.0, left_gain, right_gain });
         }
-        let Some(frame) = self.current.as_ref() else { return [0, 0]; };
-        let index = self.position.floor() as usize;
-        let next = (index + 1).min(FRAME_SAMPLES - 1);
-        let fraction = (self.position - index as f64) as f32;
-        let sample = frame.pcm[index] as f32
-            + (frame.pcm[next] as f32 - frame.pcm[index] as f32) * fraction;
-        self.position += self.step;
+
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        let step = self.step;
+        self.active.retain_mut(|voice| {
+            if voice.position >= FRAME_SAMPLES as f64 { return false; }
+            let index = voice.position.floor() as usize;
+            let next = (index + 1).min(FRAME_SAMPLES - 1);
+            let fraction = (voice.position - index as f64) as f32;
+            let pcm = &voice.frame.pcm;
+            let sample = pcm[index] as f32 + (pcm[next] as f32 - pcm[index] as f32) * fraction;
+            left += sample * voice.left_gain;
+            right += sample * voice.right_gain;
+            voice.position += step;
+            voice.position < FRAME_SAMPLES as f64
+        });
         [
-            (sample * self.left_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16,
-            (sample * self.right_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+            left.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+            right.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
         ]
     }
 }
-
 fn build_output_stream(
     device: &cpal::Device,
     rx: Receiver<AudioFrame>,
