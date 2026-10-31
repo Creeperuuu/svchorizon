@@ -11,7 +11,7 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - Official TCP request-secret / secret handshake hooks.
 - AES-128-GCM encrypted UDP transport and authentication.
 - Vendored pure-Rust Opus codec.
-- CPAL microphone capture and speaker playback.
+- CPAL microphone capture and speaker playback, selectable input/output devices (F6/F7) with live stream reconfiguration.
 - Push-to-talk (V), hold-to-whisper (B), toggleable RMS voice activation (C), and microphone mute (M, synchronized to the server's client-state packet).
 - Concurrent per-speaker mixing, bounded sequence reordering, and short-burst Opus packet-loss concealment.
 - Per-player volume/mute and microphone-gain engine controls, plus basic player/location spatial audio.
@@ -20,7 +20,7 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - Official volume-category add/remove payload decoding, bounded metadata storage, and a native HUD summary of server-provided categories.
 - Connection and voice-activation HUD indicators, plus exponential-backoff UDP reconnect attempts while the Minecraft server session remains active.
 
-The implementation is not yet complete: password entry and group customization, persistent player controls, recording-related TCP controls, device selection/settings UI, server-transfer edge cases and end-to-end interoperability testing are outstanding. Player controls are currently keybind-driven rather than a full player-list screen.
+The implementation is not yet complete: password entry and group customization, persistent player controls, recording-related TCP controls, persistent audio settings UI, server-transfer edge cases and end-to-end interoperability testing are outstanding. Player controls are currently keybind-driven rather than a full player-list screen.
 
 ## Build and validate
 
