@@ -18,6 +18,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Format Rust sources
+        run: cargo fmt --all
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
