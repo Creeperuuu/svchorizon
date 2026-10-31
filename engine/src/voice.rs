@@ -224,9 +224,12 @@ impl VoiceClient {
     pub fn set_player_volume(&self, player: [u8; 16], volume: f32) {
         if let Ok(mut settings) = self.player_audio_settings.write() {
             if !settings.contains_key(&player) && settings.len() >= 128 { return; }
-            let entry = settings.entry(player).or_default();
-            entry.volume = if volume.is_finite() { volume.clamp(0.0, 2.0) } else { 1.0 };
-            if entry.volume == 1.0 && !entry.muted { settings.remove(&player); }
+            let remove = {
+                let entry = settings.entry(player).or_default();
+                entry.volume = if volume.is_finite() { volume.clamp(0.0, 2.0) } else { 1.0 };
+                entry.volume == 1.0 && !entry.muted
+            };
+            if remove { settings.remove(&player); }
         }
     }
 
@@ -234,9 +237,12 @@ impl VoiceClient {
     pub fn set_player_muted(&self, player: [u8; 16], muted: bool) {
         if let Ok(mut settings) = self.player_audio_settings.write() {
             if !settings.contains_key(&player) && settings.len() >= 128 { return; }
-            let entry = settings.entry(player).or_default();
-            entry.muted = muted;
-            if entry.volume == 1.0 && !entry.muted { settings.remove(&player); }
+            let remove = {
+                let entry = settings.entry(player).or_default();
+                entry.muted = muted;
+                entry.volume == 1.0 && !entry.muted
+            };
+            if remove { settings.remove(&player); }
         }
     }
 
