@@ -23,6 +23,7 @@ Last updated: 2026-10-31.
 - [x] Outgoing whisper-mode flag control for microphone packets, exposed as a hold-to-whisper keybind.
 - [x] Optional RMS voice activation with a native toggle keybind (default C).
 - [x] Local microphone mute toggle (default M) that gates both push-to-talk and voice activation.
+- [x] Microphone amplification setter (0–400%) in the native audio engine.
 - [x] Bounded per-speaker Opus jitter queues with sequence reordering, a 40 ms gap window and decoder-driven concealment for up to three missing frames.
 - [x] Manual-only Windows/Linux protocol tests, Windows engine compile, Linux native-mixin validation and .hnmod packaging workflow.
 - [x] Source-only .hnmod packager with pinned Horizon and horizon-mixins revisions.
@@ -35,7 +36,7 @@ Last updated: 2026-10-31.
 - [ ] Wire group payload codecs into native controls; add group discovery, password prompts, invites, group settings and full group UI. Group sound reception and the official group packet codecs are implemented, but group actions are not yet exposed in-game.
 - [ ] Static/entity sound packet variants and the rest of the official packet catalogue.
 - [ ] Per-player ignore UI/persistence, whisper-target selection, and recording controls. Native per-player volume/mute setters and outgoing whisper flag control exist, but are not yet exposed through a complete in-game player menu.
-- [ ] Microphone/speaker device selection, persistent audio settings UI and voice-activation threshold slider. Basic RMS voice activation is implemented and toggleable.
+- [ ] Microphone/speaker device selection, persistent audio settings UI and in-game gain/voice-activation threshold sliders. Engine setters for microphone gain and RMS threshold are implemented.
 - [ ] Disconnect/reconfigure edge cases, reconnect backoff and server transfer testing.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
 
