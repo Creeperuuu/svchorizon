@@ -708,6 +708,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_official_player_state_flags_and_optional_group() {
+        let mut bytes = vec![0b0011_1111];
+        bytes.extend_from_slice(&[0x11; 16]);
+        write_utf(&mut bytes, "TestPlayer");
+        bytes.extend_from_slice(&[0x22; 16]);
+        let mut cursor = Cursor::new(&bytes);
+        let player = decode_player_state(&mut cursor).unwrap();
+        assert!(cursor.done());
+        assert_eq!(player.id, [0x11; 16]);
+        assert_eq!(player.name, "TestPlayer");
+        assert!(player.server_muted);
+        assert!(player.force_muted);
+        assert!(player.disabled);
+        assert!(player.force_disabled);
+        assert!(player.disconnected);
+        assert_eq!(player.group, Some([0x22; 16]));
+        assert_eq!(player.volume, 1.0);
+        assert!(!player.ignored);
+    }
+
+    #[test]
     fn parses_secret_payload_in_upstream_field_order() {
         let mut bytes = vec![0x42; 16];
         bytes.extend_from_slice(&24454i32.to_be_bytes());
