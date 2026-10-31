@@ -1217,6 +1217,42 @@ mod tests {
     }
 
     #[test]
+    fn jitter_buffer_reorders_packets_for_each_speaker() {
+        let now = Instant::now();
+        let make = |sequence| PendingAudio {
+            sender: [4; 16],
+            sequence,
+            opus: vec![sequence as u8],
+            position: None,
+            max_distance: None,
+        };
+        let mut jitter = AudioJitterBuffer::default();
+
+        assert_eq!(jitter.push(make(10), now).len(), 1);
+        assert!(jitter.push(make(12), now).is_empty());
+        let ready = jitter.push(make(11), now + Duration::from_millis(10));
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![11, 12]);
+    }
+
+    #[test]
+    fn jitter_buffer_skips_a_missing_packet_after_its_reorder_window() {
+        let now = Instant::now();
+        let make = |sequence| PendingAudio {
+            sender: [5; 16],
+            sequence,
+            opus: vec![sequence as u8],
+            position: None,
+            max_distance: None,
+        };
+        let mut jitter = AudioJitterBuffer::default();
+
+        assert_eq!(jitter.push(make(20), now).len(), 1);
+        assert!(jitter.push(make(22), now).is_empty());
+        let ready = jitter.poll(now + Duration::from_millis(41));
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![22]);
+    }
+
+    #[test]
     fn rejects_varint_overflow() {
         let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
         assert!(reader.varint().is_none());
