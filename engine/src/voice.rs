@@ -14,7 +14,7 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -215,6 +215,8 @@ pub struct VoiceClient {
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     whispering: Arc<AtomicBool>,
+    voice_activation: Arc<AtomicBool>,
+    voice_activation_threshold: Arc<AtomicU32>,
     connected: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
@@ -257,6 +259,8 @@ impl VoiceClient {
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
         let whispering = Arc::new(AtomicBool::new(false));
+        let voice_activation = Arc::new(AtomicBool::new(false));
+        let voice_activation_threshold = Arc::new(AtomicU32::new(0.025f32.to_bits()));
         let connected = Arc::new(AtomicBool::new(false));
 
         let audio_running = Arc::clone(&running);
@@ -265,11 +269,13 @@ impl VoiceClient {
         let audio_events = event_tx.clone();
         let audio_listener = Arc::clone(&listener);
         let audio_settings = Arc::clone(&player_audio_settings);
+        let audio_voice_activation = Arc::clone(&voice_activation);
+        let audio_voice_threshold = Arc::clone(&voice_activation_threshold);
         let audio_worker = thread::Builder::new()
             .name("svchorizon-audio".into())
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
-                audio_settings,
+                audio_settings, audio_voice_activation, audio_voice_threshold,
             ))
             .map_err(VoiceError::Io)?;
 
@@ -295,7 +301,8 @@ impl VoiceClient {
         };
 
         Ok(Self {
-            command_tx, event_rx, running, transmitting, whispering, connected,
+            command_tx, event_rx, running, transmitting, whispering,
+            voice_activation, voice_activation_threshold, connected,
             worker: Some(worker), audio_worker, listener, player_positions, player_audio_settings,
         })
     }
@@ -316,6 +323,17 @@ impl VoiceClient {
 
     pub fn is_transmitting(&self) -> bool {
         self.transmitting.load(Ordering::Relaxed)
+    }
+
+    /// Enable voice activation and set its normalized RMS threshold (0.0..=1.0).
+    pub fn set_voice_activation(&self, enabled: bool, threshold: f32) {
+        let threshold = if threshold.is_finite() { threshold.clamp(0.0, 1.0) } else { 0.025 };
+        self.voice_activation_threshold.store(threshold.to_bits(), Ordering::Relaxed);
+        self.voice_activation.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_voice_activation_enabled(&self) -> bool {
+        self.voice_activation.load(Ordering::Relaxed)
     }
 
     /// Set a speaker's playback level. Values are clamped to 0.0..=2.0.
@@ -662,13 +680,17 @@ fn run_audio_io(
     events: SyncSender<VoiceEvent>,
     listener: Arc<Mutex<ListenerPose>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
+    voice_activation: Arc<AtomicBool>,
+    voice_activation_threshold: Arc<AtomicU32>,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
     let mut streams = Vec::new();
 
     match host.default_input_device() {
-        Some(device) => match build_input_stream(&device, command_tx, transmitting, events.clone()) {
+        Some(device) => match build_input_stream(
+            &device, command_tx, transmitting, voice_activation, voice_activation_threshold, events.clone(),
+        ) {
             Ok(stream) => if let Err(error) = stream.play() {
                 let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {error}")));
             } else { streams.push(stream); },
@@ -717,7 +739,24 @@ impl InputAssembler {
             self.frame[self.frame_pos] = (value * 32767.0) as i16;
             self.frame_pos += 1;
             if self.frame_pos == FRAME_SAMPLES {
-                if self.transmitting.load(Ordering::Relaxed) {
+                let ptt = self.transmitting.load(Ordering::Relaxed);
+                let voice_activation = self.voice_activation.load(Ordering::Relaxed);
+                let should_send = if ptt {
+                    true
+                } else if voice_activation {
+                    let energy = self.frame.iter()
+                        .map(|sample| {
+                            let normalized = *sample as f32 / 32768.0;
+                            normalized * normalized
+                        })
+                        .sum::<f32>() / FRAME_SAMPLES as f32;
+                    let rms = energy.sqrt();
+                    let threshold = f32::from_bits(self.voice_activation_threshold.load(Ordering::Relaxed));
+                    rms >= threshold
+                } else {
+                    false
+                };
+                if should_send {
                     let _ = self.tx.try_send(Command::Pcm(self.frame));
                 }
                 self.frame = [0; FRAME_SAMPLES];
@@ -732,6 +771,8 @@ fn build_input_stream(
     device: &cpal::Device,
     tx: SyncSender<Command>,
     transmitting: Arc<AtomicBool>,
+    voice_activation: Arc<AtomicBool>,
+    voice_activation_threshold: Arc<AtomicU32>,
     events: SyncSender<VoiceEvent>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
@@ -742,7 +783,9 @@ fn build_input_stream(
     let rate = config.sample_rate.0;
     match format {
         cpal::SampleFormat::F32 => {
-            let mut input = InputAssembler::new(rate, tx, transmitting);
+            let mut input = InputAssembler::new(
+                rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+            );
             let errors = events;
             device.build_input_stream(&config, move |data: &[f32], _| {
                 for frame in data.chunks(channels) {
