@@ -258,13 +258,14 @@ fn resolve_voice_address(
     game_server_host: &str,
     default_port: u16,
 ) -> Result<SocketAddr, VoiceError> {
-    let (host, mut port) = if voice_host.trim().is_empty() {
-        (game_server_host.trim(), default_port)
+    let fallback_host = split_host_port(game_server_host.trim())?.0;
+    let (host, port) = if voice_host.trim().is_empty() {
+        (fallback_host, default_port)
     } else if let Ok(override_port) = voice_host.trim().parse::<u16>() {
         if override_port == 0 {
             return Err(VoiceError::Resolve("voice_host port is zero".into()));
         }
-        (game_server_host.trim(), override_port)
+        (fallback_host, override_port)
     } else {
         let (host, override_port) = split_host_port(voice_host.trim())?;
         (host, override_port.unwrap_or(default_port))
