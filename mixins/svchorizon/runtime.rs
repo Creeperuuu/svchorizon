@@ -533,6 +533,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
         *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
         RECONNECTING.store(false, Ordering::Release);
+        GROUPS_ENABLED.store(false, Ordering::Release);
         return;
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
