@@ -14,6 +14,11 @@ static SELF_MUTED: AtomicBool = AtomicBool::new(false);
 static SELF_MUTE_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static LOCAL_PLAYER_UUID: OnceLock<Mutex<Option<[u8; 16]>>> = OnceLock::new();
+
+fn local_player_uuid() -> &'static Mutex<Option<[u8; 16]>> {
+    LOCAL_PLAYER_UUID.get_or_init(|| Mutex::new(None))
+}
 static GROUP_CREATE_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_NEXT_DOWN: AtomicBool = AtomicBool::new(false);
 static GROUP_JOIN_DOWN: AtomicBool = AtomicBool::new(false);
@@ -261,6 +266,7 @@ fn preserve_player_controls(player: &mut NativePlayer, old: &[NativePlayer]) {
 }
 
 fn on_player_payload(channel: &str, bytes: &[u8]) {
+    let local_id = *local_player_uuid().lock().expect("SVC local player state poisoned");
     let mut state = group_state().lock().expect("SVC player state poisoned");
     match channel {
         "voicechat:states" => {
@@ -271,6 +277,7 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
             let mut players = Vec::with_capacity(count.min(128));
             for _ in 0..count {
                 let Some(mut player) = decode_player_state(&mut cursor) else { return; };
+                if Some(player.id) == local_id { continue; }
                 preserve_player_controls(&mut player, &old);
                 if players.len() < 128 && !players.iter().any(|entry: &NativePlayer| entry.id == player.id) {
                     players.push(player);
@@ -285,6 +292,7 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
             let mut cursor = Cursor::new(bytes);
             let Some(mut player) = decode_player_state(&mut cursor) else { return; };
             if !cursor.done() { return; }
+            if Some(player.id) == local_id { return; }
             preserve_player_controls(&mut player, &state.players);
             if let Some(existing) = state.players.iter_mut().find(|entry| entry.id == player.id) {
                 *existing = player;
@@ -430,6 +438,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             .take();
         drop(old_client);
         *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
+        *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
         return;
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
@@ -661,6 +670,7 @@ pub fn on_packet(
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
             voice_client().lock().expect("SVC client state poisoned").take();
             *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
+            *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") { send_secret_request(game); }
@@ -668,6 +678,7 @@ pub fn on_packet(
         Clientbound::CustomPayload(payload) if payload.channel == SECRET && game.native_on("svchorizon") => {
             match decode_secret(&payload.data) {
                 Some(info) => {
+                    *local_player_uuid().lock().expect("SVC local player state poisoned") = Some(info.player);
                     let fallback_host = game.remote.as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
