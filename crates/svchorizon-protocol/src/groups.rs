@@ -19,6 +19,8 @@ pub enum GroupPayloadError {
     Wire(#[from] WireError),
     #[error("group name must be 1–24 characters and cannot start with whitespace or contain control characters")]
     InvalidName,
+    #[error("group password exceeds the upstream length limit")]
+    PasswordTooLong,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +65,7 @@ pub fn encode_create_group(
 ) -> Result<Vec<u8>, GroupPayloadError> {
     validate_group_name(name)?;
     if password.is_some_and(|value| value.chars().count() > 24) {
-        return Err(GroupPayloadError::InvalidName);
+        return Err(GroupPayloadError::PasswordTooLong);
     }
     let mut w = Writer::default();
     write_utf(&mut w, name);
@@ -80,7 +82,7 @@ pub fn encode_join_group(
     password: Option<&str>,
 ) -> Result<Vec<u8>, GroupPayloadError> {
     if password.is_some_and(|value| value.chars().count() > 512) {
-        return Err(GroupPayloadError::InvalidName);
+        return Err(GroupPayloadError::PasswordTooLong);
     }
     let mut w = Writer::default();
     w.uuid(group_id);
@@ -180,6 +182,29 @@ mod tests {
             group_id: Some(id),
             wrong_password: false,
         });
+    }
+
+    #[test]
+    fn decodes_group_list_and_removal_payloads() {
+        let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let mut w = Writer::default();
+        w.uuid(id);
+        w.utf("Friends");
+        w.bool(true);
+        w.bool(false);
+        w.bool(true);
+        w.raw(&1i16.to_be_bytes());
+        let group = ClientGroup::decode(&w.data).unwrap();
+        assert_eq!(group.id, id);
+        assert_eq!(group.name, "Friends");
+        assert!(group.has_password);
+        assert!(!group.persistent);
+        assert!(group.hidden);
+        assert_eq!(group.group_type, GroupType::Open);
+
+        let mut remove = Writer::default();
+        remove.uuid(id);
+        assert_eq!(decode_remove_group(&remove.data).unwrap(), id);
     }
 
     #[test]
