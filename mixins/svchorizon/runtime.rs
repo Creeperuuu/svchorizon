@@ -126,7 +126,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
 
 pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     let binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
-    if key == binding {
+    if key == binding.as_str() {
         PTT_DOWN.store(pressed, Ordering::Relaxed);
         if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
             client.set_transmitting(pressed && game.native_on("svchorizon") && game.native_playing());
