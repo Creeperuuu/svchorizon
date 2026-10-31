@@ -7,6 +7,7 @@ const SECRET: &str = "voicechat:secret";
 
 static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 static PTT_DOWN: AtomicBool = AtomicBool::new(false);
+static WHISPER_DOWN: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -114,11 +115,18 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
         id: "svchorizon".to_owned(),
         title: "SVC Horizon 0.1.0".to_owned(),
         description: "Simple Voice Chat native client".to_owned(),
-        keys: vec![[
-            "push_to_talk".to_owned(),
-            "Push to talk".to_owned(),
-            "key.keyboard.v".to_owned(),
-        ]],
+        keys: vec![
+            [
+                "push_to_talk".to_owned(),
+                "Push to talk".to_owned(),
+                "key.keyboard.v".to_owned(),
+            ],
+            [
+                "whisper_mode".to_owned(),
+                "Hold to whisper".to_owned(),
+                "key.keyboard.b".to_owned(),
+            ],
+        ],
     });
 }
 
@@ -137,6 +145,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
         }
         PTT_DOWN.store(false, Ordering::Relaxed);
+        WHISPER_DOWN.store(false, Ordering::Relaxed);
         let old_client = voice_client().lock()
             .expect("SVC client state poisoned")
             .take();
@@ -160,6 +169,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     }
     client.set_player_positions(positions);
     client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && game.native_playing());
+    client.set_whispering(WHISPER_DOWN.load(Ordering::Relaxed) && game.native_playing());
 }
 
 /// Push-to-talk is a hold binding. Releasing it always stops transmission.
@@ -167,14 +177,20 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     if !game.native_on("svchorizon") || !game.native_window() {
         return;
     }
-    let binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
-    if key != binding {
-        return;
-    }
-    let transmitting = pressed && game.native_playing();
-    PTT_DOWN.store(transmitting, Ordering::Relaxed);
-    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-        client.set_transmitting(transmitting);
+    let ptt_binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
+    let whisper_binding = game.native_mod_key("svchorizon", "whisper_mode", "key.keyboard.b");
+    if key == ptt_binding {
+        let transmitting = pressed && game.native_playing();
+        PTT_DOWN.store(transmitting, Ordering::Relaxed);
+        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+            client.set_transmitting(transmitting);
+        }
+    } else if key == whisper_binding {
+        let whispering = pressed && game.native_playing();
+        WHISPER_DOWN.store(whispering, Ordering::Relaxed);
+        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+            client.set_whispering(whispering);
+        }
     }
 }
 
@@ -209,6 +225,7 @@ pub fn on_packet(
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
             voice_client().lock().expect("SVC client state poisoned").take();
             PTT_DOWN.store(false, Ordering::Relaxed);
+            WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") { send_secret_request(game); }
         }
         Clientbound::CustomPayload(payload) if payload.channel == SECRET && game.native_on("svchorizon") => {
