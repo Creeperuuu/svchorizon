@@ -126,6 +126,18 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
 pub fn on_tick(game: &mut crate::game::Game<'_>) {
     poll_voice_events();
 
+    // Game::leave_server clears Remote. Stop both workers when the Minecraft
+    // connection ends so a transfer or return to title cannot leak a UDP socket.
+    if game.remote.is_none() {
+        SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+        PTT_DOWN.store(false, Ordering::Relaxed);
+        let old_client = voice_client().lock()
+            .expect("SVC client state poisoned")
+            .take();
+        drop(old_client);
+        return;
+    }
+
     let player = game.native_player();
     let positions = game.remote.as_ref()
         .map(crate::game::remote::svchorizon_voice::player_positions)
