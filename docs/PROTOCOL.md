@@ -38,7 +38,7 @@ The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, t
 | `voicechat:remove_group` | Server → client | Removes group metadata |
 | `voicechat:joined_group` | Server → client | Tracks active group and wrong-password result |
 | `voicechat:create_group` | Client → server | Creates a public group named Horizon |
-| `voicechat:set_group` | Client → server | Joins a selected unlocked group |
+| `voicechat:set_group` | Client → server | Joins a selected group, optionally with its password |
 | `voicechat:leave_group` | Client → server | Leaves the active group |
 | `voicechat:add_category` | Server → client | Decodes and tracks bounded volume-category metadata, including optional fields and 16×16 icon bytes |
 | `voicechat:remove_category` | Server → client | Removes a category by ID |
@@ -77,14 +77,13 @@ The client repeats AuthenticatePacket until AuthenticateAckPacket, then repeats 
 | 0x09 | ConnectionCheckPacket | Client encoding implemented |
 | 0x0a | ConnectionCheckAckPacket | Server decoding implemented |
 
-The voice engine uses a vendored pure-Rust Opus implementation and CPAL. It captures mono microphone audio, resamples to 48 kHz, encodes 20 ms frames, decodes incoming Opus frames, and resamples for the default speaker device. Player voice is spatialized using Horizon's tracked player positions; location sound uses packet coordinates; group sound is currently centered. Per-speaker playback queues allow multiple speakers to overlap, with bounded sequence reordering and short-burst Opus packet-loss concealment.
+The voice engine uses a vendored pure-Rust Opus implementation and CPAL. It captures mono microphone audio, resamples to 48 kHz, encodes 20 ms frames, decodes incoming Opus frames, and resamples for the selected speaker device (or operating-system default). Player voice is spatialized using Horizon's tracked player positions; location sound uses packet coordinates; group sound is currently centered. Per-speaker playback queues allow multiple speakers to overlap, with bounded sequence reordering and short-burst Opus packet-loss concealment.
 
 ## Remaining protocol and integration work
 
 - Group invites, persistent group settings and full group UI. Password entry and custom group names/types are available through native chat commands.
 - Category-specific volume sliders and the complete settings interface.
 - Recording-related TCP controls and recording UI.
-- Audio input/output device selection and safe stream reconfiguration.
 - End-to-end interoperability testing against the official Paper/Spigot plugin and official Fabric/Forge/NeoForge clients.
 
 This document describes intended wire behavior and source-level implementation; it is not an interoperability certification.
