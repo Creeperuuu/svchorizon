@@ -125,9 +125,9 @@ impl VoiceClient {
         socket.connect(address)?;
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
 
-        let (command_tx, command_rx) = mpsc::sync_channel(32);
+        let (command_tx, command_rx) = mpsc::sync_channel(8);
         let (event_tx, event_rx) = mpsc::sync_channel(32);
-        let (audio_tx, audio_rx) = mpsc::sync_channel(32);
+        let (audio_tx, audio_rx) = mpsc::sync_channel(8);
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
