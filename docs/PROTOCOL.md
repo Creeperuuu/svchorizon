@@ -43,7 +43,7 @@ The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, t
 | `voicechat:add_category` | Server → client | Decodes and tracks bounded volume-category metadata, including optional fields and 16×16 icon bytes |
 | `voicechat:remove_category` | Server → client | Removes a category by ID |
 
-Category metadata is currently surfaced as a compact HUD summary; category-specific volume controls and the full settings interface are not implemented. Password-protected groups are recognized but cannot yet be joined because password text entry is not implemented. Recording-related controls remain outstanding.
+Category metadata is currently surfaced as a compact HUD summary; category-specific volume controls and the full settings interface are not implemented. Password-protected groups can be joined through `/svchorizon group join <password>`. Custom group names, optional passwords and NORMAL/OPEN/ISOLATED types can be created through `/svchorizon group create <name> [password|-] [type]`. Recording-related controls remain outstanding.
 
 ## UDP envelope and encryption
 
@@ -81,7 +81,7 @@ The voice engine uses a vendored pure-Rust Opus implementation and CPAL. It capt
 
 ## Remaining protocol and integration work
 
-- Password entry, custom group names/types, invites and full group UI.
+- Group invites, persistent group settings and full group UI. Password entry and custom group names/types are available through native chat commands.
 - Category-specific volume sliders and the complete settings interface.
 - Recording-related TCP controls and recording UI.
 - Audio input/output device selection and safe stream reconfiguration.
