@@ -19,6 +19,12 @@ def prepare_bundle(bundle: Path) -> None:
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(source, destination)
+    tests_source = ROOT / "engine" / "tests"
+    if tests_source.is_dir():
+        tests_target = bundle / "engine" / "tests"
+        if tests_target.exists():
+            shutil.rmtree(tests_target)
+        shutil.copytree(tests_source, tests_target)
     shutil.copy2(ROOT / "engine" / "COPYING", bundle / "engine" / "COPYING")
 
 def package():
