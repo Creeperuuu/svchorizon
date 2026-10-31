@@ -8,7 +8,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     fmt,
     net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
