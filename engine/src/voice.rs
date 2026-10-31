@@ -750,11 +750,29 @@ struct InputAssembler {
     frame_pos: usize,
     tx: SyncSender<Command>,
     transmitting: Arc<AtomicBool>,
+    voice_activation: Arc<AtomicBool>,
+    voice_activation_threshold: Arc<AtomicU32>,
 }
 impl InputAssembler {
-    fn new(input_rate: u32, tx: SyncSender<Command>, transmitting: Arc<AtomicBool>) -> Self {
-        Self { input_rate: input_rate.max(1), phase: 0, previous: 0.0,
-            has_previous: false, frame: [0; FRAME_SAMPLES], frame_pos: 0, tx, transmitting }
+    fn new(
+        input_rate: u32,
+        tx: SyncSender<Command>,
+        transmitting: Arc<AtomicBool>,
+        voice_activation: Arc<AtomicBool>,
+        voice_activation_threshold: Arc<AtomicU32>,
+    ) -> Self {
+        Self {
+            input_rate: input_rate.max(1),
+            phase: 0,
+            previous: 0.0,
+            has_previous: false,
+            frame: [0; FRAME_SAMPLES],
+            frame_pos: 0,
+            tx,
+            transmitting,
+            voice_activation,
+            voice_activation_threshold,
+        }
     }
     fn push(&mut self, sample: f32) {
         let sample = sample.clamp(-1.0, 1.0);
