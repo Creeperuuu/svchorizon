@@ -21,7 +21,7 @@ Last updated: 2026-10-31.
 - [x] Per-player playback volume (0–200%) and mute controls in the native audio engine.
 - [x] Outgoing whisper-mode flag control for microphone packets, exposed as a hold-to-whisper keybind.
 - [x] Optional RMS voice activation with a native toggle keybind (default C).
-- [x] Bounded per-speaker Opus jitter queues with sequence reordering and 40 ms gap recovery before decoding.
+- [x] Bounded per-speaker Opus jitter queues with sequence reordering, a 40 ms gap window and decoder-driven concealment for up to three missing frames.
 - [x] Manual-only Windows/Linux protocol tests, Windows engine compile, Linux native-mixin validation and .hnmod packaging workflow.
 - [x] Source-only .hnmod packager with pinned Horizon and horizon-mixins revisions.
 
@@ -29,7 +29,7 @@ Last updated: 2026-10-31.
 
 - [ ] Real Paper/Spigot interoperability tests against the official plugin and unmodified Fabric/Forge/NeoForge clients.
 - [ ] Run and pass the manual GitHub Actions workflow; the source has not yet been build-validated.
-- [ ] Opus packet-loss concealment (PLC), adaptive jitter delay and end-to-end packet scheduling validation. Sequence reordering and bounded gap recovery are implemented.
+- [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Group creation, join/leave, invites, group settings and full group UI. Group sound reception is implemented, but group management is not.
 - [ ] Static/entity sound packet variants and the rest of the official packet catalogue.
 - [ ] Per-player ignore UI/persistence, whisper-target selection, and recording controls. Native per-player volume/mute setters and outgoing whisper flag control exist, but are not yet exposed through a complete in-game player menu.
