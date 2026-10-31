@@ -12,6 +12,7 @@ Last updated: 2026-10-31.
 - [x] TCP `voicechat:request_secret` payload and `voicechat:secret` metadata decoder.
 - [x] Official group create/join/leave request codecs and joined/add/remove group response decoders.
 - [x] Official player-state, player-state-list and remove-player-state payload parsing, including all upstream state flags and optional group UUID.
+- [x] Official add/remove volume-category payload decoding with bounded metadata, optional translation fields and 16x16 icon handling; category metadata is tracked and surfaced in the native HUD.
 - [x] Native player selection, local ignore/mute and individual volume adjustment keybinds, backed by the engine's per-speaker mixer controls.
 - [x] Native group discovery, group cycling, quick-create, join-public-group and leave-group keybinds; password-protected groups are identified but cannot yet be joined until password entry is implemented.
 - [x] Native Horizon packet hook sends the request on play login and consumes the server's secret response.
@@ -38,7 +39,7 @@ Last updated: 2026-10-31.
 - [ ] Run and pass the manual GitHub Actions workflow; the source has not yet been build-validated.
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Password entry, custom group names/types, invites, group settings and full group UI. Basic group discovery, cycling, quick-create, public join and leave controls are now wired to the native runtime.
-- [ ] Remaining TCP custom payloads for player states, categories and recording-related controls. The official UDP microphone/player/group/location sound variants and connection packets are implemented.
+- [ ] Remaining TCP custom payloads for recording-related controls and any newly introduced upstream extensions. Player-state and volume-category payloads are now decoded; the official UDP microphone/player/group/location sound variants and connection packets are implemented.
 - [ ] Full player-list screen, persistent per-player preferences, whisper-target selection, and recording controls. Player-state parsing and keybind-driven per-player ignore/volume controls are implemented.
 - [ ] Microphone/speaker device selection, persistent audio settings UI and in-game gain/voice-activation threshold sliders. Engine setters for microphone gain and RMS threshold are implemented.
 - [ ] Server-transfer race testing, audio-device reconfiguration and real reconnect interoperability testing. Basic automatic reconnect with exponential backoff is implemented.
