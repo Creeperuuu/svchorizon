@@ -1321,7 +1321,8 @@ mod tests {
         assert_eq!(jitter.push(make(20), now).len(), 1);
         assert!(jitter.push(make(22), now).is_empty());
         let ready = jitter.poll(now + Duration::from_millis(41));
-        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![22]);
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![21, 22]);
+        assert!(ready[0].opus.is_empty());
     }
 
     #[test]
