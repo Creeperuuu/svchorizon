@@ -138,6 +138,23 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
     });
 }
 
+pub fn on_hud(
+    game: &crate::game::Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+) {
+    if !game.native_playing() || !game.native_on("svchorizon") { return; }
+    let guard = voice_client().lock().expect("SVC client state poisoned");
+    let Some(client) = guard.as_ref() else { return; };
+    let (label, color) = if client.is_transmitting() {
+        ("SVC: Transmitting", 0x55FF55)
+    } else if client.is_connected() {
+        ("SVC: Connected", 0xFFFFFF)
+    } else {
+        ("SVC: Connecting", 0xFFCC55)
+    };
+    game.native_text(batch, label, [8.0, 42.0], color, true);
+}
+
 pub fn on_packet(
     game: &mut crate::game::Game<'_>,
     packet: &horizon_protocol::packets::play::Clientbound,
