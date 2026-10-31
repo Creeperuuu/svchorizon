@@ -349,6 +349,10 @@ impl VoiceClient {
         self.transmitting.load(Ordering::Relaxed)
     }
 
+    pub fn is_whispering(&self) -> bool {
+        self.whispering.load(Ordering::Relaxed)
+    }
+
     /// Enable voice activation and set its normalized RMS threshold (0.0..=1.0).
     pub fn set_voice_activation(&self, enabled: bool, threshold: f32) {
         let threshold = if threshold.is_finite() { threshold.clamp(0.0, 1.0) } else { 0.025 };
