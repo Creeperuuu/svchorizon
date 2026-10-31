@@ -136,6 +136,14 @@ fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
     })
 }
 
+fn send_client_state(game: &mut crate::game::Game<'_>, muted: bool, disabled: bool) {
+    use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
+    game.send(Serverbound::CustomPayload(CustomPayload {
+        channel: "voicechat:client_state".to_owned(),
+        data: vec![u8::from(muted), u8::from(disabled)],
+    }));
+}
+
 fn send_secret_request(game: &mut crate::game::Game<'_>) {
     use horizon_protocol::packets::{
         configuration::CustomPayload,
@@ -521,6 +529,9 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         if pressed && !SELF_MUTE_KEY_DOWN.swap(true, Ordering::AcqRel) {
             let muted = !SELF_MUTED.load(Ordering::Relaxed);
             SELF_MUTED.store(muted, Ordering::Relaxed);
+            if game.native_playing() {
+                send_client_state(game, muted, false);
+            }
             if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
                 client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && !muted && game.native_playing());
                 client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed) && !muted, 0.025);
@@ -698,6 +709,7 @@ pub fn on_packet(
             match decode_secret(&payload.data) {
                 Some(info) => {
                     *local_player_uuid().lock().expect("SVC local player state poisoned") = Some(info.player);
+                    send_client_state(game, SELF_MUTED.load(Ordering::Relaxed), false);
                     {
                         let mut state = group_state().lock().expect("SVC player state poisoned");
                         state.players.retain(|player| player.id != info.player);
