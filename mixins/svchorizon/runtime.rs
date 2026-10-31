@@ -168,6 +168,12 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
 
+    let playing = game.native_playing();
+    if !playing {
+        PTT_DOWN.store(false, Ordering::Relaxed);
+        WHISPER_DOWN.store(false, Ordering::Relaxed);
+    }
+
     let player = game.native_player();
     let positions = game.remote.as_ref()
         .map(crate::game::remote::svchorizon_voice::player_positions)
@@ -183,8 +189,8 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     }
     client.set_player_positions(positions);
     let muted = SELF_MUTED.load(Ordering::Relaxed);
-    client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && !muted && game.native_playing());
-    client.set_whispering(WHISPER_DOWN.load(Ordering::Relaxed) && game.native_playing());
+    client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && !muted && playing);
+    client.set_whispering(WHISPER_DOWN.load(Ordering::Relaxed) && playing);
     client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed) && !muted, 0.025);
 }
 
