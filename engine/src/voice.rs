@@ -1,6 +1,6 @@
 //! Simple Voice Chat UDP client, AES-GCM envelope and Opus frame pipeline.
-//! The worker is independent of Horizon's game thread. Audio device I/O is
-//! layered on top of send_pcm()/VoiceEvent in the next integration stage.
+//! UDP and audio workers are independent of Horizon's game thread. CPAL
+//! captures mono PCM and plays decoded Opus frames; callers control PTT.
 
 use crate::{Application, OpusDecoder, OpusEncoder};
 use ring::{
@@ -382,6 +382,205 @@ fn emit_audio(
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
     let _ = events.try_send(pcm);
+}
+
+fn run_audio_io(
+    command_tx: SyncSender<Command>,
+    audio_rx: Receiver<[i16; FRAME_SAMPLES]>,
+    running: Arc<AtomicBool>,
+    transmitting: Arc<AtomicBool>,
+    events: SyncSender<VoiceEvent>,
+) {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let host = cpal::default_host();
+    let mut streams = Vec::new();
+
+    match host.default_input_device() {
+        Some(device) => match build_input_stream(&device, command_tx, transmitting, events.clone()) {
+            Ok(stream) => if let Err(error) = stream.play() {
+                let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {error}")));
+            } else { streams.push(stream); },
+            Err(error) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("microphone unavailable: {error}"))); }
+        },
+        None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no default microphone device".into())); }
+    }
+
+    match host.default_output_device() {
+        Some(device) => match build_output_stream(&device, audio_rx, events.clone()) {
+            Ok(stream) => if let Err(error) = stream.play() {
+                let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {error}")));
+            } else { streams.push(stream); },
+            Err(error) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("speaker unavailable: {error}"))); }
+        },
+        None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no default speaker device".into())); }
+    }
+
+    while running.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(50)); }
+    drop(streams);
+}
+
+struct InputAssembler {
+    input_rate: u32,
+    phase: u64,
+    previous: f32,
+    has_previous: bool,
+    frame: [i16; FRAME_SAMPLES],
+    frame_pos: usize,
+    tx: SyncSender<Command>,
+    transmitting: Arc<AtomicBool>,
+}
+impl InputAssembler {
+    fn new(input_rate: u32, tx: SyncSender<Command>, transmitting: Arc<AtomicBool>) -> Self {
+        Self { input_rate: input_rate.max(1), phase: 0, previous: 0.0,
+            has_previous: false, frame: [0; FRAME_SAMPLES], frame_pos: 0, tx, transmitting }
+    }
+    fn push(&mut self, sample: f32) {
+        let sample = sample.clamp(-1.0, 1.0);
+        if !self.has_previous { self.previous = sample; self.has_previous = true; return; }
+        self.phase += SAMPLE_RATE as u64;
+        while self.phase >= u64::from(self.input_rate) {
+            self.phase -= u64::from(self.input_rate);
+            let fraction = 1.0 - self.phase as f32 / SAMPLE_RATE as f32;
+            let value = self.previous + (sample - self.previous) * fraction;
+            self.frame[self.frame_pos] = (value * 32767.0) as i16;
+            self.frame_pos += 1;
+            if self.frame_pos == FRAME_SAMPLES {
+                if self.transmitting.load(Ordering::Relaxed) {
+                    let _ = self.tx.try_send(Command::Pcm(self.frame));
+                }
+                self.frame = [0; FRAME_SAMPLES];
+                self.frame_pos = 0;
+            }
+        }
+        self.previous = sample;
+    }
+}
+
+fn build_input_stream(
+    device: &cpal::Device,
+    tx: SyncSender<Command>,
+    transmitting: Arc<AtomicBool>,
+    events: SyncSender<VoiceEvent>,
+) -> Result<cpal::Stream, String> {
+    use cpal::traits::DeviceTrait;
+    let supported = device.default_input_config().map_err(|e| e.to_string())?;
+    let format = supported.sample_format();
+    let config = supported.config();
+    let channels = usize::from(config.channels).max(1);
+    let rate = config.sample_rate.0;
+    match format {
+        cpal::SampleFormat::F32 => {
+            let mut input = InputAssembler::new(rate, tx, transmitting);
+            let errors = events;
+            device.build_input_stream(&config, move |data: &[f32], _| {
+                for frame in data.chunks(channels) {
+                    input.push(frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32);
+                }
+            }, move |error| {
+                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("microphone stream error: {error}")));
+            }, None).map_err(|e| e.to_string())
+        }
+        cpal::SampleFormat::I16 => {
+            let mut input = InputAssembler::new(rate, tx, transmitting);
+            let errors = events;
+            device.build_input_stream(&config, move |data: &[i16], _| {
+                for frame in data.chunks(channels) {
+                    let mono = frame.iter().map(|s| *s as f32 / 32768.0).sum::<f32>()
+                        / frame.len().max(1) as f32;
+                    input.push(mono);
+                }
+            }, move |error| {
+                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("microphone stream error: {error}")));
+            }, None).map_err(|e| e.to_string())
+        }
+        cpal::SampleFormat::U16 => {
+            let mut input = InputAssembler::new(rate, tx, transmitting);
+            let errors = events;
+            device.build_input_stream(&config, move |data: &[u16], _| {
+                for frame in data.chunks(channels) {
+                    let mono = frame.iter().map(|s| (*s as f32 - 32768.0) / 32768.0).sum::<f32>()
+                        / frame.len().max(1) as f32;
+                    input.push(mono);
+                }
+            }, move |error| {
+                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("microphone stream error: {error}")));
+            }, None).map_err(|e| e.to_string())
+        }
+        other => Err(format!("unsupported microphone sample format {other:?}")),
+    }
+}
+
+struct OutputAssembler {
+    rx: Receiver<[i16; FRAME_SAMPLES]>,
+    current: Option<[i16; FRAME_SAMPLES]>,
+    position: f64,
+    step: f64,
+}
+impl OutputAssembler {
+    fn new(rx: Receiver<[i16; FRAME_SAMPLES]>, output_rate: u32) -> Self {
+        Self { rx, current: None, position: 0.0,
+            step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)) }
+    }
+    fn next_sample(&mut self) -> i16 {
+        if self.current.is_none() || self.position >= FRAME_SAMPLES as f64 {
+            self.current = self.rx.try_recv().ok();
+            self.position = 0.0;
+        }
+        let Some(frame) = self.current.as_ref() else { return 0; };
+        let index = self.position.floor() as usize;
+        let next = (index + 1).min(FRAME_SAMPLES - 1);
+        let fraction = (self.position - index as f64) as f32;
+        let sample = frame[index] as f32 + (frame[next] as f32 - frame[index] as f32) * fraction;
+        self.position += self.step;
+        sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    }
+}
+
+fn build_output_stream(
+    device: &cpal::Device,
+    rx: Receiver<[i16; FRAME_SAMPLES]>,
+    events: SyncSender<VoiceEvent>,
+) -> Result<cpal::Stream, String> {
+    use cpal::traits::DeviceTrait;
+    let supported = device.default_output_config().map_err(|e| e.to_string())?;
+    let format = supported.sample_format();
+    let config = supported.config();
+    let channels = usize::from(config.channels).max(1);
+    let rate = config.sample_rate.0;
+    match format {
+        cpal::SampleFormat::F32 => {
+            let mut output = OutputAssembler::new(rx, rate);
+            let errors = events;
+            device.build_output_stream(&config, move |data: &mut [f32], _| {
+                for frame in data.chunks_mut(channels) {
+                    frame.fill(output.next_sample() as f32 / 32768.0);
+                }
+            }, move |error| {
+                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
+            }, None).map_err(|e| e.to_string())
+        }
+        cpal::SampleFormat::I16 => {
+            let mut output = OutputAssembler::new(rx, rate);
+            let errors = events;
+            device.build_output_stream(&config, move |data: &mut [i16], _| {
+                for frame in data.chunks_mut(channels) { frame.fill(output.next_sample()); }
+            }, move |error| {
+                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
+            }, None).map_err(|e| e.to_string())
+        }
+        cpal::SampleFormat::U16 => {
+            let mut output = OutputAssembler::new(rx, rate);
+            let errors = events;
+            device.build_output_stream(&config, move |data: &mut [u16], _| {
+                for frame in data.chunks_mut(channels) {
+                    frame.fill((i32::from(output.next_sample()) + 32768) as u16);
+                }
+            }, move |error| {
+                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
+            }, None).map_err(|e| e.to_string())
+        }
+        other => Err(format!("unsupported speaker sample format {other:?}")),
+    }
 }
 
 #[derive(Debug)]
