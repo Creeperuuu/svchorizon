@@ -89,62 +89,23 @@ fn send_secret_request(game: &mut crate::game::Game<'_>) {
 
 fn poll_voice_events() {
     let mut guard = voice_client().lock().expect("SVC client state poisoned");
-    let Some(client) = guard.as_ref() else { return; };
-    while let Some(event) = client.poll_event() {
-        match event {
-            VoiceEvent::Connected => eprintln!("[svchorizon] Voice UDP authenticated and validated."),
-            VoiceEvent::Disconnected(reason) => eprintln!("[svchorizon] Voice disconnected: {reason}"),
-            VoiceEvent::AudioUnavailable(reason) => eprintln!("[svchorizon] Audio device warning: {reason}"),
+    let mut disconnected = false;
+    if let Some(client) = guard.as_ref() {
+        while let Some(event) = client.poll_event() {
+            match event {
+                VoiceEvent::Connected => eprintln!("[svchorizon] Voice UDP authenticated and validated."),
+                VoiceEvent::Disconnected(reason) => {
+                    eprintln!("[svchorizon] Voice disconnected: {reason}");
+                    disconnected = true;
+                }
+                VoiceEvent::AudioUnavailable(reason) => eprintln!("[svchorizon] Audio device warning: {reason}"),
+            }
         }
     }
-}
-
-
-pub fn on_tick(game: &mut crate::game::Game<'_>) {
-    poll_voice_events();
-    if game.remote.is_none() {
-        SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
-        voice_client().lock().expect("SVC client state poisoned").take();
+    if disconnected {
+        guard.take();
         PTT_DOWN.store(false, Ordering::Relaxed);
-        return;
     }
-    let enabled = game.native_on("svchorizon") && game.native_playing();
-    if !enabled { PTT_DOWN.store(false, Ordering::Relaxed); }
-    let positions = game.remote.as_ref()
-        .map(crate::game::remote::svchorizon_voice::player_positions)
-        .unwrap_or_default();
-    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-        client.set_player_positions(positions);
-        if let Some(player) = game.native_player() {
-            client.set_listener(player.x, player.y, player.z, player.yaw);
-        } else {
-            client.clear_listener();
-        }
-        client.set_transmitting(enabled && PTT_DOWN.load(Ordering::Relaxed));
-    }
-}
-
-pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
-    let binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
-    if key == binding.as_str() {
-        PTT_DOWN.store(pressed, Ordering::Relaxed);
-        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-            client.set_transmitting(pressed && game.native_on("svchorizon") && game.native_playing());
-        }
-    }
-}
-
-pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
-    mods.push(crate::game::native_hooks::NativeMod {
-        id: "svchorizon".into(),
-        title: "SVC Horizon 0.1.0".into(),
-        description: "Simple Voice Chat client for Horizon; connects to official voicechat servers.".into(),
-        keys: vec![[
-            "push_to_talk".into(),
-            "Push to talk".into(),
-            "key.keyboard.v".into(),
-        ]],
-    });
 }
 
 pub fn on_hud(
@@ -177,9 +138,9 @@ pub fn on_packet(
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
             voice_client().lock().expect("SVC client state poisoned").take();
             PTT_DOWN.store(false, Ordering::Relaxed);
-            send_secret_request(game);
+            if game.native_on("svchorizon") { send_secret_request(game); }
         }
-        Clientbound::CustomPayload(payload) if payload.channel == SECRET => {
+        Clientbound::CustomPayload(payload) if payload.channel == SECRET && game.native_on("svchorizon") => {
             match decode_secret(&payload.data) {
                 Some(info) => {
                     let fallback_host = game.remote.as_ref()
