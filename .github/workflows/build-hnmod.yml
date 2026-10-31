@@ -75,6 +75,10 @@ jobs:
           python-version: "3.12"
       - name: Stage bundled engine
         run: python tools/prepare_bundle.py
+      - name: Format engine sources
+        run: cargo fmt --manifest-path mixins/svchorizon/engine/Cargo.toml
+      - name: Check engine formatting
+        run: cargo fmt --manifest-path mixins/svchorizon/engine/Cargo.toml -- --check
       - name: Compile Opus, AES-GCM and CPAL on Windows
         run: cargo check --manifest-path mixins/svchorizon/engine/Cargo.toml
 
