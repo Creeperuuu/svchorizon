@@ -1402,6 +1402,26 @@ mod tests {
     }
 
     #[test]
+    fn microphone_gain_amplifies_and_clamps_input_samples() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut input = InputAssembler::new(
+            SAMPLE_RATE as u32,
+            tx,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0.025f32.to_bits())),
+            Arc::new(AtomicU32::new(2.0f32.to_bits())),
+        );
+        for _ in 0..=FRAME_SAMPLES {
+            input.push(0.1);
+        }
+        match rx.try_recv() {
+            Ok(Command::Pcm(frame)) => assert!((i32::from(frame[100]) - 6_553).abs() <= 1),
+            _ => panic!("expected an amplified PCM frame"),
+        }
+    }
+
+    #[test]
     fn rejects_varint_overflow() {
         let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
         assert!(reader.varint().is_none());
