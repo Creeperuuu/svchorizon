@@ -124,6 +124,7 @@ pub struct VoiceClient {
     event_rx: Receiver<VoiceEvent>,
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
+    whispering: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
@@ -165,6 +166,7 @@ impl VoiceClient {
         let player_audio_settings = Arc::new(RwLock::new(HashMap::new()));
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
+        let whispering = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
 
         let audio_running = Arc::clone(&running);
@@ -183,6 +185,7 @@ impl VoiceClient {
 
         let worker_running = Arc::clone(&running);
         let worker_transmitting = Arc::clone(&transmitting);
+        let worker_whispering = Arc::clone(&whispering);
         let worker_connected = Arc::clone(&connected);
         let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
@@ -190,7 +193,7 @@ impl VoiceClient {
             .spawn(move || {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
-                    worker_running, worker_transmitting, worker_connected, worker_positions,
+                    worker_running, worker_transmitting, worker_whispering, worker_connected, worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -202,7 +205,7 @@ impl VoiceClient {
         };
 
         Ok(Self {
-            command_tx, event_rx, running, transmitting, connected,
+            command_tx, event_rx, running, transmitting, whispering, connected,
             worker: Some(worker), audio_worker, listener, player_positions, player_audio_settings,
         })
     }
@@ -210,6 +213,11 @@ impl VoiceClient {
     /// Enable only while push-to-talk is held or voice activation is active.
     pub fn set_transmitting(&self, enabled: bool) {
         self.transmitting.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable the official Simple Voice Chat whispering flag on outgoing frames.
+    pub fn set_whispering(&self, enabled: bool) {
+        self.whispering.store(enabled, Ordering::Relaxed);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -380,6 +388,7 @@ fn run_worker(
     audio: SyncSender<AudioFrame>,
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
+    whispering: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
@@ -413,7 +422,7 @@ fn run_worker(
                             let packet = Packet::Mic {
                                 opus: opus[..length].to_vec(),
                                 sequence,
-                                whispering: false,
+                                whispering: whispering.load(Ordering::Relaxed),
                             };
                             sequence = sequence.wrapping_add(1);
                             let _ = send_packet(&socket, &info, &packet);
