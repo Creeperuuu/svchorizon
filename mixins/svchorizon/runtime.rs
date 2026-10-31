@@ -327,7 +327,7 @@ fn send_leave_group(game: &mut crate::game::Game<'_>) {
 }
 
 fn command_words(input: &str) -> Option<Vec<String>> {
-    if input.len() > 256 { return None; }
+    if input.len() > 1024 { return None; }
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -348,7 +348,7 @@ fn command_words(input: &str) -> Option<Vec<String>> {
         } else {
             current.push(ch);
         }
-        if current.chars().count() > 64 { return None; }
+        if current.chars().count() > 256 { return None; }
     }
     if escaped || quoted { return None; }
     if !current.is_empty() { words.push(current); }
