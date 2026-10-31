@@ -239,6 +239,7 @@ pub struct VoiceClient {
     whispering: Arc<AtomicBool>,
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
+    microphone_gain: Arc<AtomicU32>,
     connected: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
@@ -283,6 +284,7 @@ impl VoiceClient {
         let whispering = Arc::new(AtomicBool::new(false));
         let voice_activation = Arc::new(AtomicBool::new(false));
         let voice_activation_threshold = Arc::new(AtomicU32::new(0.025f32.to_bits()));
+        let microphone_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let connected = Arc::new(AtomicBool::new(false));
 
         let audio_running = Arc::clone(&running);
@@ -293,11 +295,12 @@ impl VoiceClient {
         let audio_settings = Arc::clone(&player_audio_settings);
         let audio_voice_activation = Arc::clone(&voice_activation);
         let audio_voice_threshold = Arc::clone(&voice_activation_threshold);
+        let audio_microphone_gain = Arc::clone(&microphone_gain);
         let audio_worker = thread::Builder::new()
             .name("svchorizon-audio".into())
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
-                audio_settings, audio_voice_activation, audio_voice_threshold,
+                audio_settings, audio_voice_activation, audio_voice_threshold, audio_microphone_gain,
             ))
             .map_err(VoiceError::Io)?;
 
@@ -326,7 +329,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, connected,
+            voice_activation, voice_activation_threshold, microphone_gain, connected,
             worker: Some(worker), audio_worker, listener, player_positions, player_audio_settings,
         })
     }
@@ -362,6 +365,12 @@ impl VoiceClient {
 
     pub fn is_voice_activation_enabled(&self) -> bool {
         self.voice_activation.load(Ordering::Relaxed)
+    }
+
+    /// Set microphone amplification from 0.0 (silent) through 4.0.
+    pub fn set_microphone_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 1.0 };
+        self.microphone_gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
     /// Set a speaker's playback level. Values are clamped to 0.0..=2.0.
@@ -715,6 +724,7 @@ fn run_audio_io(
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
+    microphone_gain: Arc<AtomicU32>,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
@@ -722,7 +732,8 @@ fn run_audio_io(
 
     match host.default_input_device() {
         Some(device) => match build_input_stream(
-            &device, command_tx, transmitting, voice_activation, voice_activation_threshold, events.clone(),
+            &device, command_tx, transmitting, voice_activation, voice_activation_threshold,
+            microphone_gain, events.clone(),
         ) {
             Ok(stream) => if let Err(error) = stream.play() {
                 let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {error}")));
@@ -757,6 +768,7 @@ struct InputAssembler {
     transmitting: Arc<AtomicBool>,
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
+    microphone_gain: Arc<AtomicU32>,
 }
 impl InputAssembler {
     fn new(
@@ -765,6 +777,7 @@ impl InputAssembler {
         transmitting: Arc<AtomicBool>,
         voice_activation: Arc<AtomicBool>,
         voice_activation_threshold: Arc<AtomicU32>,
+        microphone_gain: Arc<AtomicU32>,
     ) -> Self {
         Self {
             input_rate: input_rate.max(1),
@@ -777,10 +790,12 @@ impl InputAssembler {
             transmitting,
             voice_activation,
             voice_activation_threshold,
+            microphone_gain,
         }
     }
     fn push(&mut self, sample: f32) {
-        let sample = sample.clamp(-1.0, 1.0);
+        let gain = f32::from_bits(self.microphone_gain.load(Ordering::Relaxed));
+        let sample = (sample * gain).clamp(-1.0, 1.0);
         if !self.has_previous { self.previous = sample; self.has_previous = true; return; }
         self.phase += SAMPLE_RATE as u64;
         while self.phase >= u64::from(self.input_rate) {
@@ -824,6 +839,7 @@ fn build_input_stream(
     transmitting: Arc<AtomicBool>,
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
+    microphone_gain: Arc<AtomicU32>,
     events: SyncSender<VoiceEvent>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
@@ -836,6 +852,7 @@ fn build_input_stream(
         cpal::SampleFormat::F32 => {
             let mut input = InputAssembler::new(
                 rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+                Arc::clone(&microphone_gain),
             );
             let errors = events;
             device.build_input_stream(&config, move |data: &[f32], _| {
@@ -1358,6 +1375,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
         );
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.1);
