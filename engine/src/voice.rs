@@ -817,7 +817,7 @@ fn build_output_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::I16 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener));
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [i16], _| {
                 for frame in data.chunks_mut(channels) {
