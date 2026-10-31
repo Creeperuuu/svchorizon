@@ -987,7 +987,7 @@ impl OutputAssembler {
         let mut right = 0.0f32;
         let step = self.step;
         self.speakers.retain(|_, queue| {
-            if let Some(voice) = queue.front_mut() {
+            let completed = if let Some(voice) = queue.front_mut() {
                 if voice.position < FRAME_SAMPLES as f64 {
                     let index = voice.position.floor() as usize;
                     let next = (index + 1).min(FRAME_SAMPLES - 1);
@@ -999,9 +999,12 @@ impl OutputAssembler {
                     right += sample * voice.right_gain;
                     voice.position += step;
                 }
-                if voice.position >= FRAME_SAMPLES as f64 {
-                    queue.pop_front();
-                }
+                voice.position >= FRAME_SAMPLES as f64
+            } else {
+                false
+            };
+            if completed {
+                queue.pop_front();
             }
             !queue.is_empty()
         });
