@@ -866,6 +866,7 @@ fn build_input_stream(
         cpal::SampleFormat::I16 => {
             let mut input = InputAssembler::new(
                 rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+                Arc::clone(&microphone_gain),
             );
             let errors = events;
             device.build_input_stream(&config, move |data: &[i16], _| {
@@ -879,7 +880,7 @@ fn build_input_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut input = InputAssembler::new(rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold));
+            let mut input = InputAssembler::new(rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold), Arc::clone(&microphone_gain));
             let errors = events;
             device.build_input_stream(&config, move |data: &[u16], _| {
                 for frame in data.chunks(channels) {
