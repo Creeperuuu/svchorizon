@@ -921,11 +921,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_host_with_and_without_port() {
-        assert_eq!(resolve_voice_address("127.0.0.1:25565", 24454).unwrap(),
-            "127.0.0.1:24454".parse::<SocketAddr>().unwrap());
-        assert_eq!(resolve_voice_address("127.0.0.1", 24454).unwrap(),
-            "127.0.0.1:24454".parse::<SocketAddr>().unwrap());
+    fn resolves_voice_host_overrides_like_the_official_client() {
+        // An empty voice_host uses the game server hostname but the separate
+        // voice UDP port, never the Minecraft TCP port.
+        assert_eq!(
+            resolve_voice_address("", "127.0.0.1:25565", 24454).unwrap(),
+            "127.0.0.1:24454".parse::<SocketAddr>().unwrap()
+        );
+
+        // A numeric voice_host overrides only the UDP port.
+        assert_eq!(
+            resolve_voice_address("25566", "127.0.0.1:25565", 24454).unwrap(),
+            "127.0.0.1:25566".parse::<SocketAddr>().unwrap()
+        );
+
+        // A host:port voice_host overrides both host and UDP port.
+        assert_eq!(
+            resolve_voice_address("127.0.0.1:25567", "192.0.2.1:25565", 24454).unwrap(),
+            "127.0.0.1:25567".parse::<SocketAddr>().unwrap()
+        );
+
+        // A host-only override keeps the packet's UDP port.
+        assert_eq!(
+            resolve_voice_address("127.0.0.1", "192.0.2.1:25565", 24454).unwrap(),
+            "127.0.0.1:24454".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolves_bracketed_ipv6_voice_host() {
+        assert_eq!(
+            resolve_voice_address("[::1]:24455", "127.0.0.1:25565", 24454).unwrap(),
+            "[::1]:24455".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_voice_host_port() {
+        assert!(resolve_voice_address("127.0.0.1:0", "127.0.0.1:25565", 24454).is_err());
+        assert!(resolve_voice_address("127.0.0.1:not-a-port", "127.0.0.1:25565", 24454).is_err());
     }
 
     #[test]
