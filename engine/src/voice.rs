@@ -294,6 +294,9 @@ fn run_worker(
             return;
         }
     };
+    encoder.use_inband_fec = true;
+    encoder.packet_loss_perc = 5;
+    let payload_limit = (info.mtu as usize).clamp(2, MAX_OPUS);
     let mut decoders: HashMap<[u8; 16], OpusDecoder> = HashMap::new();
     let mut authenticated = false;
     let mut validated = false;
@@ -310,7 +313,7 @@ fn run_worker(
                 Ok(Command::Pcm(pcm)) => {
                     if validated && transmitting.load(Ordering::Relaxed) {
                         let mut opus = [0u8; 1276];
-                        if let Ok(length) = encoder.encode_i16(&pcm, FRAME_SAMPLES, &mut opus) {
+                        if let Ok(length) = encoder.encode_i16(&pcm, FRAME_SAMPLES, &mut opus[..payload_limit]) {
                             let packet = Packet::Mic {
                                 opus: opus[..length].to_vec(),
                                 sequence,
@@ -740,9 +743,6 @@ fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> R
     body.extend_from_slice(&nonce);
     body.extend_from_slice(&encrypted);
     write_byte_array(&mut datagram, &body);
-    if datagram.len() > info.mtu as usize {
-        return Err(VoiceError::InvalidServerInfo("encrypted UDP packet exceeds negotiated MTU"));
-    }
     socket.send(&datagram)?;
     Ok(())
 }
