@@ -563,6 +563,16 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
                 "Raise selected player's volume".to_owned(),
                 "key.keyboard.page.up".to_owned(),
             ],
+            [
+                "input_device_next".to_owned(),
+                "Cycle microphone device".to_owned(),
+                "key.keyboard.f6".to_owned(),
+            ],
+            [
+                "output_device_next".to_owned(),
+                "Cycle speaker device".to_owned(),
+                "key.keyboard.f7".to_owned(),
+            ],
         ],
     });
 }
