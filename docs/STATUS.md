@@ -16,6 +16,7 @@ Last updated: 2026-10-31.
 - [x] Native group discovery, group cycling, quick-create, join-public-group and leave-group keybinds; password-protected groups are identified but cannot yet be joined until password entry is implemented.
 - [x] Native Horizon packet hook sends the request on play login and consumes the server's secret response.
 - [x] UDP worker with authentication retry, connection validation, ping echo, keepalive response and timeout handling.
+- [x] Automatic voice UDP reconnect worker with exponential backoff, session-generation checks and preserved per-player audio controls.
 - [x] Vendored pure-Rust Opus encoder/decoder, with tests for 48 kHz 20 ms VOIP frames and all upstream codec modes.
 - [x] CPAL default microphone capture and speaker playback; mono resampling to/from 48 kHz.
 - [x] Configurable push-to-talk key registered in Horizon Options > Mods (default V).
@@ -40,7 +41,7 @@ Last updated: 2026-10-31.
 - [ ] Remaining TCP custom payloads for player states, categories and recording-related controls. The official UDP microphone/player/group/location sound variants and connection packets are implemented.
 - [ ] Full player-list screen, persistent per-player preferences, whisper-target selection, and recording controls. Player-state parsing and keybind-driven per-player ignore/volume controls are implemented.
 - [ ] Microphone/speaker device selection, persistent audio settings UI and in-game gain/voice-activation threshold sliders. Engine setters for microphone gain and RMS threshold are implemented.
-- [ ] Disconnect/reconfigure edge cases, reconnect backoff and server transfer testing.
+- [ ] Server-transfer race testing, audio-device reconfiguration and real reconnect interoperability testing. Basic automatic reconnect with exponential backoff is implemented.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
 
 ## Compatibility pin
