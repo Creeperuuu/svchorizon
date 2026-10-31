@@ -8,7 +8,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     error::Error,
     fmt,
     net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
@@ -80,6 +80,96 @@ struct PlayerAudioSettings {
 
 impl Default for PlayerAudioSettings {
     fn default() -> Self { Self { volume: 1.0, muted: false } }
+}
+
+struct PendingAudio {
+    sender: [u8; 16],
+    sequence: i64,
+    opus: Vec<u8>,
+    position: Option<[f64; 3]>,
+    max_distance: Option<f32>,
+}
+
+struct SenderJitter {
+    expected: Option<i64>,
+    pending: BTreeMap<i64, PendingAudio>,
+    gap_since: Option<Instant>,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct AudioJitterBuffer {
+    senders: HashMap<[u8; 16], SenderJitter>,
+}
+
+impl AudioJitterBuffer {
+    const MAX_SENDERS: usize = 128;
+    const MAX_PENDING_PER_SENDER: usize = 8;
+    const REORDER_DELAY: Duration = Duration::from_millis(40);
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+    fn push(&mut self, packet: PendingAudio, now: Instant) -> Vec<PendingAudio> {
+        self.senders.retain(|_, state| now.duration_since(state.last_seen) < Self::IDLE_TIMEOUT);
+        if !self.senders.contains_key(&packet.sender) && self.senders.len() >= Self::MAX_SENDERS {
+            return Vec::new();
+        }
+
+        let state = self.senders.entry(packet.sender).or_insert_with(|| SenderJitter {
+            expected: Some(packet.sequence),
+            pending: BTreeMap::new(),
+            gap_since: None,
+            last_seen: now,
+        });
+        state.last_seen = now;
+        let expected = state.expected.unwrap_or(packet.sequence);
+        if packet.sequence < expected {
+            return Vec::new();
+        }
+        if !state.pending.contains_key(&packet.sequence)
+            && state.pending.len() >= Self::MAX_PENDING_PER_SENDER
+        {
+            return Vec::new();
+        }
+        state.pending.entry(packet.sequence).or_insert(packet);
+        Self::drain_ready(state, now)
+    }
+
+    fn poll(&mut self, now: Instant) -> Vec<PendingAudio> {
+        self.senders.retain(|_, state| {
+            now.duration_since(state.last_seen) < Self::IDLE_TIMEOUT || !state.pending.is_empty()
+        });
+        let mut ready = Vec::new();
+        for state in self.senders.values_mut() {
+            ready.extend(Self::drain_ready(state, now));
+        }
+        ready
+    }
+
+    fn drain_ready(state: &mut SenderJitter, now: Instant) -> Vec<PendingAudio> {
+        let mut ready = Vec::new();
+        loop {
+            let Some(expected) = state.expected else { break; };
+            if let Some(packet) = state.pending.remove(&expected) {
+                state.expected = Some(expected.wrapping_add(1));
+                state.gap_since = None;
+                ready.push(packet);
+                continue;
+            }
+            let Some(next_sequence) = state.pending.keys().next().copied() else {
+                state.gap_since = None;
+                break;
+            };
+            let gap_since = *state.gap_since.get_or_insert(now);
+            if now.duration_since(gap_since) < Self::REORDER_DELAY {
+                break;
+            }
+            // A sequence gap lasted beyond the reorder window. Resume at the
+            // oldest buffered packet rather than stalling that speaker.
+            state.expected = Some(next_sequence);
+            state.gap_since = None;
+        }
+        ready
+    }
 }
 
 struct AudioFrame {
