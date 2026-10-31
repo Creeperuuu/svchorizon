@@ -391,7 +391,7 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
                 Some(group) => {
                     let password = words.get(3).map(String::as_str);
                     if password.is_some_and(|p| p.chars().count() > 16) {
-                        game.native_feedback(horizon_client::text::Text::literal("SVC: Password must be 16 characters or fewer."));
+                        game.native_feedback(horizon_client::text::Text::literal("SVC: Password must be 256 characters or fewer."));
                     } else {
                         send_join_group_password(game, &group, password);
                     }
@@ -410,8 +410,8 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
                 game.native_feedback(horizon_client::text::Text::literal("SVC: Group type must be normal, open, or isolated."));
                 return;
             }};
-            if name.chars().count() > 16 || password.is_some_and(|p| p.chars().count() > 16) {
-                game.native_feedback(horizon_client::text::Text::literal("SVC: Group names and passwords must be 16 characters or fewer."));
+            if name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 16) {
+                game.native_feedback(horizon_client::text::Text::literal("SVC: Group names must be 24 characters or fewer and passwords 256 or fewer."));
                 return;
             }
             send_create_group_custom(game, name, password, group_type);
