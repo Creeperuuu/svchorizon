@@ -14,7 +14,7 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - CPAL microphone capture and speaker playback.
 - Push-to-talk (V), hold-to-whisper (B), toggleable RMS voice activation (C), and microphone mute (M).
 - Concurrent per-speaker mixing, bounded sequence reordering, and short-burst Opus packet-loss concealment.
-- Per-player volume/mute engine controls and basic player/location spatial audio.
+- Per-player volume/mute and microphone-gain engine controls, plus basic player/location spatial audio.
 - Official group create/join/leave payload codecs and group response decoders (not yet wired to in-game controls).
 - Connection and voice-activation HUD indicators.
 
