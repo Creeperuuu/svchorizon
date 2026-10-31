@@ -7,6 +7,7 @@ const SECRET: &str = "voicechat:secret";
 
 static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 static PTT_DOWN: AtomicBool = AtomicBool::new(false);
+static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn voice_client() -> &'static Mutex<Option<VoiceClient>> {
@@ -129,7 +130,12 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     // Game::leave_server clears Remote. Stop both workers when the Minecraft
     // connection ends so a transfer or return to title cannot leak a UDP socket.
     if game.remote.is_none() {
-        SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+        // Advance the generation once per disconnect, not once per frame on
+        // the title screen. This invalidates any asynchronous UDP connect
+        // still finishing for the previous server.
+        if REMOTE_ACTIVE.swap(false, Ordering::AcqRel) {
+            SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+        }
         PTT_DOWN.store(false, Ordering::Relaxed);
         let old_client = voice_client().lock()
             .expect("SVC client state poisoned")
@@ -137,6 +143,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         drop(old_client);
         return;
     }
+    REMOTE_ACTIVE.store(true, Ordering::Release);
 
     let player = game.native_player();
     let positions = game.remote.as_ref()
@@ -198,6 +205,7 @@ pub fn on_packet(
     match packet {
         Clientbound::Login(_) => {
             // A new play session must never inherit the previous server's key.
+            REMOTE_ACTIVE.store(true, Ordering::Release);
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
             voice_client().lock().expect("SVC client state poisoned").take();
             PTT_DOWN.store(false, Ordering::Relaxed);
