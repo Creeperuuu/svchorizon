@@ -15,6 +15,7 @@ The project targets unmodified Paper/Spigot servers running the official Simple 
 - Push-to-talk (V), hold-to-whisper (B), and toggleable RMS voice activation (C).
 - Concurrent per-speaker mixing, bounded sequence reordering, and short-burst Opus packet-loss concealment.
 - Per-player volume/mute engine controls and basic player/location spatial audio.
+- Official group create/join/leave payload codecs and group response decoders (not yet wired to in-game controls).
 - Connection and voice-activation HUD indicators.
 
 The implementation is not yet complete: group management, remaining packet types, device selection/settings UI, reconnect edge cases and end-to-end interoperability testing are outstanding. Per-player volume/mute setters are not yet exposed through an in-game player menu.
