@@ -1,27 +1,14 @@
 use std::sync::{Mutex, OnceLock};
+use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
 
 const SVC_COMPATIBILITY_VERSION: i32 = 20;
 const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
 
-#[derive(Clone, Debug)]
-pub struct VoiceServerInfo {
-    pub secret: [u8; 16],
-    pub port: u16,
-    pub player: [u8; 16],
-    pub codec: u8,
-    pub mtu: i32,
-    pub distance: f64,
-    pub keep_alive: i32,
-    pub groups: bool,
-    pub host: String,
-    pub allow_recording: bool,
-}
+static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 
-static SERVER_INFO: OnceLock<Mutex<Option<VoiceServerInfo>>> = OnceLock::new();
-
-fn state() -> &'static Mutex<Option<VoiceServerInfo>> {
-    SERVER_INFO.get_or_init(|| Mutex::new(None))
+fn voice_client() -> &'static Mutex<Option<VoiceClient>> {
+    VOICE_CLIENT.get_or_init(|| Mutex::new(None))
 }
 
 struct Cursor<'a> {
@@ -42,11 +29,14 @@ impl<'a> Cursor<'a> {
         match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None }
     }
     fn i32(&mut self) -> Option<i32> { Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?)) }
-    fn f64(&mut self) -> Option<f64> { Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?))) }
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?)))
+    }
     fn varint(&mut self) -> Option<usize> {
         let mut out = 0usize;
         for i in 0..5 {
             let b = self.u8()?;
+            if i == 4 && b & 0xf0 != 0 { return None; }
             out |= usize::from(b & 0x7f).checked_shl(7 * i)?;
             if b & 0x80 == 0 { return Some(out); }
         }
@@ -71,14 +61,17 @@ fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
     let codec = c.u8()?;
     let mtu = c.i32()?;
     let distance = c.f64()?;
-    let keep_alive = c.i32()?;
+    let keep_alive_ms = c.i32()?;
     let groups = c.bool()?;
     let host = c.string(32767)?;
     let allow_recording = c.bool()?;
-    if !c.done() || mtu <= 0 || keep_alive <= 0 || !distance.is_finite() || distance < 0.0 {
+    if !c.done() || mtu <= 0 || keep_alive_ms <= 0 || !distance.is_finite() || distance < 0.0 {
         return None;
     }
-    Some(VoiceServerInfo { secret, port, player, codec, mtu, distance, keep_alive, groups, host, allow_recording })
+    Some(VoiceServerInfo {
+        secret, port, player, codec, mtu, distance, keep_alive_ms,
+        groups, host, allow_recording,
+    })
 }
 
 fn send_secret_request(game: &mut crate::game::Game<'_>) {
@@ -92,21 +85,44 @@ fn send_secret_request(game: &mut crate::game::Game<'_>) {
     }));
 }
 
+fn poll_voice_events() {
+    let mut guard = voice_client().lock().expect("SVC client state poisoned");
+    let Some(client) = guard.as_ref() else { return; };
+    while let Some(event) = client.poll_event() {
+        match event {
+            VoiceEvent::Connected => eprintln!("[svchorizon] Voice UDP authenticated and validated."),
+            VoiceEvent::Disconnected(reason) => eprintln!("[svchorizon] Voice disconnected: {reason}"),
+            VoiceEvent::AudioUnavailable(reason) => eprintln!("[svchorizon] Audio device warning: {reason}"),
+        }
+    }
+}
+
 pub fn on_packet(
     game: &mut crate::game::Game<'_>,
     packet: &horizon_protocol::packets::play::Clientbound,
 ) {
     use horizon_protocol::packets::play::Clientbound;
 
+    poll_voice_events();
     match packet {
-        // The player has entered the play state. Ask the official plugin for
-        // the exact same per-player UDP secret used by Java clients.
-        Clientbound::Login(_) => send_secret_request(game),
+        Clientbound::Login(_) => {
+            // A new play session must never inherit the previous server's key.
+            voice_client().lock().expect("SVC client state poisoned").take();
+            send_secret_request(game);
+        }
         Clientbound::CustomPayload(payload) if payload.channel == SECRET => {
             match decode_secret(&payload.data) {
                 Some(info) => {
-                    *state().lock().expect("SVC state poisoned") = Some(info);
-                    eprintln!("[svchorizon] Received the official voice server handshake.");
+                    let fallback_host = game.remote.as_ref()
+                        .map(|remote| remote.session.address.clone())
+                        .unwrap_or_default();
+                    match VoiceClient::connect(info, &fallback_host) {
+                        Ok(client) => {
+                            *voice_client().lock().expect("SVC client state poisoned") = Some(client);
+                            eprintln!("[svchorizon] Voice server handshake accepted; starting UDP/audio workers.");
+                        }
+                        Err(error) => eprintln!("[svchorizon] Could not start voice connection: {error}"),
+                    }
                 }
                 None => eprintln!("[svchorizon] Rejected malformed voicechat:secret payload."),
             }
