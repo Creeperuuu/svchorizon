@@ -122,9 +122,19 @@ struct NativePlayer {
     ignored: bool,
 }
 
+#[derive(Clone)]
+struct NativeCategory {
+    id: String,
+    name: String,
+    description: Option<String>,
+    tab: Option<String>,
+    tab_name: Option<String>,
+}
+
 #[derive(Default)]
 struct GroupState {
     groups: Vec<NativeGroup>,
+    categories: Vec<NativeCategory>,
     selected: usize,
     active: Option<[u8; 16]>,
     wrong_password: bool,
@@ -156,6 +166,9 @@ impl<'a> Cursor<'a> {
     fn u8(&mut self) -> Option<u8> { Some(*self.take(1)?.first()?) }
     fn bool(&mut self) -> Option<bool> {
         match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None }
+    }
+    fn optional_string(&mut self, max_chars: usize) -> Option<Option<String>> {
+        if self.bool()? { Some(Some(self.string(max_chars)?)) } else { Some(None) }
     }
     fn i16(&mut self) -> Option<i16> { Some(i16::from_be_bytes(self.take(2)?.try_into().ok()?)) }
     fn i32(&mut self) -> Option<i32> { Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?)) }
@@ -315,6 +328,47 @@ fn on_group_payload(channel: &str, bytes: &[u8]) {
                 state.selected %= state.groups.len();
             }
             if state.active == Some(id) { state.active = None; }
+        }
+        _ => {}
+    }
+}
+
+fn decode_category(cursor: &mut Cursor<'_>) -> Option<NativeCategory> {
+    let id = cursor.string(16)?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        return None;
+    }
+    let name = cursor.string(16)?;
+    let _name_translation_key = cursor.optional_string(256)?;
+    let description = cursor.optional_string(256)?;
+    let _description_translation_key = cursor.optional_string(256)?;
+    if cursor.bool()? {
+        // VolumeCategoryImpl transmits a fixed 16x16 ARGB icon.
+        cursor.take(16 * 16 * 4)?;
+    }
+    let tab = cursor.optional_string(16)?;
+    let tab_name = cursor.optional_string(16)?;
+    let _tab_translation_key = cursor.optional_string(256)?;
+    Some(NativeCategory { id, name, description, tab, tab_name })
+}
+
+fn on_category_payload(channel: &str, bytes: &[u8]) {
+    let mut state = group_state().lock().expect("SVC category state poisoned");
+    let mut cursor = Cursor::new(bytes);
+    match channel {
+        "voicechat:add_category" => {
+            let Some(category) = decode_category(&mut cursor) else { return; };
+            if !cursor.done() { return; }
+            if let Some(existing) = state.categories.iter_mut().find(|entry| entry.id == category.id) {
+                *existing = category;
+            } else if state.categories.len() < 64 {
+                state.categories.push(category);
+            }
+        }
+        "voicechat:remove_category" => {
+            let Some(id) = cursor.string(16) else { return; };
+            if !cursor.done() { return; }
+            state.categories.retain(|category| category.id != id);
         }
         _ => {}
     }
@@ -778,6 +832,16 @@ pub fn on_hud(
         "SVC Player: none | P select, O ignore, PgUp/PgDn volume".to_owned()
     };
     game.native_text(batch, &player_label, [8.0, 66.0], 0xFFFFFF, true);
+    let category_label = if groups.categories.is_empty() {
+        "SVC Categories: none".to_owned()
+    } else {
+        let names = groups.categories.iter().take(3)
+            .map(|category| category.name.as_str()).collect::<Vec<_>>().join(", ");
+        let extra = groups.categories.len().saturating_sub(3);
+        if extra > 0 { format!("SVC Categories: {names} +{extra}") }
+        else { format!("SVC Categories: {names}") }
+    };
+    game.native_text(batch, &category_label, [8.0, 78.0], 0xAAAAFF, true);
 }
 
 pub fn on_packet(
@@ -848,6 +912,12 @@ pub fn on_packet(
         ) && game.native_on("svchorizon") => {
             on_player_payload(&payload.channel, &payload.data);
         }
+        Clientbound::CustomPayload(payload) if matches!(
+            payload.channel.as_str(),
+            "voicechat:add_category" | "voicechat:remove_category"
+        ) && game.native_on("svchorizon") => {
+            on_category_payload(&payload.channel, &payload.data);
+        }
         _ => {}
     }
 }
@@ -855,6 +925,43 @@ pub fn on_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_official_category_metadata_and_optional_fields() {
+        let mut bytes = Vec::new();
+        write_utf(&mut bytes, "music");
+        write_utf(&mut bytes, "Music");
+        bytes.push(0); // no name translation key
+        bytes.push(1); write_utf(&mut bytes, "Background music");
+        bytes.push(0); // no description translation key
+        bytes.push(0); // no icon
+        bytes.push(1); write_utf(&mut bytes, "media");
+        bytes.push(1); write_utf(&mut bytes, "Media");
+        bytes.push(0); // no tab translation key
+        let mut cursor = Cursor::new(&bytes);
+        let category = decode_category(&mut cursor).unwrap();
+        assert!(cursor.done());
+        assert_eq!(category.id, "music");
+        assert_eq!(category.name, "Music");
+        assert_eq!(category.description.as_deref(), Some("Background music"));
+        assert_eq!(category.tab.as_deref(), Some("media"));
+        assert_eq!(category.tab_name.as_deref(), Some("Media"));
+    }
+
+    #[test]
+    fn rejects_category_with_invalid_id_or_truncated_icon() {
+        let mut invalid_id = Vec::new();
+        write_utf(&mut invalid_id, "Bad-ID");
+        let mut cursor = Cursor::new(&invalid_id);
+        assert!(decode_category(&mut cursor).is_none());
+
+        let mut truncated_icon = Vec::new();
+        write_utf(&mut truncated_icon, "music");
+        write_utf(&mut truncated_icon, "Music");
+        truncated_icon.extend_from_slice(&[0, 0, 0, 1]);
+        let mut cursor = Cursor::new(&truncated_icon);
+        assert!(decode_category(&mut cursor).is_none());
+    }
 
     #[test]
     fn encodes_official_client_state_flags() {
