@@ -1,0 +1,44 @@
+name: Build SVC Horizon hnmod
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test protocol core
+        run: cargo test --workspace --all-targets
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  package:
+    needs: protocol-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package hnmod
+        run: python tools/package.py
+      - name: Upload hnmod
+        uses: actions/upload-artifact@v4
+        with:
+          name: svchorizon-hnmod
+          path: target/svchorizon-0.1.0.hnmod
+          if-no-files-found: error
+          compression-level: 0
