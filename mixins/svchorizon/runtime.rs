@@ -679,6 +679,12 @@ pub fn on_packet(
             match decode_secret(&payload.data) {
                 Some(info) => {
                     *local_player_uuid().lock().expect("SVC local player state poisoned") = Some(info.player);
+                    {
+                        let mut state = group_state().lock().expect("SVC player state poisoned");
+                        state.players.retain(|player| player.id != info.player);
+                        if state.players.is_empty() { state.selected_player = 0; }
+                        else { state.selected_player %= state.players.len(); }
+                    }
                     let fallback_host = game.remote.as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
