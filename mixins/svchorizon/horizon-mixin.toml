@@ -74,7 +74,7 @@ kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_commands"
 helper = "native_commands.rs"
 bindings = [
-  { name = "game", ty = "&crate::game::Game<'_>", value = "self" },
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
   { name = "commands", ty = "&mut Vec<&'static str>", value = "commands" }
 ]
 
