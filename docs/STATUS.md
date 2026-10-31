@@ -17,6 +17,7 @@ Last updated: 2026-10-31.
 - [x] Configurable push-to-talk key registered in Horizon Options > Mods (default V).
 - [x] Native HUD connection/transmitting indicator.
 - [x] Player UUID-to-entity position mapping, location/player voice distance attenuation and stereo panning.
+- [x] Simultaneous incoming-speaker PCM mixing so multiple players can talk over one another instead of being played serially.
 - [x] Manual-only Windows/Linux protocol tests, Windows engine compile, Linux native-mixin validation and .hnmod packaging workflow.
 - [x] Source-only .hnmod packager with pinned Horizon and horizon-mixins revisions.
 
