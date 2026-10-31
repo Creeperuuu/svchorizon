@@ -25,7 +25,7 @@ Last updated: 2026-10-31.
 - [x] Per-player playback volume (0–200%) and mute controls in the native audio engine.
 - [x] Outgoing whisper-mode flag control for microphone packets, exposed as a hold-to-whisper keybind.
 - [x] Optional RMS voice activation with a native toggle keybind (default C).
-- [x] Local microphone mute toggle (default M) that gates both push-to-talk and voice activation.
+- [x] Local microphone mute toggle (default M) that gates both push-to-talk and voice activation, synchronized through the official `voicechat:client_state` TCP payload.
 - [x] Microphone amplification setter (0–400%) in the native audio engine.
 - [x] Bounded per-speaker Opus jitter queues with sequence reordering, a 40 ms gap window and decoder-driven concealment for up to three missing frames.
 - [x] Manual-only Windows/Linux protocol tests, Windows engine compile, Linux native-mixin validation and .hnmod packaging workflow.
