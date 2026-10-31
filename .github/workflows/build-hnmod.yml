@@ -81,6 +81,8 @@ jobs:
         run: cargo fmt --manifest-path mixins/svchorizon/engine/Cargo.toml -- --check
       - name: Compile Opus, AES-GCM and CPAL on Windows
         run: cargo check --manifest-path mixins/svchorizon/engine/Cargo.toml
+      - name: Run native engine protocol tests
+        run: cargo test --manifest-path mixins/svchorizon/engine/Cargo.toml
 
   package:
     needs: [protocol-tests, native-mixin-check, engine-windows-check]
