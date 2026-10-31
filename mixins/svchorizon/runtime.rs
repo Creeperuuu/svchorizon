@@ -422,7 +422,7 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
                 return;
             }};
             let invalid_name = name.chars().next().is_none_or(|c| c.is_control() || c.is_whitespace())
-                || name.chars().any(char::is_control);
+                || name.chars().any(|c| c.is_control());
             if invalid_name || name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 256) {
                 game.native_feedback(horizon_client::text::Text::literal("SVC: Group names must start with a visible character, contain no control characters, and be 24 characters or fewer; passwords may be up to 256 characters."));
                 return;
