@@ -1,4 +1,4 @@
-use std::sync::{Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
+use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}}, thread};
 use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
 
 const SVC_COMPATIBILITY_VERSION: i32 = 20;
@@ -7,6 +7,7 @@ const SECRET: &str = "voicechat:secret";
 
 static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 static PTT_DOWN: AtomicBool = AtomicBool::new(false);
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn voice_client() -> &'static Mutex<Option<VoiceClient>> {
     VOICE_CLIENT.get_or_init(|| Mutex::new(None))
@@ -101,6 +102,12 @@ fn poll_voice_events() {
 
 pub fn on_tick(game: &mut crate::game::Game<'_>) {
     poll_voice_events();
+    if game.remote.is_none() {
+        SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+        voice_client().lock().expect("SVC client state poisoned").take();
+        PTT_DOWN.store(false, Ordering::Relaxed);
+        return;
+    }
     let enabled = game.native_on("svchorizon") && game.native_playing();
     if !enabled { PTT_DOWN.store(false, Ordering::Relaxed); }
     if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
@@ -141,7 +148,9 @@ pub fn on_packet(
     match packet {
         Clientbound::Login(_) => {
             // A new play session must never inherit the previous server's key.
+            SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
             voice_client().lock().expect("SVC client state poisoned").take();
+            PTT_DOWN.store(false, Ordering::Relaxed);
             send_secret_request(game);
         }
         Clientbound::CustomPayload(payload) if payload.channel == SECRET => {
@@ -150,13 +159,18 @@ pub fn on_packet(
                     let fallback_host = game.remote.as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
-                    match VoiceClient::connect(info, &fallback_host) {
-                        Ok(client) => {
-                            *voice_client().lock().expect("SVC client state poisoned") = Some(client);
-                            eprintln!("[svchorizon] Voice server handshake accepted; starting UDP/audio workers.");
+                    let generation = SESSION_GENERATION.load(Ordering::Acquire);
+                    let _ = thread::Builder::new().name("svchorizon-connect".into()).spawn(move || {
+                        match VoiceClient::connect(info, &fallback_host) {
+                            Ok(client) => {
+                                if SESSION_GENERATION.load(Ordering::Acquire) == generation {
+                                    *voice_client().lock().expect("SVC client state poisoned") = Some(client);
+                                    eprintln!("[svchorizon] Voice UDP/audio workers started.");
+                                }
+                            }
+                            Err(error) => eprintln!("[svchorizon] Could not start voice connection: {error}"),
                         }
-                        Err(error) => eprintln!("[svchorizon] Could not start voice connection: {error}"),
-                    }
+                    });
                 }
                 None => eprintln!("[svchorizon] Rejected malformed voicechat:secret payload."),
             }
