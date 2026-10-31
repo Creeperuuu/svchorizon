@@ -999,8 +999,12 @@ impl OutputAssembler {
     /// Mix one current frame per speaker. Consecutive packets from one
     /// speaker remain sequential, while different speakers overlap.
     fn next_stereo(&mut self) -> [i16; 2] {
-        let incoming = self.rx.lock().map(|rx| rx.try_iter().collect::<Vec<_>>()).unwrap_or_default();
-        for frame in incoming {
+        loop {
+            let frame = match self.rx.lock() {
+                Ok(rx) => rx.try_recv().ok(),
+                Err(_) => None,
+            };
+            let Some(frame) = frame else { break; };
             if !self.speakers.contains_key(&frame.sender)
                 && self.speakers.len() >= Self::MAX_SPEAKERS
             {
