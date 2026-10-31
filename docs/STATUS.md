@@ -11,6 +11,8 @@ Last updated: 2026-10-31.
 - [x] Authentication, connection-check, keepalive, ping, microphone and player/group/location sound packet codecs.
 - [x] TCP `voicechat:request_secret` payload and `voicechat:secret` metadata decoder.
 - [x] Official group create/join/leave request codecs and joined/add/remove group response decoders.
+- [x] Official player-state, player-state-list and remove-player-state payload parsing, including all upstream state flags and optional group UUID.
+- [x] Native player selection, local ignore/mute and individual volume adjustment keybinds, backed by the engine's per-speaker mixer controls.
 - [x] Native group discovery, group cycling, quick-create, join-public-group and leave-group keybinds; password-protected groups are identified but cannot yet be joined until password entry is implemented.
 - [x] Native Horizon packet hook sends the request on play login and consumes the server's secret response.
 - [x] UDP worker with authentication retry, connection validation, ping echo, keepalive response and timeout handling.
@@ -36,7 +38,7 @@ Last updated: 2026-10-31.
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Password entry, custom group names/types, invites, group settings and full group UI. Basic group discovery, cycling, quick-create, public join and leave controls are now wired to the native runtime.
 - [ ] Remaining TCP custom payloads for player states, categories and recording-related controls. The official UDP microphone/player/group/location sound variants and connection packets are implemented.
-- [ ] Per-player ignore UI/persistence, whisper-target selection, and recording controls. Native per-player volume/mute setters and outgoing whisper flag control exist, but are not yet exposed through a complete in-game player menu.
+- [ ] Full player-list screen, persistent per-player preferences, whisper-target selection, and recording controls. Player-state parsing and keybind-driven per-player ignore/volume controls are implemented.
 - [ ] Microphone/speaker device selection, persistent audio settings UI and in-game gain/voice-activation threshold sliders. Engine setters for microphone gain and RMS threshold are implemented.
 - [ ] Disconnect/reconfigure edge cases, reconnect backoff and server transfer testing.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
