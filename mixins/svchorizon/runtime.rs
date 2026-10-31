@@ -390,7 +390,7 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
             match selected {
                 Some(group) => {
                     let password = words.get(3).map(String::as_str);
-                    if password.is_some_and(|p| p.chars().count() > 16) {
+                    if password.is_some_and(|p| p.chars().count() > 256) {
                         game.native_feedback(horizon_client::text::Text::literal("SVC: Password must be 256 characters or fewer."));
                     } else {
                         send_join_group_password(game, &group, password);
