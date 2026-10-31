@@ -91,10 +91,13 @@ struct PendingAudio {
 }
 
 struct SenderJitter {
+    sender: [u8; 16],
     expected: Option<i64>,
     pending: BTreeMap<i64, PendingAudio>,
     gap_since: Option<Instant>,
     last_seen: Instant,
+    last_position: Option<[f64; 3]>,
+    last_distance: Option<f32>,
 }
 
 #[derive(Default)]
@@ -115,12 +118,17 @@ impl AudioJitterBuffer {
         }
 
         let state = self.senders.entry(packet.sender).or_insert_with(|| SenderJitter {
+            sender: packet.sender,
             expected: Some(packet.sequence),
             pending: BTreeMap::new(),
             gap_since: None,
             last_seen: now,
+            last_position: packet.position,
+            last_distance: packet.max_distance,
         });
         state.last_seen = now;
+        state.last_position = packet.position;
+        state.last_distance = packet.max_distance;
         let expected = state.expected.unwrap_or(packet.sequence);
         if packet.sequence < expected {
             return Vec::new();
@@ -163,9 +171,22 @@ impl AudioJitterBuffer {
             if now.duration_since(gap_since) < Self::REORDER_DELAY {
                 break;
             }
-            // A sequence gap lasted beyond the reorder window. Resume at the
-            // oldest buffered packet rather than stalling that speaker.
-            state.expected = Some(next_sequence);
+            // A sequence gap lasted beyond the reorder window. Ask Opus
+            // to conceal a short loss burst, then skip any larger outage.
+            let missing = next_sequence.saturating_sub(expected).clamp(0, 3) as usize;
+            for _ in 0..missing {
+                ready.push(PendingAudio {
+                    sender: state.sender,
+                    sequence: state.expected.unwrap_or(expected),
+                    opus: Vec::new(),
+                    position: state.last_position,
+                    max_distance: state.last_distance,
+                });
+                state.expected = Some(state.expected.unwrap_or(expected).wrapping_add(1));
+            }
+            if state.expected.is_none_or(|value| value < next_sequence) {
+                state.expected = Some(next_sequence);
+            }
             state.gap_since = None;
         }
         ready
@@ -658,7 +679,7 @@ fn emit_audio(
     audio: &SyncSender<AudioFrame>,
     pending: PendingAudio,
 ) {
-    if pending.opus.is_empty() || pending.opus.len() > MAX_OPUS { return; }
+    if pending.opus.len() > MAX_OPUS { return; }
     if !decoders.contains_key(&pending.sender) {
         let Ok(decoder) = OpusDecoder::new(SAMPLE_RATE, 1) else { return; };
         decoders.insert(pending.sender, decoder);
