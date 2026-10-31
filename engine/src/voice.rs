@@ -72,6 +72,16 @@ struct ListenerPose {
     active: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PlayerAudioSettings {
+    volume: f32,
+    muted: bool,
+}
+
+impl Default for PlayerAudioSettings {
+    fn default() -> Self { Self { volume: 1.0, muted: false } }
+}
+
 struct AudioFrame {
     sender: [u8; 16],
     pcm: [i16; FRAME_SAMPLES],
@@ -119,6 +129,7 @@ pub struct VoiceClient {
     audio_worker: Option<JoinHandle<()>>,
     listener: Arc<Mutex<ListenerPose>>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
+    player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
 }
 
 impl VoiceClient {
@@ -151,6 +162,7 @@ impl VoiceClient {
         let (audio_tx, audio_rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
         let player_positions = Arc::new(RwLock::new(HashMap::new()));
+        let player_audio_settings = Arc::new(RwLock::new(HashMap::new()));
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
@@ -160,10 +172,12 @@ impl VoiceClient {
         let audio_command_tx = command_tx.clone();
         let audio_events = event_tx.clone();
         let audio_listener = Arc::clone(&listener);
+        let audio_settings = Arc::clone(&player_audio_settings);
         let audio_worker = thread::Builder::new()
             .name("svchorizon-audio".into())
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
+                audio_settings,
             ))
             .map_err(VoiceError::Io)?;
 
@@ -189,7 +203,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, connected,
-            worker: Some(worker), audio_worker, listener, player_positions,
+            worker: Some(worker), audio_worker, listener, player_positions, player_audio_settings,
         })
     }
 
@@ -204,6 +218,26 @@ impl VoiceClient {
 
     pub fn is_transmitting(&self) -> bool {
         self.transmitting.load(Ordering::Relaxed)
+    }
+
+    /// Set a speaker's playback level. Values are clamped to 0.0..=2.0.
+    pub fn set_player_volume(&self, player: [u8; 16], volume: f32) {
+        if let Ok(mut settings) = self.player_audio_settings.write() {
+            if !settings.contains_key(&player) && settings.len() >= 128 { return; }
+            let entry = settings.entry(player).or_default();
+            entry.volume = if volume.is_finite() { volume.clamp(0.0, 2.0) } else { 1.0 };
+            if entry.volume == 1.0 && !entry.muted { settings.remove(&player); }
+        }
+    }
+
+    /// Mute or unmute one remote speaker without affecting other players.
+    pub fn set_player_muted(&self, player: [u8; 16], muted: bool) {
+        if let Ok(mut settings) = self.player_audio_settings.write() {
+            if !settings.contains_key(&player) && settings.len() >= 128 { return; }
+            let entry = settings.entry(player).or_default();
+            entry.muted = muted;
+            if entry.volume == 1.0 && !entry.muted { settings.remove(&player); }
+        }
     }
 
     pub fn set_listener(&self, x: f64, y: f64, z: f64, yaw_degrees: f32) {
@@ -506,6 +540,7 @@ fn run_audio_io(
     transmitting: Arc<AtomicBool>,
     events: SyncSender<VoiceEvent>,
     listener: Arc<Mutex<ListenerPose>>,
+    player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
@@ -522,7 +557,7 @@ fn run_audio_io(
     }
 
     match host.default_output_device() {
-        Some(device) => match build_output_stream(&device, audio_rx, events.clone(), listener) {
+        Some(device) => match build_output_stream(&device, audio_rx, events.clone(), listener, player_audio_settings) {
             Ok(stream) => if let Err(error) = stream.play() {
                 let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {error}")));
             } else { streams.push(stream); },
@@ -638,18 +673,25 @@ struct OutputAssembler {
     speakers: HashMap<[u8; 16], VecDeque<PlaybackFrame>>,
     step: f64,
     listener: Arc<Mutex<ListenerPose>>,
+    player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
 }
 
 impl OutputAssembler {
     const MAX_SPEAKERS: usize = 32;
     const MAX_QUEUED_FRAMES_PER_SPEAKER: usize = 6;
 
-    fn new(rx: Receiver<AudioFrame>, output_rate: u32, listener: Arc<Mutex<ListenerPose>>) -> Self {
+    fn new(
+        rx: Receiver<AudioFrame>,
+        output_rate: u32,
+        listener: Arc<Mutex<ListenerPose>>,
+        player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
+    ) -> Self {
         Self {
             rx,
             speakers: HashMap::with_capacity(8),
             step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)),
             listener,
+            player_audio_settings,
         }
     }
 
@@ -683,7 +725,17 @@ impl OutputAssembler {
             {
                 continue;
             }
-            let (left_gain, right_gain) = self.gains_for(&frame);
+            let (mut left_gain, mut right_gain) = self.gains_for(&frame);
+            let settings = self.player_audio_settings.read().ok()
+                .and_then(|all| all.get(&frame.sender).copied())
+                .unwrap_or_default();
+            if settings.muted {
+                left_gain = 0.0;
+                right_gain = 0.0;
+            } else {
+                left_gain *= settings.volume;
+                right_gain *= settings.volume;
+            }
             let queue = self.speakers.entry(frame.sender).or_default();
             if queue.len() >= Self::MAX_QUEUED_FRAMES_PER_SPEAKER {
                 continue;
@@ -731,6 +783,7 @@ fn build_output_stream(
     rx: Receiver<AudioFrame>,
     events: SyncSender<VoiceEvent>,
     listener: Arc<Mutex<ListenerPose>>,
+    player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -740,7 +793,7 @@ fn build_output_stream(
     let rate = config.sample_rate.0;
     match format {
         cpal::SampleFormat::F32 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener));
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [f32], _| {
                 for frame in data.chunks_mut(channels) {
@@ -774,7 +827,7 @@ fn build_output_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut output = OutputAssembler::new(rx, rate, listener);
+            let mut output = OutputAssembler::new(rx, rate, listener, player_audio_settings);
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [u16], _| {
                 for frame in data.chunks_mut(channels) {
