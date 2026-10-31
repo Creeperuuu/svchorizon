@@ -48,6 +48,8 @@ jobs:
         run: cargo fetch --locked --manifest-path horizon-mixins/Cargo.toml
       - name: Fetch pinned Horizon dependencies
         run: cargo fetch --locked --manifest-path horizon/Cargo.toml
+      - name: Stage vendored Opus engine into the native bundle
+        run: python tools/prepare_bundle.py
       - name: Build mixin CLI
         run: cargo build --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli
       - name: Plan native hooks
