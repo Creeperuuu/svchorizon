@@ -7,8 +7,7 @@ rust-version.workspace = true
 description = "Wire protocol and cryptography core for Simple Voice Chat on Horizon"
 
 [dependencies]
-aes-gcm = "0.10"
-rand = "0.8"
+ring = "0.17.14"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 
