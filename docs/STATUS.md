@@ -18,6 +18,8 @@ Last updated: 2026-10-31.
 - [x] Native HUD connection/transmitting indicator.
 - [x] Player UUID-to-entity position mapping, location/player voice distance attenuation and stereo panning.
 - [x] Per-speaker sequential PCM scheduling with simultaneous mixing so multiple players can talk over one another instead of being played serially.
+- [x] Per-player playback volume (0–200%) and mute controls in the native audio engine.
+- [x] Outgoing whisper-mode flag control for microphone packets.
 - [x] Manual-only Windows/Linux protocol tests, Windows engine compile, Linux native-mixin validation and .hnmod packaging workflow.
 - [x] Source-only .hnmod packager with pinned Horizon and horizon-mixins revisions.
 
@@ -28,7 +30,7 @@ Last updated: 2026-10-31.
 - [ ] Jitter buffer, sequence reordering/loss concealment and robust packet scheduling.
 - [ ] Group creation, join/leave, invites, group settings and full group UI. Group sound reception is implemented, but group management is not.
 - [ ] Static/entity sound packet variants and the rest of the official packet catalogue.
-- [ ] Per-player volume, mute/ignore, whisper controls and recording controls.
+- [ ] Per-player ignore UI/persistence, whisper-target selection, and recording controls. Native per-player volume/mute and outgoing whisper flag setters exist, but are not yet exposed through a complete in-game player menu.
 - [ ] Voice activation, microphone/speaker device selection and audio settings UI.
 - [ ] Disconnect/reconfigure edge cases, reconnect backoff and server transfer testing.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
