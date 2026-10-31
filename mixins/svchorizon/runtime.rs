@@ -108,6 +108,57 @@ fn poll_voice_events() {
     }
 }
 
+pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+    mods.push(crate::game::native_hooks::NativeMod {
+        id: "svchorizon".to_owned(),
+        title: "SVC Horizon 0.1.0".to_owned(),
+        description: "Simple Voice Chat native client".to_owned(),
+        keys: vec![[
+            "push_to_talk".to_owned(),
+            "Push to talk".to_owned(),
+            "key.keyboard.v".to_owned(),
+        ]],
+    });
+}
+
+/// Called by Horizon's stable native tick hook. All audio/network work stays
+/// on worker threads; this only copies the current game pose and PTT state.
+pub fn on_tick(game: &mut crate::game::Game<'_>) {
+    poll_voice_events();
+
+    let player = game.native_player();
+    let positions = game.remote.as_ref()
+        .map(crate::game::remote::svchorizon_voice::player_positions)
+        .unwrap_or_default();
+
+    let guard = voice_client().lock().expect("SVC client state poisoned");
+    let Some(client) = guard.as_ref() else { return; };
+
+    if let Some(player) = player {
+        client.set_listener(player.x, player.y, player.z, player.yaw);
+    } else {
+        client.clear_listener();
+    }
+    client.set_player_positions(positions);
+    client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && game.native_playing());
+}
+
+/// Push-to-talk is a hold binding. Releasing it always stops transmission.
+pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
+    if !game.native_on("svchorizon") || !game.native_window() {
+        return;
+    }
+    let binding = game.native_mod_key("svchorizon", "push_to_talk", "key.keyboard.v");
+    if key != binding {
+        return;
+    }
+    let transmitting = pressed && game.native_playing();
+    PTT_DOWN.store(transmitting, Ordering::Relaxed);
+    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        client.set_transmitting(transmitting);
+    }
+}
+
 pub fn on_hud(
     game: &crate::game::Game<'_>,
     batch: &mut horizon_client::hud::HudBatch,
