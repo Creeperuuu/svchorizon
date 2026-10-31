@@ -897,6 +897,12 @@ pub fn on_hud(
         else { format!("SVC Categories: {names}") }
     };
     game.native_text(batch, &category_label, [8.0, 78.0], 0xAAAAFF, true);
+    if let Some(client) = guard.as_ref() {
+        let (input, output) = client.selected_audio_devices();
+        game.native_text(batch, &format!("SVC Audio: Mic {} | Out {}",
+            input.as_deref().unwrap_or("OS default"),
+            output.as_deref().unwrap_or("OS default")), [8.0, 90.0], 0xAAAAAA, true);
+    }
 }
 
 pub fn on_packet(
