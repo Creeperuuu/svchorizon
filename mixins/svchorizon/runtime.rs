@@ -8,6 +8,7 @@ const SECRET: &str = "voicechat:secret";
 static VOICE_CLIENT: OnceLock<Mutex<Option<VoiceClient>>> = OnceLock::new();
 static PTT_DOWN: AtomicBool = AtomicBool::new(false);
 static WHISPER_DOWN: AtomicBool = AtomicBool::new(false);
+static VOICE_ACTIVATION: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -126,6 +127,11 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
                 "Hold to whisper".to_owned(),
                 "key.keyboard.b".to_owned(),
             ],
+            [
+                "voice_activation".to_owned(),
+                "Toggle voice activation".to_owned(),
+                "key.keyboard.c".to_owned(),
+            ],
         ],
     });
 }
@@ -170,6 +176,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     client.set_player_positions(positions);
     client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && game.native_playing());
     client.set_whispering(WHISPER_DOWN.load(Ordering::Relaxed) && game.native_playing());
+    client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed), 0.025);
 }
 
 /// Push-to-talk is a hold binding. Releasing it always stops transmission.
@@ -191,6 +198,12 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
             client.set_whispering(whispering);
         }
+    } else if pressed && key == game.native_mod_key("svchorizon", "voice_activation", "key.keyboard.c") {
+        let enabled = !VOICE_ACTIVATION.load(Ordering::Relaxed);
+        VOICE_ACTIVATION.store(enabled, Ordering::Relaxed);
+        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+            client.set_voice_activation(enabled, 0.025);
+        }
     }
 }
 
@@ -203,6 +216,8 @@ pub fn on_hud(
     let Some(client) = guard.as_ref() else { return; };
     let (label, color) = if client.is_transmitting() {
         ("SVC: Transmitting", 0x55FF55)
+    } else if client.is_voice_activation_enabled() {
+        ("SVC: Voice activation", 0x55FF55)
     } else if client.is_connected() {
         ("SVC: Connected", 0xFFFFFF)
     } else {
