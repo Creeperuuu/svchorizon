@@ -363,11 +363,14 @@ fn command_words(input: &str) -> Option<Vec<String>> {
     (words.len() <= 8).then_some(words)
 }
 
-pub fn on_commands(commands: &mut Vec<&'static str>) {
-    if !commands.contains(&"svchorizon") { commands.push("svchorizon"); }
+pub fn on_commands(game: &crate::game::Game<'_>, commands: &mut Vec<&'static str>) {
+    if game.native_on("svchorizon") && !commands.contains(&"svchorizon") {
+        commands.push("svchorizon");
+    }
 }
 
 pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
+    if !game.native_on("svchorizon") { return; }
     let Some(words) = command_words(command) else { return; };
     if words.first().map(String::as_str) != Some("svchorizon") { return; }
     *ran = true;
