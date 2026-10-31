@@ -10,6 +10,8 @@ static PTT_DOWN: AtomicBool = AtomicBool::new(false);
 static WHISPER_DOWN: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVATION: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVATION_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+static SELF_MUTED: AtomicBool = AtomicBool::new(false);
+static SELF_MUTE_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static REMOTE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -133,6 +135,11 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
                 "Toggle voice activation".to_owned(),
                 "key.keyboard.c".to_owned(),
             ],
+            [
+                "mute_microphone".to_owned(),
+                "Toggle microphone mute".to_owned(),
+                "key.keyboard.m".to_owned(),
+            ],
         ],
     });
 }
@@ -175,9 +182,10 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         client.clear_listener();
     }
     client.set_player_positions(positions);
-    client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && game.native_playing());
+    let muted = SELF_MUTED.load(Ordering::Relaxed);
+    client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && !muted && game.native_playing());
     client.set_whispering(WHISPER_DOWN.load(Ordering::Relaxed) && game.native_playing());
-    client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed), 0.025);
+    client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed) && !muted, 0.025);
 }
 
 /// Push-to-talk is a hold binding. Releasing it always stops transmission.
@@ -191,7 +199,7 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         let transmitting = pressed && game.native_playing();
         PTT_DOWN.store(transmitting, Ordering::Relaxed);
         if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-            client.set_transmitting(transmitting);
+            client.set_transmitting(transmitting && !SELF_MUTED.load(Ordering::Relaxed));
         }
     } else if key == whisper_binding {
         let whispering = pressed && game.native_playing();
@@ -204,10 +212,21 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             let enabled = !VOICE_ACTIVATION.load(Ordering::Relaxed);
             VOICE_ACTIVATION.store(enabled, Ordering::Relaxed);
             if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-                client.set_voice_activation(enabled, 0.025);
+                client.set_voice_activation(enabled && !SELF_MUTED.load(Ordering::Relaxed), 0.025);
             }
         } else if !pressed {
             VOICE_ACTIVATION_KEY_DOWN.store(false, Ordering::Release);
+        }
+    } else if key == game.native_mod_key("svchorizon", "mute_microphone", "key.keyboard.m") {
+        if pressed && !SELF_MUTE_KEY_DOWN.swap(true, Ordering::AcqRel) {
+            let muted = !SELF_MUTED.load(Ordering::Relaxed);
+            SELF_MUTED.store(muted, Ordering::Relaxed);
+            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && !muted && game.native_playing());
+                client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed) && !muted, 0.025);
+            }
+        } else if !pressed {
+            SELF_MUTE_KEY_DOWN.store(false, Ordering::Release);
         }
     }
 }
@@ -219,7 +238,9 @@ pub fn on_hud(
     if !game.native_playing() || !game.native_on("svchorizon") { return; }
     let guard = voice_client().lock().expect("SVC client state poisoned");
     let Some(client) = guard.as_ref() else { return; };
-    let (label, color) = if client.is_transmitting() {
+    let (label, color) = if SELF_MUTED.load(Ordering::Relaxed) {
+        ("SVC: Microphone muted", 0xFF5555)
+    } else if client.is_transmitting() {
         ("SVC: Transmitting", 0x55FF55)
     } else if client.is_voice_activation_enabled() {
         ("SVC: Voice activation", 0x55FF55)
