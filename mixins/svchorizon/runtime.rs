@@ -240,6 +240,8 @@ pub fn on_hud(
     let Some(client) = guard.as_ref() else { return; };
     let (label, color) = if SELF_MUTED.load(Ordering::Relaxed) {
         ("SVC: Microphone muted", 0xFF5555)
+    } else if client.is_transmitting() && client.is_whispering() {
+        ("SVC: Whispering", 0x55FF55)
     } else if client.is_transmitting() {
         ("SVC: Transmitting", 0x55FF55)
     } else if client.is_voice_activation_enabled() {
