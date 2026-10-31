@@ -135,8 +135,11 @@ impl VoiceClient {
         OpusEncoder::new(SAMPLE_RATE, 1, application)
             .map_err(|_| VoiceError::InvalidServerInfo("Opus encoder initialization failed"))?;
 
-        let host = if info.host.trim().is_empty() { fallback_host } else { &info.host };
-        let address = resolve_voice_address(host, info.port)?;
+        // The upstream voice_host setting accepts an empty value, a port
+        // override by itself, a hostname, or hostname:port. In particular,
+        // treating "24454" as a hostname breaks servers that configure only
+        // a custom UDP port.
+        let address = resolve_voice_address(&info.host, fallback_host, info.port)?;
         let bind_address = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let socket = UdpSocket::bind(bind_address)?;
         socket.connect(address)?;
@@ -250,29 +253,80 @@ impl Drop for VoiceClient {
     fn drop(&mut self) { self.shutdown(); }
 }
 
-fn resolve_voice_address(host: &str, port: u16) -> Result<SocketAddr, VoiceError> {
-    let host = host.trim();
-    if host.is_empty() { return Err(VoiceError::Resolve("empty host".into())); }
+fn resolve_voice_address(
+    voice_host: &str,
+    game_server_host: &str,
+    default_port: u16,
+) -> Result<SocketAddr, VoiceError> {
+    let (host, mut port) = if voice_host.trim().is_empty() {
+        (game_server_host.trim(), default_port)
+    } else if let Ok(override_port) = voice_host.trim().parse::<u16>() {
+        if override_port == 0 {
+            return Err(VoiceError::Resolve("voice_host port is zero".into()));
+        }
+        (game_server_host.trim(), override_port)
+    } else {
+        let (host, override_port) = split_host_port(voice_host.trim())?;
+        (host, override_port.unwrap_or(default_port))
+    };
+
+    if port == 0 {
+        return Err(VoiceError::Resolve("voice UDP port is zero".into()));
+    }
+    let host = normalize_host(host)?;
     if host == "rtc-local" || host == "rtc-remote" {
         return Ok(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port));
-    }
-    if let Ok(address) = host.parse::<SocketAddr>() {
-        return Ok(SocketAddr::new(address.ip(), port));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    let host = if host.starts_with('[') && host.ends_with(']') {
-        &host[1..host.len() - 1]
-    } else if host.matches(':').count() == 1 {
-        host.split_once(':').map_or(host, |(name, _)| name)
-    } else {
-        host
-    };
-    (host, port).to_socket_addrs()
+    (host.as_str(), port)
+        .to_socket_addrs()
         .map_err(VoiceError::Io)?
         .next()
         .ok_or_else(|| VoiceError::Resolve(format!("{host}:{port}")))
+}
+
+/// Split a Minecraft-style host authority without accidentally treating the
+/// port of the game server as the voice UDP port.
+fn split_host_port(value: &str) -> Result<(&str, Option<u16>), VoiceError> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']')
+            .ok_or_else(|| VoiceError::Resolve(format!("invalid IPv6 authority: {value}")))?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        if suffix.is_empty() {
+            return Ok((host, None));
+        }
+        let port_text = suffix.strip_prefix(':')
+            .ok_or_else(|| VoiceError::Resolve(format!("invalid host authority: {value}")))?;
+        let port = port_text.parse::<u16>()
+            .ok().filter(|port| *port != 0)
+            .ok_or_else(|| VoiceError::Resolve(format!("invalid port in authority: {value}")))?;
+        return Ok((host, Some(port)));
+    }
+
+    if value.matches(':').count() == 1 {
+        let (host, port_text) = value.split_once(':').expect("one colon was counted");
+        let port = port_text.parse::<u16>()
+            .ok().filter(|port| *port != 0)
+            .ok_or_else(|| VoiceError::Resolve(format!("invalid port in authority: {value}")))?;
+        return Ok((host, Some(port)));
+    }
+
+    // An unbracketed IPv6 literal has multiple colons and no port suffix.
+    Ok((value, None))
+}
+
+fn normalize_host(value: &str) -> Result<String, VoiceError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(VoiceError::Resolve("empty voice server host".into()));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(VoiceError::Resolve("voice server host contains whitespace".into()));
+    }
+    Ok(value.to_owned())
 }
 
 fn run_worker(
