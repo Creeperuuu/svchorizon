@@ -771,7 +771,8 @@ fn run_audio_io(
         if active_selection.as_ref() != Some(&selected) {
             streams.clear();
             let input = match selected.input.as_deref() {
-                Some(name) => host.input_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next()),
+                Some(name) => host.input_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next())
+                    .or_else(|| host.default_input_device()),
                 None => host.default_input_device(),
             };
             match input {
@@ -784,7 +785,8 @@ fn run_audio_io(
                 None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default microphone device".into())); }
             }
             let output = match selected.output.as_deref() {
-                Some(name) => host.output_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next()),
+                Some(name) => host.output_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next())
+                    .or_else(|| host.default_output_device()),
                 None => host.default_output_device(),
             };
             match output {
