@@ -18,6 +18,18 @@ static LOCAL_PLAYER_UUID: OnceLock<Mutex<Option<[u8; 16]>>> = OnceLock::new();
 static LAST_SERVER_INFO: OnceLock<Mutex<Option<(VoiceServerInfo, String)>>> = OnceLock::new();
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
 static GROUPS_ENABLED: AtomicBool = AtomicBool::new(false);
+static AUDIO_DEVICE_PREFS: OnceLock<Mutex<(Option<String>, Option<String>)>> = OnceLock::new();
+
+fn audio_device_preferences() -> &'static Mutex<(Option<String>, Option<String>)> {
+    AUDIO_DEVICE_PREFS.get_or_init(|| Mutex::new((None, None)))
+}
+
+fn apply_audio_device_preferences(client: &VoiceClient) {
+    let preferences = audio_device_preferences().lock()
+        .expect("SVC audio preferences poisoned").clone();
+    client.set_input_device(preferences.0);
+    client.set_output_device(preferences.1);
+}
 
 fn local_player_uuid() -> &'static Mutex<Option<[u8; 16]>> {
     LOCAL_PLAYER_UUID.get_or_init(|| Mutex::new(None))
@@ -63,6 +75,7 @@ fn start_reconnect() {
             match VoiceClient::connect(info.clone(), &fallback_host) {
                 Ok(client) => {
                     apply_player_controls(&client);
+                    apply_audio_device_preferences(&client);
                     if SESSION_GENERATION.load(Ordering::Acquire) == generation
                         && REMOTE_ACTIVE.load(Ordering::Acquire)
                     {
@@ -797,6 +810,7 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
                 let step = INPUT_DEVICE_INDEX.fetch_add(1, Ordering::AcqRel);
                 let slot = step % (devices.len() + 1);
                 let selection = if slot == devices.len() { None } else { Some(devices[slot].clone()) };
+                audio_device_preferences().lock().expect("SVC audio preferences poisoned").0 = selection.clone();
                 if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
                     client.set_input_device(selection.clone());
                 }
@@ -812,6 +826,7 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
                 let step = OUTPUT_DEVICE_INDEX.fetch_add(1, Ordering::AcqRel);
                 let slot = step % (devices.len() + 1);
                 let selection = if slot == devices.len() { None } else { Some(devices[slot].clone()) };
+                audio_device_preferences().lock().expect("SVC audio preferences poisoned").1 = selection.clone();
                 if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
                     client.set_output_device(selection.clone());
                 }
@@ -949,6 +964,7 @@ pub fn on_packet(
                         match VoiceClient::connect(info, &fallback_host) {
                             Ok(client) => {
                                 apply_player_controls(&client);
+                                apply_audio_device_preferences(&client);
                                 if SESSION_GENERATION.load(Ordering::Acquire) == generation {
                                     *voice_client().lock().expect("SVC client state poisoned") = Some(client);
                                     eprintln!("[svchorizon] Voice UDP/audio workers started.");
