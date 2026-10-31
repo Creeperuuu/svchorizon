@@ -60,15 +60,7 @@ pub struct VoiceServerInfo {
 pub enum VoiceEvent {
     Connected,
     Disconnected(String),
-    Audio {
-        channel: [u8; 16],
-        sender: [u8; 16],
-        position: Option<[f64; 3]>,
-        distance: Option<f32>,
-        whispering: bool,
-        category: Option<String>,
-        pcm: [i16; FRAME_SAMPLES],
-    },
+    AudioUnavailable(String),
 }
 
 #[derive(Debug)]
@@ -108,6 +100,7 @@ pub struct VoiceClient {
     transmitting: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    audio_worker: Option<JoinHandle<()>>,
 }
 
 impl VoiceClient {
@@ -134,9 +127,21 @@ impl VoiceClient {
 
         let (command_tx, command_rx) = mpsc::sync_channel(32);
         let (event_tx, event_rx) = mpsc::sync_channel(32);
+        let (audio_tx, audio_rx) = mpsc::sync_channel(32);
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
+
+        let audio_running = Arc::clone(&running);
+        let audio_transmitting = Arc::clone(&transmitting);
+        let audio_command_tx = command_tx.clone();
+        let audio_events = event_tx.clone();
+        let audio_worker = thread::Builder::new()
+            .name("svchorizon-audio".into())
+            .spawn(move || run_audio_io(
+                audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events,
+            ))
+            .ok();
 
         let worker_running = Arc::clone(&running);
         let worker_transmitting = Arc::clone(&transmitting);
@@ -145,12 +150,15 @@ impl VoiceClient {
             .name("svchorizon-udp".into())
             .spawn(move || {
                 run_worker(
-                    socket, info, application, command_rx, event_tx,
+                    socket, info, application, command_rx, event_tx, audio_tx,
                     worker_running, worker_transmitting, worker_connected,
                 );
             })?;
 
-        Ok(Self { command_tx, event_rx, running, transmitting, connected, worker: Some(worker) })
+        Ok(Self {
+            command_tx, event_rx, running, transmitting, connected,
+            worker: Some(worker), audio_worker,
+        })
     }
 
     /// Enable only while push-to-talk is held or voice activation is active.
@@ -186,6 +194,7 @@ impl VoiceClient {
         self.running.store(false, Ordering::Release);
         let _ = self.command_tx.try_send(Command::Shutdown);
         if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.audio_worker.take() { let _ = worker.join(); }
     }
 }
 
@@ -221,6 +230,7 @@ fn run_worker(
     application: Application,
     commands: Receiver<Command>,
     events: SyncSender<VoiceEvent>,
+    audio: SyncSender<[i16; FRAME_SAMPLES]>,
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
@@ -314,19 +324,19 @@ fn run_worker(
                     }
                     Packet::PlayerSound { channel, sender, opus, distance, whispering, category, .. } => {
                         if validated {
-                            emit_audio(&mut decoders, &events, channel, sender, None,
+                            emit_audio(&mut decoders, &audio, channel, sender, None,
                                 Some(distance), whispering, category, &opus);
                         }
                     }
                     Packet::GroupSound { channel, sender, opus, category, .. } => {
                         if validated {
-                            emit_audio(&mut decoders, &events, channel, sender, None,
+                            emit_audio(&mut decoders, &audio, channel, sender, None,
                                 None, false, category, &opus);
                         }
                     }
                     Packet::LocationSound { channel, sender, location, opus, distance, category, .. } => {
                         if validated {
-                            emit_audio(&mut decoders, &events, channel, sender, Some(location),
+                            emit_audio(&mut decoders, &audio, channel, sender, Some(location),
                                 Some(distance), false, category, &opus);
                         }
                     }
@@ -350,28 +360,28 @@ fn run_worker(
 
 fn emit_audio(
     decoders: &mut HashMap<[u8; 16], OpusDecoder>,
-    events: &SyncSender<VoiceEvent>,
-    channel: [u8; 16],
+    events: &SyncSender<[i16; FRAME_SAMPLES]>,
+    _channel: [u8; 16],
     sender: [u8; 16],
-    position: Option<[f64; 3]>,
-    distance: Option<f32>,
-    whispering: bool,
-    category: Option<String>,
+    _position: Option<[f64; 3]>,
+    _distance: Option<f32>,
+    _whispering: bool,
+    _category: Option<String>,
     opus: &[u8],
 ) {
     if opus.is_empty() || opus.len() > MAX_OPUS { return; }
-    let decoder = decoders.entry(sender).or_insert_with(|| {
-        OpusDecoder::new(SAMPLE_RATE, 1).expect("valid Opus decoder configuration")
-    });
+    if !decoders.contains_key(&sender) {
+        let Ok(decoder) = OpusDecoder::new(SAMPLE_RATE, 1) else { return; };
+        decoders.insert(sender, decoder);
+    }
+    let Some(decoder) = decoders.get_mut(&sender) else { return; };
     let mut float_pcm = [0.0f32; FRAME_SAMPLES];
     let Ok(samples) = decoder.decode(opus, FRAME_SAMPLES, &mut float_pcm) else { return; };
     let mut pcm = [0i16; FRAME_SAMPLES];
     for (out, input) in pcm.iter_mut().zip(float_pcm.iter()).take(samples.min(FRAME_SAMPLES)) {
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
-    let _ = events.try_send(VoiceEvent::Audio {
-        channel, sender, position, distance, whispering, category, pcm,
-    });
+    let _ = events.try_send(pcm);
 }
 
 #[derive(Debug)]
