@@ -13,7 +13,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
@@ -63,6 +63,21 @@ pub enum VoiceEvent {
     AudioUnavailable(String),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ListenerPose {
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f64,
+    active: bool,
+}
+
+struct AudioFrame {
+    pcm: [i16; FRAME_SAMPLES],
+    position: Option<[f64; 3]>,
+    max_distance: Option<f32>,
+}
+
 #[derive(Debug)]
 pub enum VoiceError {
     Io(std::io::Error),
@@ -101,6 +116,7 @@ pub struct VoiceClient {
     connected: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
+    listener: Arc<Mutex<ListenerPose>>,
 }
 
 impl VoiceClient {
@@ -128,6 +144,7 @@ impl VoiceClient {
         let (command_tx, command_rx) = mpsc::sync_channel(8);
         let (event_tx, event_rx) = mpsc::sync_channel(32);
         let (audio_tx, audio_rx) = mpsc::sync_channel(8);
+        let listener = Arc::new(Mutex::new(ListenerPose::default()));
         let running = Arc::new(AtomicBool::new(true));
         let transmitting = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
@@ -136,10 +153,11 @@ impl VoiceClient {
         let audio_transmitting = Arc::clone(&transmitting);
         let audio_command_tx = command_tx.clone();
         let audio_events = event_tx.clone();
+        let audio_listener = Arc::clone(&listener);
         let audio_worker = thread::Builder::new()
             .name("svchorizon-audio".into())
             .spawn(move || run_audio_io(
-                audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events,
+                audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
             ))
             .ok();
 
@@ -164,7 +182,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, connected,
-            worker: Some(worker), audio_worker,
+            worker: Some(worker), audio_worker, listener,
         })
     }
 
@@ -179,6 +197,16 @@ impl VoiceClient {
 
     pub fn is_transmitting(&self) -> bool {
         self.transmitting.load(Ordering::Relaxed)
+    }
+
+    pub fn set_listener(&self, x: f64, y: f64, z: f64, yaw_degrees: f32) {
+        if let Ok(mut pose) = self.listener.lock() {
+            *pose = ListenerPose { x, y, z, yaw: f64::from(yaw_degrees).to_radians(), active: true };
+        }
+    }
+
+    pub fn clear_listener(&self) {
+        if let Ok(mut pose) = self.listener.lock() { pose.active = false; }
     }
 
     /// Queue exactly one 20 ms mono 48 kHz PCM frame. Returns false when muted
@@ -241,7 +269,7 @@ fn run_worker(
     application: Application,
     commands: Receiver<Command>,
     events: SyncSender<VoiceEvent>,
-    audio: SyncSender<[i16; FRAME_SAMPLES]>,
+    audio: SyncSender<AudioFrame>,
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
@@ -373,11 +401,11 @@ fn run_worker(
 
 fn emit_audio(
     decoders: &mut HashMap<[u8; 16], OpusDecoder>,
-    events: &SyncSender<[i16; FRAME_SAMPLES]>,
+    audio: &SyncSender<AudioFrame>,
     _channel: [u8; 16],
     sender: [u8; 16],
-    _position: Option<[f64; 3]>,
-    _distance: Option<f32>,
+    position: Option<[f64; 3]>,
+    distance: Option<f32>,
     _whispering: bool,
     _category: Option<String>,
     opus: &[u8],
@@ -394,15 +422,16 @@ fn emit_audio(
     for (out, input) in pcm.iter_mut().zip(float_pcm.iter()).take(samples.min(FRAME_SAMPLES)) {
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
-    let _ = events.try_send(pcm);
+    let _ = audio.try_send(AudioFrame { pcm, position, max_distance: distance });
 }
 
 fn run_audio_io(
     command_tx: SyncSender<Command>,
-    audio_rx: Receiver<[i16; FRAME_SAMPLES]>,
+    audio_rx: Receiver<AudioFrame>,
     running: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     events: SyncSender<VoiceEvent>,
+    listener: Arc<Mutex<ListenerPose>>,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
@@ -419,7 +448,7 @@ fn run_audio_io(
     }
 
     match host.default_output_device() {
-        Some(device) => match build_output_stream(&device, audio_rx, events.clone()) {
+        Some(device) => match build_output_stream(&device, audio_rx, events.clone(), listener) {
             Ok(stream) => if let Err(error) = stream.play() {
                 let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {error}")));
             } else { streams.push(stream); },
@@ -524,35 +553,72 @@ fn build_input_stream(
 }
 
 struct OutputAssembler {
-    rx: Receiver<[i16; FRAME_SAMPLES]>,
-    current: Option<[i16; FRAME_SAMPLES]>,
+    rx: Receiver<AudioFrame>,
+    current: Option<AudioFrame>,
     position: f64,
     step: f64,
+    listener: Arc<Mutex<ListenerPose>>,
+    left_gain: f32,
+    right_gain: f32,
 }
 impl OutputAssembler {
-    fn new(rx: Receiver<[i16; FRAME_SAMPLES]>, output_rate: u32) -> Self {
+    fn new(rx: Receiver<AudioFrame>, output_rate: u32, listener: Arc<Mutex<ListenerPose>>) -> Self {
         Self { rx, current: None, position: 0.0,
-            step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)) }
+            step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)),
+            listener, left_gain: 1.0, right_gain: 1.0 }
     }
-    fn next_sample(&mut self) -> i16 {
+
+    fn update_spatial_gain(&mut self) {
+        let Some(frame) = self.current.as_ref() else {
+            self.left_gain = 0.0; self.right_gain = 0.0; return;
+        };
+        let Some(source) = frame.position else {
+            self.left_gain = 1.0; self.right_gain = 1.0; return;
+        };
+        let Ok(listener) = self.listener.lock() else { return; };
+        if !listener.active {
+            self.left_gain = 1.0; self.right_gain = 1.0; return;
+        }
+        let dx = source[0] - listener.x;
+        let dy = source[1] - listener.y;
+        let dz = source[2] - listener.z;
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+        let max_distance = f64::from(frame.max_distance.unwrap_or(0.0));
+        let attenuation = if max_distance > 0.0 {
+            ((max_distance - distance) / max_distance).clamp(0.0, 1.0) as f32
+        } else { 1.0 };
+        let pan = if distance > 0.001 {
+            ((dx * listener.yaw.cos() - dz * listener.yaw.sin()) / distance).clamp(-1.0, 1.0)
+        } else { 0.0 };
+        self.left_gain = attenuation * (1.0 - pan).clamp(0.0, 1.0) as f32;
+        self.right_gain = attenuation * (1.0 + pan).clamp(0.0, 1.0) as f32;
+    }
+
+    fn next_stereo(&mut self) -> [i16; 2] {
         if self.current.is_none() || self.position >= FRAME_SAMPLES as f64 {
             self.current = self.rx.try_recv().ok();
             self.position = 0.0;
+            self.update_spatial_gain();
         }
-        let Some(frame) = self.current.as_ref() else { return 0; };
+        let Some(frame) = self.current.as_ref() else { return [0, 0]; };
         let index = self.position.floor() as usize;
         let next = (index + 1).min(FRAME_SAMPLES - 1);
         let fraction = (self.position - index as f64) as f32;
-        let sample = frame[index] as f32 + (frame[next] as f32 - frame[index] as f32) * fraction;
+        let sample = frame.pcm[index] as f32
+            + (frame.pcm[next] as f32 - frame.pcm[index] as f32) * fraction;
         self.position += self.step;
-        sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        [
+            (sample * self.left_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+            (sample * self.right_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+        ]
     }
 }
 
 fn build_output_stream(
     device: &cpal::Device,
-    rx: Receiver<[i16; FRAME_SAMPLES]>,
+    rx: Receiver<AudioFrame>,
     events: SyncSender<VoiceEvent>,
+    listener: Arc<Mutex<ListenerPose>>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -562,31 +628,52 @@ fn build_output_stream(
     let rate = config.sample_rate.0;
     match format {
         cpal::SampleFormat::F32 => {
-            let mut output = OutputAssembler::new(rx, rate);
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [f32], _| {
                 for frame in data.chunks_mut(channels) {
-                    frame.fill(output.next_sample() as f32 / 32768.0);
+                    let stereo = output.next_stereo();
+                    if frame.len() == 1 {
+                        frame[0] = (i32::from(stereo[0]) + i32::from(stereo[1])) as f32 / 65536.0;
+                    } else {
+                        frame[0] = stereo[0] as f32 / 32768.0;
+                        frame[1] = stereo[1] as f32 / 32768.0;
+                        for sample in frame.iter_mut().skip(2) { *sample = 0.0; }
+                    }
                 }
             }, move |error| {
                 let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::I16 => {
-            let mut output = OutputAssembler::new(rx, rate);
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [i16], _| {
-                for frame in data.chunks_mut(channels) { frame.fill(output.next_sample()); }
+                for frame in data.chunks_mut(channels) {
+                    let stereo = output.next_stereo();
+                    if frame.len() == 1 { frame[0] = ((i32::from(stereo[0]) + i32::from(stereo[1])) / 2) as i16; }
+                    else {
+                        frame[0] = stereo[0]; frame[1] = stereo[1];
+                        for sample in frame.iter_mut().skip(2) { *sample = 0; }
+                    }
+                }
             }, move |error| {
                 let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut output = OutputAssembler::new(rx, rate);
+            let mut output = OutputAssembler::new(rx, rate, listener);
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [u16], _| {
                 for frame in data.chunks_mut(channels) {
-                    frame.fill((i32::from(output.next_sample()) + 32768) as u16);
+                    let stereo = output.next_stereo();
+                    if frame.len() == 1 {
+                        frame[0] = ((i32::from(stereo[0]) + i32::from(stereo[1])) / 2 + 32768) as u16;
+                    } else {
+                        frame[0] = (i32::from(stereo[0]) + 32768) as u16;
+                        frame[1] = (i32::from(stereo[1]) + 32768) as u16;
+                        for sample in frame.iter_mut().skip(2) { *sample = 32768; }
+                    }
                 }
             }, move |error| {
                 let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
