@@ -39,7 +39,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Minecraft: 26.3
 - Horizon: `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`
 - horizon-mixins: `d9c83d7096b7ea5b83678da2efdfd6161f74997e`
-- Simple Voice Chat compatibility version: 20 (upstream 2.6.28+26.3)
+- Simple Voice Chat compatibility version: 20 (upstream 2.6.27+26.3)
 
 See [protocol notes](docs/PROTOCOL.md) and [implementation status](docs/STATUS.md).
 
