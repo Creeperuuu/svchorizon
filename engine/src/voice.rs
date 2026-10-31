@@ -1298,6 +1298,38 @@ mod tests {
     }
 
     #[test]
+    fn voice_activation_sends_frames_above_the_rms_threshold() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut input = InputAssembler::new(
+            SAMPLE_RATE as u32,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU32::new(0.025f32.to_bits())),
+        );
+        for _ in 0..=FRAME_SAMPLES {
+            input.push(0.1);
+        }
+        assert!(matches!(rx.try_recv(), Ok(Command::Pcm(_))));
+    }
+
+    #[test]
+    fn voice_activation_ignores_frames_below_the_rms_threshold() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut input = InputAssembler::new(
+            SAMPLE_RATE as u32,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU32::new(0.025f32.to_bits())),
+        );
+        for _ in 0..=FRAME_SAMPLES {
+            input.push(0.01);
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
     fn rejects_varint_overflow() {
         let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
         assert!(reader.varint().is_none());
