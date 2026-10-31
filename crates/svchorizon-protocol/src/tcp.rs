@@ -2,7 +2,7 @@ use crate::wire::{Reader, WireError, Writer};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Compatibility version in Simple Voice Chat 2.6.28+26.3
+/// Compatibility version in Simple Voice Chat 2.6.27+26.3
 /// (upstream gradle.properties: voicechat_compatibility_version=20).
 pub const COMPATIBILITY_VERSION: i32 = 20;
 pub const REQUEST_SECRET_CHANNEL: &str = "voicechat:request_secret";
