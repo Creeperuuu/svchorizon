@@ -3321,3 +3321,6 @@ mod tests {
         );
     }
 }
+
+/// Simple Voice Chat UDP transport and Opus frame engine.
+pub mod voice;
