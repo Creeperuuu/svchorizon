@@ -43,7 +43,7 @@ Last updated: 2026-10-31.
 - [ ] Remaining TCP custom payloads for recording-related controls and any newly introduced upstream extensions. Player-state and volume-category payloads are now decoded; the official UDP microphone/player/group/location sound variants and connection packets are implemented.
 - [ ] Full player-list screen, persistent per-player preferences, whisper-target selection, and recording controls. Player-state parsing and keybind-driven per-player ignore/volume controls are implemented.
 - [ ] Persistent audio settings UI and in-game gain/voice-activation threshold sliders. Microphone/speaker device selection is implemented through F6/F7 keybinds and is retained across reconnects for the current game session.
-- [ ] Server-transfer race testing, audio-device reconfiguration and real reconnect interoperability testing. Basic automatic reconnect with exponential backoff is implemented.
+- [ ] Server-transfer race testing and real reconnect interoperability testing. Basic automatic reconnect with exponential backoff and live audio-device reconfiguration are implemented in source.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
 
 ## Compatibility pin
