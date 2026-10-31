@@ -146,14 +146,21 @@ impl VoiceClient {
         let worker_running = Arc::clone(&running);
         let worker_transmitting = Arc::clone(&transmitting);
         let worker_connected = Arc::clone(&connected);
-        let worker = thread::Builder::new()
+        let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
             .spawn(move || {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
                     worker_running, worker_transmitting, worker_connected,
                 );
-            })?;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                running.store(false, Ordering::Release);
+                if let Some(audio) = audio_worker { let _ = audio.join(); }
+                return Err(VoiceError::Io(error));
+            }
+        };
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, connected,
@@ -246,8 +253,8 @@ fn run_worker(
     let mut authenticated = false;
     let mut validated = false;
     let mut sequence = 0i64;
-    let mut last_auth = Instant::now() - Duration::from_secs(2);
-    let mut last_check = Instant::now() - Duration::from_secs(2);
+    let mut last_auth: Option<Instant> = None;
+    let mut last_check: Option<Instant> = None;
     let mut last_keepalive = Instant::now();
     let keepalive_timeout = Duration::from_millis((info.keep_alive_ms as u64).saturating_mul(10));
     let mut receive = [0u8; MAX_DATAGRAM];
@@ -282,13 +289,15 @@ fn run_worker(
         }
         if !running.load(Ordering::Acquire) { break; }
 
-        if !authenticated && last_auth.elapsed() >= Duration::from_secs(1) {
+        if !authenticated && last_auth.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
             let packet = Packet::Authenticate { player: info.player, secret: info.secret };
             let _ = send_packet(&socket, &info, &packet);
-            last_auth = Instant::now();
-        } else if authenticated && !validated && last_check.elapsed() >= Duration::from_secs(1) {
+            last_auth = Some(Instant::now());
+        } else if authenticated && !validated
+            && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
             let _ = send_packet(&socket, &info, &Packet::ConnectionCheck);
-            last_check = Instant::now();
+            last_check = Some(Instant::now());
         }
 
         if validated && last_keepalive.elapsed() > keepalive_timeout {
@@ -305,7 +314,7 @@ fn run_worker(
                 match packet {
                     Packet::AuthenticateAck => {
                         authenticated = true;
-                        last_check = Instant::now() - Duration::from_secs(2);
+                        last_check = None;
                     }
                     Packet::ConnectionCheckAck => {
                         if !validated {
@@ -625,6 +634,9 @@ fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> R
     body.extend_from_slice(&nonce);
     body.extend_from_slice(&encrypted);
     write_byte_array(&mut datagram, &body);
+    if datagram.len() > info.mtu as usize {
+        return Err(VoiceError::InvalidServerInfo("encrypted UDP packet exceeds negotiated MTU"));
+    }
     socket.send(&datagram)?;
     Ok(())
 }
