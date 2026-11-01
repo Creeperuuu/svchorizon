@@ -39,6 +39,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Force LF checkouts
+        # Git for Windows would otherwise check text files out with CRLF, and the pinned
+        # horizon-mixins revision parses Cargo.lock as LF text (its CRLF handling is newer
+        # than the pinned revision): a CRLF lock makes apply fail with "the dependent has
+        # no workspace entry in Cargo.lock".
+        run: git config --global core.autocrlf false
+
       - name: Checkout pinned Horizon
         uses: actions/checkout@v4
         with:
@@ -46,6 +53,15 @@ jobs:
           ref: ${{ env.HORIZON_REVISION }}
           path: horizon
           persist-credentials: false
+
+      - name: Re-checkout pinned Horizon with LF endings
+        # Belt and braces for the step above: rewrite every tracked file straight from
+        # the index with autocrlf off, so the workspace is byte-identical to the Linux
+        # checkouts this mod was validated against.
+        run: |
+          cd horizon
+          git config core.autocrlf false
+          git checkout-index --force --all
 
       - name: Materialize tracked symlinks in pinned Horizon
         run: |
