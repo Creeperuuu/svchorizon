@@ -1,7 +1,10 @@
 use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, thread};
 use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
 
-const SVC_COMPATIBILITY_VERSION: i32 = 21;
+// Compatibility number of the shipped Simple Voice Chat bukkit plugin for
+// MC 26.3 (2.6.27). Verified against the plugin jar: it logs "Compatibility
+// version 20" and rejects every other value without sending a secret.
+const SVC_COMPATIBILITY_VERSION: i32 = 20;
 const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
 const REGISTER: &str = "minecraft:register";
@@ -253,9 +256,11 @@ impl<'a> Cursor<'a> {
 fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
     let mut c = Cursor::new(bytes);
     let secret: [u8; 16] = c.take(16)?.try_into().ok()?;
-    // SecretPacket.toBytes order: secret, connection UUID, port, player, ... The
-    // connection UUID keys every UDP datagram this client sends.
-    let connection_id: [u8; 16] = c.take(16)?.try_into().ok()?;
+    // SecretPacket.toBytes order for SVC 2.6.27 (compatibility 20): secret,
+    // port, player, codec, mtu, distance, keepalive, groups, host, recording.
+    // There is no server-assigned connection UUID in this wire generation: the
+    // secret doubles as the UUID that keys every UDP datagram we send, so the
+    // engine derives it from the secret bytes.
     let port = c.i32()?;
     let port = u16::try_from(port).ok().filter(|p| *p != 0)?;
     let player = c.take(16)?.try_into().ok()?;
@@ -271,7 +276,6 @@ fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
     }
     Some(VoiceServerInfo {
         secret,
-        connection_id,
         port,
         player,
         codec,
@@ -1293,9 +1297,8 @@ mod tests {
     }
 
     #[test]
-    fn decodes_secret_payload_with_connection_id_in_upstream_field_order() {
+    fn decodes_secret_payload_in_2_6_27_field_order() {
         let mut bytes = vec![0x42; 16];
-        bytes.extend_from_slice(&[0x77; 16]);
         bytes.extend_from_slice(&24454i32.to_be_bytes());
         bytes.extend_from_slice(&[0x11; 16]);
         bytes.push(0);
@@ -1307,7 +1310,6 @@ mod tests {
         bytes.extend_from_slice(b"voice.example.test");
         bytes.push(0);
         let info = decode_secret(&bytes).unwrap();
-        assert_eq!(info.connection_id, [0x77; 16]);
         assert_eq!(info.port, 24454);
         assert_eq!(info.mtu, 1200);
         assert_eq!(info.distance, 48.0);
@@ -1319,7 +1321,6 @@ mod tests {
     fn rejects_truncated_or_trailing_payloads() {
         assert!(decode_secret(&[0; 8]).is_none());
         let mut bytes = vec![0x42; 16];
-        bytes.extend_from_slice(&[0x77; 16]);
         bytes.extend_from_slice(&24454i32.to_be_bytes());
         bytes.extend_from_slice(&[0x11; 16]);
         bytes.push(0);

@@ -14,10 +14,17 @@ use uuid::Uuid;
 pub const REQUEST_SECRET_CHANNEL: &str = "voicechat:request_secret";
 pub const SECRET_CHANNEL: &str = "voicechat:secret";
 
-/// Current upstream compatibility number for Simple Voice Chat 2.6.27+ / MC 26.3
-/// (upstream gradle.properties: voicechat_compatibility_version=21). The plugin
-/// requires an exact match before it sends the secret payload.
-pub const COMPATIBILITY_VERSION: i32 = 21;
+/// Compatibility number of the Simple Voice Chat plugin generation this build
+/// interoperates with. The shipped bukkit plugin for MC 26.3, 2.6.27, reports
+/// compatibility version 20 (verified against the plugin jar: the server logs
+/// "Compatibility version 20" and rejects every other number before it sends a
+/// secret). Upstream's 2.7.0-pre1 development branch has already moved to 21
+/// and also changed the wire format, so both numbers must be bumped together
+/// once 2.7.x actually ships.
+pub const COMPATIBILITY_VERSION: i32 = 20;
+
+/// Compatibility number spoken by upstream's unreleased 2.7.0-pre1 branch.
+pub const COMPATIBILITY_VERSION_2_7_PRE: i32 = 21;
 pub const MAX_VOICE_HOST_CHARS: usize = 32_767;
 
 #[derive(Debug, Error)]
@@ -59,12 +66,18 @@ impl TryFrom<u8> for VoiceCodec {
     }
 }
 
-/// The complete SecretPacket fields sent by the official server plugin.
+/// The complete SecretPacket fields sent by the official server plugin
+/// (SVC 2.6.27, compatibility version 20).
+///
+/// In this wire generation the 16 secret bytes are only the AES key: every
+/// client UDP datagram is prefixed with the player's own profile UUID and the
+/// server looks its secret up with that UUID (`secrets` map keyed by
+/// `player.getUniqueId()`, resolved in `NetworkMessage.readPacketServer`).
+/// Upstream's 2.7.0-pre1 branch inserts a separate server-assigned connection
+/// UUID into the payload; that format is not yet shipped.
 #[derive(Clone)]
 pub struct VoiceServerInfo {
     pub secret: VoiceSecret,
-    /// The connection UUID that keys every UDP datagram this client sends.
-    pub connection_id: Uuid,
     pub server_port: u16,
     pub player_uuid: Uuid,
     pub codec: VoiceCodec,
@@ -80,7 +93,6 @@ impl std::fmt::Debug for VoiceServerInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VoiceServerInfo")
             .field("secret", &"[REDACTED]")
-            .field("connection_id", &self.connection_id)
             .field("server_port", &self.server_port)
             .field("player_uuid", &self.player_uuid)
             .field("codec", &self.codec)
@@ -95,11 +107,12 @@ impl std::fmt::Debug for VoiceServerInfo {
 }
 
 impl VoiceServerInfo {
-    /// Decode SecretPacket.toBytes() in its exact upstream field order.
+    /// Decode SecretPacket.toBytes() in its exact field order for SVC 2.6.27
+    /// (secret, port, player, codec, mtu, distance, keepalive, groups, host,
+    /// allow recording).
     pub fn decode(payload: &[u8]) -> Result<Self, HandshakeError> {
         let mut r = Reader::new(payload);
         let secret = VoiceSecret::from_bytes(r.take(16)?.try_into().expect("length checked"));
-        let connection_id = r.uuid()?;
         let server_port = r.i32()?;
         if !(1..=u16::MAX as i32).contains(&server_port) {
             return Err(HandshakeError::InvalidPort(server_port));
@@ -123,7 +136,6 @@ impl VoiceServerInfo {
         }
         Ok(Self {
             secret,
-            connection_id,
             server_port: server_port as u16,
             player_uuid,
             codec,
@@ -156,20 +168,28 @@ pub fn resolve_voice_endpoint(
     default_port: u16,
 ) -> Result<VoiceEndpoint, HandshakeError> {
     if voice_host.is_empty() {
-        return Ok(VoiceEndpoint { host: game_server_host.to_owned(), port: default_port });
+        return Ok(VoiceEndpoint {
+            host: game_server_host.to_owned(),
+            port: default_port,
+        });
     }
 
     if let Ok(port) = voice_host.parse::<u16>() {
         if port == 0 {
             return Err(HandshakeError::InvalidPort(0));
         }
-        return Ok(VoiceEndpoint { host: game_server_host.to_owned(), port });
+        return Ok(VoiceEndpoint {
+            host: game_server_host.to_owned(),
+            port,
+        });
     }
 
     // URI authority parsing is intentionally strict and supports bracketed
     // IPv6 literals. It never performs DNS resolution on the game thread.
     let (host, port) = if let Some(rest) = voice_host.strip_prefix('[') {
-        let end = rest.find(']').ok_or_else(|| HandshakeError::InvalidHost(voice_host.into()))?;
+        let end = rest
+            .find(']')
+            .ok_or_else(|| HandshakeError::InvalidHost(voice_host.into()))?;
         let host = &rest[..end];
         let suffix = &rest[end + 1..];
         if suffix.is_empty() {
@@ -191,12 +211,19 @@ pub fn resolve_voice_endpoint(
     if host.is_empty() || host.chars().any(char::is_whitespace) {
         return Err(HandshakeError::InvalidHost(voice_host.into()));
     }
-    Ok(VoiceEndpoint { host: host.to_owned(), port })
+    Ok(VoiceEndpoint {
+        host: host.to_owned(),
+        port,
+    })
 }
 
 fn parse_port(value: &str, original: &str) -> Result<u16, HandshakeError> {
-    let port = value.parse::<u16>().map_err(|_| HandshakeError::InvalidHost(original.into()))?;
-    if port == 0 { return Err(HandshakeError::InvalidHost(original.into())); }
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| HandshakeError::InvalidHost(original.into()))?;
+    if port == 0 {
+        return Err(HandshakeError::InvalidHost(original.into()));
+    }
     Ok(port)
 }
 
@@ -211,7 +238,9 @@ pub fn encode_request_secret(compatibility_version: i32) -> Vec<u8> {
 pub fn decode_request_secret(payload: &[u8]) -> Result<i32, HandshakeError> {
     let mut r = Reader::new(payload);
     let version = r.i32()?;
-    if !r.is_empty() { return Err(HandshakeError::TrailingBytes); }
+    if !r.is_empty() {
+        return Err(HandshakeError::TrailingBytes);
+    }
     Ok(version)
 }
 
@@ -222,7 +251,6 @@ mod tests {
     fn secret_payload(host: &str) -> Vec<u8> {
         let mut w = Writer::default();
         w.raw(&[0x42; 16]);
-        w.uuid(Uuid::parse_str("99aa77bb-1111-2222-3333-445566778899").unwrap());
         w.i32(24454);
         w.uuid(Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap());
         w.u8(VoiceCodec::Voip as u8);
@@ -238,16 +266,21 @@ mod tests {
     #[test]
     fn request_secret_is_one_big_endian_i32() {
         let payload = encode_request_secret(COMPATIBILITY_VERSION);
-        assert_eq!(payload, [0, 0, 0, 21]);
-        assert_eq!(decode_request_secret(&payload).unwrap(), 21);
+        assert_eq!(payload, 20i32.to_be_bytes());
+        assert_eq!(
+            decode_request_secret(&payload).unwrap(),
+            COMPATIBILITY_VERSION
+        );
     }
 
     #[test]
     fn decodes_secret_packet_fields_in_upstream_order() {
         let packet = VoiceServerInfo::decode(&secret_payload("")).unwrap();
-        assert_eq!(packet.connection_id.to_string(), "99aa77bb-1111-2222-3333-445566778899");
         assert_eq!(packet.server_port, 24454);
-        assert_eq!(packet.player_uuid.to_string(), "00112233-4455-6677-8899-aabbccddeeff");
+        assert_eq!(
+            packet.player_uuid.to_string(),
+            "00112233-4455-6677-8899-aabbccddeeff"
+        );
         assert_eq!(packet.codec, VoiceCodec::Voip);
         assert_eq!(packet.mtu_size, 1024);
         assert_eq!(packet.voice_chat_distance, 48.0);
@@ -258,22 +291,48 @@ mod tests {
 
     #[test]
     fn resolves_default_numeric_and_host_port_overrides() {
-        assert_eq!(resolve_voice_endpoint("", "mc.example.org", 24454).unwrap(),
-            VoiceEndpoint { host: "mc.example.org".into(), port: 24454 });
-        assert_eq!(resolve_voice_endpoint("25565", "mc.example.org", 24454).unwrap(),
-            VoiceEndpoint { host: "mc.example.org".into(), port: 25565 });
-        assert_eq!(resolve_voice_endpoint("voice.example.org:24454", "mc.example.org", 1).unwrap(),
-            VoiceEndpoint { host: "voice.example.org".into(), port: 24454 });
-        assert_eq!(resolve_voice_endpoint("[2001:db8::1]:24454", "mc.example.org", 1).unwrap(),
-            VoiceEndpoint { host: "2001:db8::1".into(), port: 24454 });
+        assert_eq!(
+            resolve_voice_endpoint("", "mc.example.org", 24454).unwrap(),
+            VoiceEndpoint {
+                host: "mc.example.org".into(),
+                port: 24454
+            }
+        );
+        assert_eq!(
+            resolve_voice_endpoint("25565", "mc.example.org", 24454).unwrap(),
+            VoiceEndpoint {
+                host: "mc.example.org".into(),
+                port: 25565
+            }
+        );
+        assert_eq!(
+            resolve_voice_endpoint("voice.example.org:24454", "mc.example.org", 1).unwrap(),
+            VoiceEndpoint {
+                host: "voice.example.org".into(),
+                port: 24454
+            }
+        );
+        assert_eq!(
+            resolve_voice_endpoint("[2001:db8::1]:24454", "mc.example.org", 1).unwrap(),
+            VoiceEndpoint {
+                host: "2001:db8::1".into(),
+                port: 24454
+            }
+        );
     }
 
     #[test]
     fn rejects_invalid_codec_and_extra_data() {
         let mut payload = secret_payload("");
-        // secret(16) + connection UUID(16) + port(4) + player UUID(16): the codec byte.
-        payload[52] = 99;
-        assert!(matches!(VoiceServerInfo::decode(&payload), Err(HandshakeError::InvalidCodec(99))));
-        assert!(matches!(decode_request_secret(&[0, 0, 0, 21, 1]), Err(HandshakeError::TrailingBytes)));
+        // secret(16) + port(4) + player UUID(16): the codec byte.
+        payload[36] = 99;
+        assert!(matches!(
+            VoiceServerInfo::decode(&payload),
+            Err(HandshakeError::InvalidCodec(99))
+        ));
+        assert!(matches!(
+            decode_request_secret(&[0, 0, 0, 21, 1]),
+            Err(HandshakeError::TrailingBytes)
+        ));
     }
 }

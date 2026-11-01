@@ -43,10 +43,6 @@ const CONNECTION_CHECK_ACK: u8 = 0x0a;
 #[derive(Clone, Debug)]
 pub struct VoiceServerInfo {
     pub secret: [u8; 16],
-    /// The connection UUID the server assigned this client in the secret
-    /// payload. Every client datagram carries it before the encrypted body
-    /// (ClientNetworkMessage.writeClient), so the server can pick the key.
-    pub connection_id: [u8; 16],
     pub port: u16,
     pub player: [u8; 16],
     /// 0 = VOIP, 1 = AUDIO, 2 = RESTRICTED_LOWDELAY.
@@ -631,7 +627,10 @@ fn run_worker(
         if !running.load(Ordering::Acquire) { break; }
 
         if !authenticated && last_auth.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
-            let _ = send_packet(&socket, &info, &Packet::Authenticate);
+            let _ = send_packet(&socket, &info, &Packet::Authenticate {
+                player: info.player,
+                secret: info.secret,
+            });
             last_auth = Some(Instant::now());
         } else if authenticated && !validated
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
@@ -1144,9 +1143,9 @@ fn build_output_stream(
 #[derive(Debug)]
 enum Packet {
     Mic { opus: Vec<u8>, sequence: i64, whispering: bool },
-    /// Upstream AuthenticatePacket has no fields: the secret and connection
-    /// identity travel in the datagram envelope itself.
-    Authenticate,
+    /// SVC 2.6.27 authentication: player UUID followed by the raw 16-byte
+    /// secret issued in the SecretPacket (AuthenticatePacket.toBytes order).
+    Authenticate { player: [u8; 16], secret: [u8; 16] },
     ConnectionCheck,
     KeepAlive,
     AuthenticateAck,
@@ -1180,9 +1179,10 @@ fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> R
         .map_err(|_| VoiceError::InvalidServerInfo("AES-GCM encryption failed"))?;
     let mut datagram = Vec::with_capacity(1 + 16 + 3 + NONCE_BYTES + encrypted.len());
     datagram.push(MAGIC);
-    // ClientNetworkMessage.writeClient writes the connection UUID, not the
-    // player's profile UUID: the server resolves the key by connection.
-    datagram.extend_from_slice(&info.connection_id);
+    // SVC 2.6.27 (compatibility 20): the server's secret map is keyed by the
+    // player's profile UUID, so every client datagram carries that UUID and
+    // the server resolves the AES key with Server.getSecret(playerUUID).
+    datagram.extend_from_slice(&info.player);
     let mut body = Vec::with_capacity(NONCE_BYTES + encrypted.len());
     body.extend_from_slice(&nonce);
     body.extend_from_slice(&encrypted);
@@ -1211,7 +1211,9 @@ fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
             out.push(MIC); write_byte_array(&mut out, opus); out.extend_from_slice(&sequence.to_be_bytes());
             out.push(u8::from(*whispering));
         }
-        Packet::Authenticate => out.push(AUTHENTICATE),
+        Packet::Authenticate { player, secret } => {
+            out.push(AUTHENTICATE); out.extend_from_slice(player); out.extend_from_slice(secret);
+        }
         Packet::ConnectionCheck => out.push(CONNECTION_CHECK),
         Packet::KeepAlive => out.push(KEEP_ALIVE),
         Packet::Ping { id, timestamp } => {
@@ -1226,7 +1228,10 @@ fn decode_packet(bytes: &[u8]) -> Option<Packet> {
     let mut r = Reader::new(bytes);
     let packet = match r.u8()? {
         MIC => Packet::Mic { opus: r.byte_array(MAX_OPUS)?, sequence: r.i64()?, whispering: r.boolean()? },
-        AUTHENTICATE => Packet::Authenticate,
+        AUTHENTICATE => Packet::Authenticate {
+            player: r.array16()?,
+            secret: r.array16()?,
+        },
         CONNECTION_CHECK => Packet::ConnectionCheck,
         KEEP_ALIVE => Packet::KeepAlive,
         AUTHENTICATE_ACK => Packet::AuthenticateAck,
@@ -1350,10 +1355,18 @@ mod tests {
     }
 
     #[test]
-    fn outbound_auth_packet_is_the_single_type_byte() {
-        // Upstream AuthenticatePacket.fromBytes/toBytes carry no fields.
-        let encoded = encode_packet(&Packet::Authenticate).unwrap();
-        assert_eq!(encoded, [AUTHENTICATE]);
+    fn outbound_auth_packet_carries_player_and_secret() {
+        // SVC 2.6.27 AuthenticatePacket.toBytes: playerUUID, then the raw secret.
+        let encoded = encode_packet(&Packet::Authenticate {
+            player: [0x11; 16],
+            secret: [0x42; 16],
+        }).unwrap();
+        let mut expected = vec![AUTHENTICATE];
+        expected.extend_from_slice(&[0x11; 16]);
+        expected.extend_from_slice(&[0x42; 16]);
+        assert_eq!(encoded, expected);
+        assert!(matches!(decode_packet(&encoded), Some(Packet::Authenticate { player, secret })
+            if player == [0x11; 16] && secret == [0x42; 16]));
     }
 
     #[test]

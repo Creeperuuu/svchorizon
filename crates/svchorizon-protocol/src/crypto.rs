@@ -18,23 +18,35 @@ pub enum CryptoError {
     Truncated,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct VoiceSecret([u8; SECRET_BYTES]);
 
+impl std::fmt::Debug for VoiceSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VoiceSecret([REDACTED])")
+    }
+}
+
 impl VoiceSecret {
-    pub fn from_bytes(bytes: [u8; SECRET_BYTES]) -> Self { Self(bytes) }
-    pub fn as_bytes(&self) -> &[u8; SECRET_BYTES] { &self.0 }
+    pub fn from_bytes(bytes: [u8; SECRET_BYTES]) -> Self {
+        Self(bytes)
+    }
+    pub fn as_bytes(&self) -> &[u8; SECRET_BYTES] {
+        &self.0
+    }
 
     fn key(&self) -> LessSafeKey {
-        let key = UnboundKey::new(&aead::AES_128_GCM, &self.0)
-            .expect("AES-128 key has exactly 16 bytes");
+        let key =
+            UnboundKey::new(&aead::AES_128_GCM, &self.0).expect("AES-128 key has exactly 16 bytes");
         LessSafeKey::new(key)
     }
 
     /// Mirrors upstream Secret.encrypt(): random IV prefix and AES-128-GCM.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut nonce = [0u8; NONCE_BYTES];
-        SystemRandom::new().fill(&mut nonce).map_err(|_| CryptoError::Randomness)?;
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| CryptoError::Randomness)?;
         let mut ciphertext = plaintext.to_vec();
         self.key()
             .seal_in_place_append_tag(
@@ -53,11 +65,10 @@ impl VoiceSecret {
         if encrypted.len() < NONCE_BYTES + GCM_TAG_BYTES {
             return Err(CryptoError::Truncated);
         }
-        let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES]
-            .try_into()
-            .expect("length checked");
+        let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES].try_into().expect("length checked");
         let mut plaintext = encrypted[NONCE_BYTES..].to_vec();
-        let opened = self.key()
+        let opened = self
+            .key()
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::empty(),
@@ -84,7 +95,10 @@ mod tests {
     fn wrong_key_fails_authentication() {
         let a = VoiceSecret::from_bytes([1; 16]);
         let b = VoiceSecret::from_bytes([2; 16]);
-        assert!(matches!(b.decrypt(&a.encrypt(b"test").unwrap()), Err(CryptoError::Authentication)));
+        assert!(matches!(
+            b.decrypt(&a.encrypt(b"test").unwrap()),
+            Err(CryptoError::Authentication)
+        ));
     }
 
     #[test]
@@ -92,6 +106,9 @@ mod tests {
         let key = VoiceSecret::from_bytes([7; 16]);
         let mut encrypted = key.encrypt(b"voice frame").unwrap();
         *encrypted.last_mut().unwrap() ^= 0x80;
-        assert!(matches!(key.decrypt(&encrypted), Err(CryptoError::Authentication)));
+        assert!(matches!(
+            key.decrypt(&encrypted),
+            Err(CryptoError::Authentication)
+        ));
     }
 }

@@ -2,7 +2,7 @@
 
 A native Rust Simple Voice Chat client port for Horizon.
 
-<sub>Development status: advanced prototype; not yet validated in-game or against an official server.</sub>
+<sub>Development status: advanced prototype; the complete SVC wire path (handshake, secret, UDP auth, keepalive, mic stream) is live-tested against a real Paper 26.3 server running the unmodified official plugin; in-game scenarios inside Horizon are still being validated.</sub>
 
 The project targets unmodified Paper/Spigot servers running the official Simple Voice Chat plugin and players using official Fabric, Forge and NeoForge clients. No Horizon-specific server plugin is intended.
 
@@ -40,7 +40,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Minecraft: 26.3
 - Horizon: `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`
 - horizon-mixins: `d9c83d7096b7ea5b83678da2efdfd6161f74997e`
-- Simple Voice Chat compatibility version: 21 (upstream gradle.properties, 2.6.27+ / MC 26.3)
+- Simple Voice Chat compatibility version: 20 (the shipped `voicechat-bukkit-2.6.27` plugin for MC 26.3; upstream 2.7.0-pre1 moves to 21 with a wire change)
+
+## Interop test harness
+
+`tools/interop-harness` joins a real Paper server running the official Simple
+Voice Chat plugin using this project's protocol implementation and drives the
+complete official voice handshake (secret request, UDP authentication,
+connection validation, keepalive, microphone frames). See
+[docs/STATUS.md](docs/STATUS.md) ("Live interop validation") for the recorded
+server-side evidence and how to reproduce it.
 
 See [protocol notes](docs/PROTOCOL.md) and [implementation status](docs/STATUS.md).
 

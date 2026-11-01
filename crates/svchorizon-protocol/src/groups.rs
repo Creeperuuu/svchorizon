@@ -17,7 +17,9 @@ pub const REMOVE_GROUP_CHANNEL: &str = "voicechat:remove_group";
 pub enum GroupPayloadError {
     #[error(transparent)]
     Wire(#[from] WireError),
-    #[error("group name must be 1–24 characters and cannot start with whitespace or contain control characters")]
+    #[error(
+        "group name must be 1–24 characters and cannot start with whitespace or contain control characters"
+    )]
     InvalidName,
     #[error("group password exceeds the upstream length limit")]
     PasswordTooLong,
@@ -43,7 +45,9 @@ impl GroupType {
 
 fn validate_group_name(name: &str) -> Result<(), GroupPayloadError> {
     let mut chars = name.chars();
-    let Some(first) = chars.next() else { return Err(GroupPayloadError::InvalidName); };
+    let Some(first) = chars.next() else {
+        return Err(GroupPayloadError::InvalidName);
+    };
     if name.chars().count() > 24
         || first.is_whitespace()
         || first.is_control()
@@ -109,7 +113,10 @@ impl JoinedGroup {
         let group_id = if r.bool()? { Some(r.uuid()?) } else { None };
         let wrong_password = r.bool()?;
         r.finish()?;
-        Ok(Self { group_id, wrong_password })
+        Ok(Self {
+            group_id,
+            wrong_password,
+        })
     }
 }
 
@@ -131,9 +138,18 @@ impl ClientGroup {
         let has_password = r.bool()?;
         let persistent = r.bool()?;
         let hidden = r.bool()?;
-        let group_type = GroupType::from_wire(i16::from_be_bytes(r.take(2)?.try_into().expect("length checked")));
+        let group_type = GroupType::from_wire(i16::from_be_bytes(
+            r.take(2)?.try_into().expect("length checked"),
+        ));
         r.finish()?;
-        Ok(Self { id, name, has_password, persistent, hidden, group_type })
+        Ok(Self {
+            id,
+            name,
+            has_password,
+            persistent,
+            hidden,
+            group_type,
+        })
     }
 }
 
@@ -155,7 +171,10 @@ mod tests {
         assert_eq!(r.utf(24).unwrap(), "Horizon");
         assert!(r.bool().unwrap());
         assert_eq!(r.utf(24).unwrap(), "secret");
-        assert_eq!(i16::from_be_bytes(r.take(2).unwrap().try_into().unwrap()), 2);
+        assert_eq!(
+            i16::from_be_bytes(r.take(2).unwrap().try_into().unwrap()),
+            2
+        );
         r.finish().unwrap();
     }
 
@@ -178,10 +197,13 @@ mod tests {
         w.bool(true);
         w.uuid(id);
         w.bool(false);
-        assert_eq!(JoinedGroup::decode(&w.data).unwrap(), JoinedGroup {
-            group_id: Some(id),
-            wrong_password: false,
-        });
+        assert_eq!(
+            JoinedGroup::decode(&w.data).unwrap(),
+            JoinedGroup {
+                group_id: Some(id),
+                wrong_password: false,
+            }
+        );
     }
 
     #[test]

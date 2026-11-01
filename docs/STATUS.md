@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-10-31.
+Last updated: 2026-11-01.
 
 ## Implemented in source
 
@@ -36,7 +36,8 @@ Last updated: 2026-10-31.
 
 ## Still missing before a complete Simple Voice Chat client
 
-- [ ] Real Paper/Spigot interoperability tests against the official plugin and unmodified Fabric/Forge/NeoForge clients.
+- [x] Real Paper interoperability test against the official plugin: the protocol crate now completes the full official handshake/auth/keepalive/microphone flow against a live Paper 26.3 server running unmodified `voicechat-bukkit-2.6.27` (see "Live interop validation").
+- [ ] Two-client audio relay test (a second client actually hearing the first) and cross-talk with official Fabric/Forge/NeoForge clients on the same server.
 - [ ] Run the manual GitHub Actions workflow on CI runners (Windows engine compile + packaging matrix); the source is now build-validated locally (see below).
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Group invites, persistent group settings and a full graphical group UI. Password entry and custom group names/types are available through `/svchorizon group` chat commands; basic discovery/cycling and quick controls remain keybind-driven.
@@ -48,13 +49,15 @@ Last updated: 2026-10-31.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version 21 from upstream gradle.properties (2.6.27+ / MC 26.3); the plugin requires an exact match. This value is release-specific, not a universal protocol version.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.
 
-## Interop-critical wire details (verified against upstream 2.6.27+ source)
+## Interop-critical wire details (verified against the 2.6.27 plugin jar and a live server)
 
 - The client sends `minecraft:register` with every `voicechat:*` channel before requesting the secret; Bukkit/Paper deliver payloads only to channels the client registered.
-- The `voicechat:secret` payload carries a connection UUID between the AES secret and the UDP port; every client UDP datagram prefixes that connection UUID (not the player UUID), mirroring `ClientNetworkMessage.writeClient`.
-- `AuthenticatePacket` (0x05) has an empty body: the encrypted plaintext is the single packet-ID byte.
+- The `voicechat:secret` payload (compatibility 20) has **no** connection UUID: secret, port, player UUID, codec, mtu, distance, keepalive, groups, host, recording. Upstream 2.7.0-pre1 inserts a server-assigned connection UUID after the secret.
+- Every client UDP datagram prefixes the **player's own profile UUID**; the plugin keeps its per-player AES secrets in a map keyed by `player.getUniqueId()` and resolves the key with that UUID (verified by decompiling `NetworkMessage.readPacketServer` and `ServerVoiceEvents.initializePlayerConnection` in the shipped jar).
+- `AuthenticatePacket` (0x05) carries the player UUID followed by the raw 16-byte secret; `AuthenticateAckPacket`, `ConnectionCheckPacket` and `ConnectionCheckAckPacket` are empty in 2.6.27 (the nonce-carrying variants exist only in upstream 2.7.0-pre1).
+- AES-128-GCM with a random 12-byte IV prefix and 128-bit tag, exactly as implemented (`Secret.IV_SIZE_BYTES = 12` in the jar).
 - The command registration hook (`native_commands`) does not exist at the pinned Horizon commit (hooks API 3), so `/svchorizon` runs through the `native_command` hook alone; chat feedback uses `native_chat`.
 
 The vendored Opus implementation is from [restsend/opus-rs](https://github.com/restsend/opus-rs) and retains its BSD license in the engine bundle.
@@ -69,8 +72,37 @@ Validated against Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c` with
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean on the protocol workspace.
 - `tools/package.py` produces `target/svchorizon-0.1.0.hnmod`; every bundle path passes the launcher's `mixins/<id>/` `.rs`/`.toml` file rule (the vendored BSD license text stays outside the bundle, in `engine/COPYING`).
 
-Protocol fixes found by the audit against upstream `henkelmax/simple-voice-chat` (2.6.27+ / MC 26.3): compatibility version 20 -> 21; the secret payload's connection UUID is now decoded and used as the datagram prefix (was the player UUID); `AuthenticatePacket` is sent with an empty body; the client registers all official `voicechat:*` channels via `minecraft:register` before requesting the secret (Bukkit/Paper deliver payloads only to registered channels); create-group passwords are limited to the upstream 24-character name limit.
+Wire corrections (2026-11-01) proven by the live interop run below — the previous audit had derived the wire from upstream's unreleased 2.7.0-pre1 branch instead of the shipped 2.6.27 plugin: compatibility version 21 -> 20; the secret payload's connection UUID field removed (not present in 2.6.27); the UDP datagram prefix is the player UUID (was mis-set to the secret UUID, which made the server reject every datagram with "Player <uuid> does not have a secret"); `AuthenticatePacket` now sends the player UUID + raw secret (was empty).
+
+## Live interop validation (2026-11-01, branch dev/continue-port)
+
+`tools/interop-harness` (workspace member) joins a real Paper 26.3 build 235
+server running the unmodified official `voicechat-bukkit-2.6.27` plugin on
+127.0.0.1, using a hand-rolled protocol-777 Minecraft login (packet IDs from
+the pinned Horizon id table) plus `svchorizon-protocol` for the entire SVC
+wire. Reproduce with the repository-root helper `scripts/run_interop.sh`
+(boots the server headless with `-Dvoicechat.debug=true`, waits for readiness,
+runs the harness, prints the plugin's log lines).
+
+Observed from the plugin, unedited:
+
+- `Received secret request of svchorizon (20)` → `Sent secret to svchorizon`
+- `Successfully authenticated player 159fe646-f0d3-3e45-85de-310fb9410b28`
+- `Successfully validated connection of player 159fe646-f0d3-3e45-85de-310fb9410b28`
+- `Player svchorizon (159fe646-f0d3-3e45-85de-310fb9410b28) successfully connected to voice chat`
+
+The harness then answers server keepalives, echoes pings and streams
+microphone packets for five seconds and exits 0. This validates the TCP
+handshake, secret decoding, AES-GCM transport, UDP authentication, connection
+validation and keepalive path against the real plugin — it does not yet prove
+two-client audio relay (needs a second voice client on the server).
 
 ## Validation policy
 
-Protocol unit tests and source-level integration do not prove server interoperability. No usable-client or interoperability claim is made until the resulting bundle is tested against a real Paper server running the official plugin.
+Protocol unit tests alone do not prove server interoperability. The full SVC
+wire path (TCP handshake, secret, UDP authentication, connection validation,
+keepalive) is now proven against a real Paper server running the unmodified
+official plugin — see "Live interop validation". What remains unproven is the
+packaged mod running inside the actual Horizon client: the two-client audio
+relay, official Fabric/Forge/NeoForge cross-talk and the in-game scenario
+matrix still have to pass before the mod can be called done.
