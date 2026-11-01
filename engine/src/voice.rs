@@ -226,6 +226,18 @@ impl From<std::io::Error> for VoiceError {
     fn from(value: std::io::Error) -> Self { Self::Io(value) }
 }
 
+impl VoiceError {
+    /// True when the send failed only because the remote peer answered an
+    /// earlier datagram with an ICMP port-unreachable, which connected UDP
+    /// sockets on Windows surface as `WSAECONNRESET` on a later send or
+    /// recv. On a connectionless voice socket this is reachability noise,
+    /// not a socket failure - the unanswered-attempts warning tracks the
+    /// reachability signal instead.
+    fn is_connection_reset(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    }
+}
+
 enum Command {
     Pcm([i16; FRAME_SAMPLES]),
     Shutdown,
@@ -653,7 +665,7 @@ fn run_worker(
                 // datagram as WSAECONNRESET on the next send; that is a
                 // reachability signal, not a socket failure - it is counted
                 // by the unanswered-attempts warning below instead.
-                if error.kind() != std::io::ErrorKind::ConnectionReset {
+                if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending authentication failed: {error}");
                 }
             }
@@ -674,7 +686,7 @@ fn run_worker(
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
             if let Err(error) = send_packet(&socket, &info, &Packet::ConnectionCheck) {
-                if error.kind() != std::io::ErrorKind::ConnectionReset {
+                if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending connection check failed: {error}");
                 }
             }
@@ -709,7 +721,7 @@ fn run_worker(
                     Packet::KeepAlive => {
                         last_keepalive = Instant::now();
                         if let Err(error) = send_packet(&socket, &info, &Packet::KeepAlive) {
-                            if error.kind() != std::io::ErrorKind::ConnectionReset {
+                            if !error.is_connection_reset() {
                                 eprintln!("[svchorizon] sending keepalive failed: {error}");
                             }
                         }
