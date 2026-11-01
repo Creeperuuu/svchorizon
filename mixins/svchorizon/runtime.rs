@@ -10,9 +10,9 @@ use svchorizon_engine::voice::{
 };
 
 // Compatibility numbers of the two Simple Voice Chat wire generations this
-// client speaks. The server silently ignores a request_secret carrying any
-// other value, so both are probed on every join: whichever generation the
-// server runs answers the matching request with its secret payload.
+// client speaks. A mismatched request_secret is explicitly rejected by the
+// server with an incompatible_version chat message, so probe the widely
+// deployed stable 2.6.x generation first and only try 2.7.x if no secret arrives.
 //
 // Compat 20 = Simple Voice Chat 2.6.x (the release line across Minecraft
 // 1.12.2 up to and including 1.21.x/26.x servers). Compat 21 = Simple Voice
@@ -23,7 +23,7 @@ const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
 const REGISTER: &str = "minecraft:register";
 /// The compatibility number that last produced a secret on this session
-/// (0 = unknown, probe both generations).
+/// (0 = unknown; the negotiated profile is also stored in VoiceServerInfo).
 static KNOWN_COMPAT: AtomicI32 = AtomicI32::new(0);
 /// Unix millis of the last secret request; drives the re-probe timer.
 static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
@@ -34,9 +34,11 @@ static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
 const SECRET_PROBE_TIMEOUT_MS: u64 = 3_000;
 /// Retry the preferred generation if neither probe receives a secret.
 const SECRET_REQUEST_RETRY_MS: u64 = 10_000;
-/// Current upstream SVC for Minecraft 26.3 is compat 21 (2.7.0-pre1).
-/// Compat 20 remains supported as a delayed fallback for 2.6.x servers.
-const SECRET_PROBE_ORDER: &[i32] = &[21, 20];
+/// Probe stable SVC 2.6.x first (compat 20), which is used by the current
+/// release line across old and new Minecraft server versions. Try the newer
+/// 2.7.x wire generation (compat 21) only when the stable handshake fails.
+/// These are SVC protocol generations, not Minecraft protocol versions.
+const SECRET_PROBE_ORDER: &[i32] = &[20, 21];
 static SECRET_PROBE_INDEX: AtomicUsize = AtomicUsize::new(0);
 /// Every custom-payload channel the official plugin registers (NetManager.init).
 /// Bukkit/Paper deliver a payload only for channels the client registered, so
@@ -1111,7 +1113,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             && now.saturating_sub(last) >= SECRET_REQUEST_RETRY_MS
         {
             // No secret arrived from either supported generation. Keep the
-            // connection-detection path alive without spamming both versions.
+            // connection-detection path alive by retrying stable compat 20.
             SECRET_PROBE_INDEX.store(1, Ordering::Release);
             let version = SECRET_PROBE_ORDER[0];
             send_secret_request(game, version);
@@ -1608,10 +1610,9 @@ pub fn on_packet(
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") {
-                // Bukkit/Paper only deliver payloads the client registered.
-                // The known-generation cache is per server: a different
-                // server may run the other SVC generation, so probe both
-                // again on every join.
+                // A different server may run a different SVC release, so
+                // negotiate again on every join. Minecraft's game version
+                // does not determine this compatibility number.
                 KNOWN_COMPAT.store(0, Ordering::Release);
                 SECRET_PROBE_INDEX.store(1, Ordering::Release);
                 send_channel_registration(game);
