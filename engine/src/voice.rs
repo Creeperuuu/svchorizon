@@ -41,8 +41,8 @@ const CONNECTION_CHECK: u8 = 0x09;
 const CONNECTION_CHECK_ACK: u8 = 0x0a;
 
 /// Which wire generation the server speaks. The plugin-channel handshake is
-/// gated by a compatibility number (the server silently ignores a request
-/// carrying a different one), and the UDP layer differs between the two
+/// gated by an SVC compatibility number (a mismatch produces an
+/// incompatible_version chat message), and the UDP layer differs between the two
 /// generations that are deployed in the wild:
 ///
 /// * `Compat20` - Simple Voice Chat 2.6.x (compatibility version 20, the
