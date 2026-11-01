@@ -27,8 +27,15 @@ const REGISTER: &str = "minecraft:register";
 static KNOWN_COMPAT: AtomicI32 = AtomicI32::new(0);
 /// Unix millis of the last secret request; drives the re-probe timer.
 static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
-/// How often a secret request is re-sent while no secret has arrived.
-const SECRET_REQUEST_RETRY_MS: u64 = 10_000;
+/// SVC's request-secret handler sends a visible incompatibility chat message
+/// for every request whose compatibility number does not match. Probe one
+/// generation at a time so a supported server does not receive a false
+/// incompatibility warning for the other generation.
+const SECRET_PROBE_TIMEOUT_MS: u64 = 1_500;
+/// Current upstream SVC for Minecraft 26.3 is compat 21 (2.7.0-pre1).
+/// Compat 20 remains supported as a delayed fallback for 2.6.x servers.
+const SECRET_PROBE_ORDER: &[i32] = &[21, 20];
+static SECRET_PROBE_INDEX: AtomicUsize = AtomicUsize::new(0);
 /// Every custom-payload channel the official plugin registers (NetManager.init).
 /// Bukkit/Paper deliver a payload only for channels the client registered, so
 /// this must go out before the secret request on every server join.
@@ -389,19 +396,12 @@ fn send_client_state(game: &mut crate::game::Game<'_>, muted: bool, disabled: bo
     }));
 }
 
-fn send_secret_request(game: &mut crate::game::Game<'_>) {
+fn send_secret_request(game: &mut crate::game::Game<'_>, version: i32) {
     use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
-    // Once a generation is known, ask only for it. Otherwise probe every
-    // supported generation: the server answers only the request whose
-    // compatibility number matches its own and ignores the other.
-    let known = KNOWN_COMPAT.load(Ordering::Acquire);
-    let versions: &[i32] = if known != 0 { &[known] } else { &[20, 21] };
-    for version in versions {
-        game.send(Serverbound::CustomPayload(CustomPayload {
-            channel: REQUEST_SECRET.to_owned(),
-            data: version.to_be_bytes().to_vec(),
-        }));
-    }
+    game.send(Serverbound::CustomPayload(CustomPayload {
+        channel: REQUEST_SECRET.to_owned(),
+        data: version.to_be_bytes().to_vec(),
+    }));
     LAST_SECRET_REQUEST.store(now_millis(), Ordering::Release);
 }
 
@@ -1096,8 +1096,14 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     {
         let last = LAST_SECRET_REQUEST.load(Ordering::Acquire);
         let now = now_millis();
-        if last == 0 || now.saturating_sub(last) >= SECRET_REQUEST_RETRY_MS {
-            send_secret_request(game);
+        let next_probe = SECRET_PROBE_INDEX.load(Ordering::Acquire);
+        if next_probe < SECRET_PROBE_ORDER.len()
+            && (last == 0 || now.saturating_sub(last) >= SECRET_PROBE_TIMEOUT_MS)
+        {
+            let version = SECRET_PROBE_ORDER[next_probe];
+            SECRET_PROBE_INDEX.store(next_probe + 1, Ordering::Release);
+            send_secret_request(game, version);
+            eprintln!("[svchorizon] Probing SVC compatibility {version}.");
         }
     }
 
@@ -1595,8 +1601,11 @@ pub fn on_packet(
                 // server may run the other SVC generation, so probe both
                 // again on every join.
                 KNOWN_COMPAT.store(0, Ordering::Release);
+                SECRET_PROBE_INDEX.store(1, Ordering::Release);
                 send_channel_registration(game);
-                send_secret_request(game);
+                let version = SECRET_PROBE_ORDER[0];
+                send_secret_request(game, version);
+                eprintln!("[svchorizon] Probing SVC compatibility {version}.");
             }
         }
         Clientbound::CustomPayload(payload)
@@ -1605,6 +1614,7 @@ pub fn on_packet(
             match decode_secret(&payload.data) {
                 Some(info) => {
                     KNOWN_COMPAT.store(info.profile.compatibility_version(), Ordering::Release);
+                    SECRET_PROBE_INDEX.store(SECRET_PROBE_ORDER.len(), Ordering::Release);
                     eprintln!(
                         "[svchorizon] Secret received ({}): voice host '{}' port {} keepalive {}ms groups {}",
                         info.profile.label(),
