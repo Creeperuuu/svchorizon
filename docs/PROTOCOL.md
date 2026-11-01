@@ -24,9 +24,7 @@ Bukkit/Paper deliver a custom payload only for channels the client registered, s
 1. Channel: `minecraft:register`, body: every `voicechat:*` channel the official plugin
    registers (NetManager.init), NUL-separated, mirroring the official client.
 2. Channel: `voicechat:request_secret`, body: 32-bit big-endian compatibility
-   version, `20` and `21` probed together until the server answers (the server
-   compares the client version exactly and silently ignores any other number
-   without sending a secret; a session remembers which number worked).
+   version, `21` first and `20` after a short timeout if no secret arrives. The server compares the client version exactly; a mismatch triggers an incompatibility chat message rather than silently ignoring the request. A successful secret response ends probing and selects that wire generation.
 
 The server replies on `voicechat:secret` with (SecretPacket.toBytes order,
 verified from the 2.6.27 jar):
@@ -51,7 +49,7 @@ The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, t
 
 | Channel | Direction | Current behavior |
 |---|---|---|
-| `voicechat:request_secret` | Client → server | Probes compatibility 20 and 21; remembers the generation the server accepted |
+| `voicechat:request_secret` | Client → server | Probes compatibility 21 first, then 20 after a short timeout; remembers the generation the server accepted |
 | `voicechat:secret` | Server → client | Decodes session secret and UDP metadata; starts voice workers |
 | `voicechat:client_state` | Client → server | Synchronizes local microphone mute/disabled flags |
 | `voicechat:states` | Server → client | Parses bounded player-state snapshots |
