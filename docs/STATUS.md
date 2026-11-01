@@ -53,7 +53,7 @@ Last updated: 2026-11-01.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client advertises Simple Voice Chat compatibility version **20** and **21**: on every join both generations are probed (the server answers only the request whose number matches its own plugin build), and the UDP layer switches to the matching wire format. Compat 20 is the release line published for Minecraft 1.12.2 through the current 1.21.x/26.x servers (`voicechat-bukkit-2.6.27` and friends); compat 21 is upstream 2.7.x. This is a property of the server's plugin build, not of one Minecraft version, so probing both covers older and newer servers alike.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client supports Simple Voice Chat compatibility **21** and **20**. It probes 21 first (the current upstream SVC 2.7.0-pre1 build for Minecraft 26.3), then probes 20 after a short timeout for older 2.6.x servers. Probes are sequential because the official server emits a visible incompatibility message for a mismatched request. The secret response selects the matching UDP wire generation; compatibility is a property of the server plugin build, not Minecraft alone.
 
 ## Interop-critical wire details (verified against the 2.6.27 plugin jar and a live server)
 
