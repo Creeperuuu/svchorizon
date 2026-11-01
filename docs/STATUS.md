@@ -103,6 +103,27 @@ and `cargo check` of the staged `horizon-client` (whole game plus mod) with
 Rust 1.95.0. Not validated: a live server. If it is still unreachable the voice
 UDP port is almost certainly not open or forwarded on the host.
 
+## axocraftseason8 live result: endpoint correct, no answer (2026-11-01)
+
+Log from a real run: voice host empty, connected peer 172.197.205.171:47157,
+voice endpoint 172.197.205.171:47230 (the port the server announced), 20
+authentication attempts with no reply. So the endpoint selection is right (the
+typed name and the SRV/peer address resolve to the same IP here) and the secret
+exchange works; the voice UDP datagrams get no answer.
+
+The loopback "UDP self-test" only proves the game can receive UDP locally; it
+does not exercise the firewall or the network, and its message now says so.
+
+The engine now tells the two failure modes apart by counting ICMP
+port-unreachable replies (`ConnectionReset` on Windows, `ConnectionRefused`
+elsewhere), instead of swallowing them:
+- rejections > 0: the host is reachable but nothing listens on that UDP port
+  (voice server not bound there, or the panel/NAT does not map the port). HUD:
+  "Voice port closed on server (nothing listening)".
+- rejections == 0: datagrams are silently dropped (host/cloud firewall not
+  allowing inbound UDP on that port, or local filtering). HUD: "Voice server
+  unreachable (UDP dropped)".
+
 ## Compatibility pin
 
 The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.

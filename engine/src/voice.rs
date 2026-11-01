@@ -234,11 +234,16 @@ impl VoiceError {
         }
     }
 
-    /// True when this is the transient `ConnectionReset` a connected UDP socket
-    /// reports on Windows after an earlier datagram drew an ICMP
-    /// port-unreachable. It signals reachability, not a broken socket.
-    pub fn is_connection_reset(&self) -> bool {
-        self.io_kind() == Some(std::io::ErrorKind::ConnectionReset)
+    /// True when the OS reports that the voice server's host rejected a datagram
+    /// with an ICMP port-unreachable: `ConnectionReset` on Windows (WSAECONNRESET
+    /// on the next send/recv of a connected UDP socket), `ConnectionRefused` on
+    /// Linux/macOS. It is not a socket failure: it proves the host is reachable
+    /// but nothing is listening on that UDP port.
+    pub fn is_icmp_rejection(&self) -> bool {
+        matches!(
+            self.io_kind(),
+            Some(std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused)
+        )
     }
 }
 impl Error for VoiceError {}
@@ -265,6 +270,7 @@ pub struct VoiceClient {
     microphone_gain: Arc<AtomicU32>,
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
+    icmp_rejections: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
     listener: Arc<Mutex<ListenerPose>>,
@@ -296,7 +302,7 @@ impl VoiceClient {
         let address = resolve_voice_address(&info.host, fallback_host, info.port)?;
         eprintln!("[svchorizon] Voice endpoint: {address}");
         match udp_self_test() {
-            Ok(()) => eprintln!("[svchorizon] UDP self-test: ok (the game process can receive UDP)"),
+            Ok(()) => eprintln!("[svchorizon] UDP self-test: ok (loopback only: the game process can receive UDP; this does not test the firewall or the network)"),
             Err(error) => eprintln!(
                 "[svchorizon] UDP self-test FAILED: {error} - the game process cannot receive UDP at all; a sandbox/antivirus is blocking it"
             ),
@@ -320,6 +326,7 @@ impl VoiceClient {
         let microphone_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let connected = Arc::new(AtomicBool::new(false));
         let auth_attempts = Arc::new(AtomicU32::new(0));
+        let icmp_rejections = Arc::new(AtomicU32::new(0));
 
         let audio_running = Arc::clone(&running);
         let audio_transmitting = Arc::clone(&transmitting);
@@ -347,6 +354,7 @@ impl VoiceClient {
         let worker_voice_activation = Arc::clone(&voice_activation);
         let worker_connected = Arc::clone(&connected);
         let worker_auth_attempts = Arc::clone(&auth_attempts);
+        let worker_icmp_rejections = Arc::clone(&icmp_rejections);
         let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
@@ -354,7 +362,7 @@ impl VoiceClient {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
                     worker_running, worker_transmitting, worker_whispering, worker_voice_activation,
-                    worker_connected, worker_auth_attempts, worker_positions,
+                    worker_connected, worker_auth_attempts, worker_icmp_rejections, worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -367,7 +375,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts,
+            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts, icmp_rejections,
             worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
             audio_devices, endpoint: address,
         })
@@ -421,6 +429,14 @@ impl VoiceClient {
     /// "still connecting" from "the server is not answering at all".
     pub fn unanswered_auth_attempts(&self) -> u32 {
         self.auth_attempts.load(Ordering::Relaxed)
+    }
+
+    /// How many times the voice server's host answered a datagram with an ICMP
+    /// port-unreachable. Non-zero means the host is reachable but nothing is
+    /// listening on the voice UDP port; zero with unanswered attempts means the
+    /// datagrams are silently dropped somewhere on the way.
+    pub fn icmp_rejections(&self) -> u32 {
+        self.icmp_rejections.load(Ordering::Relaxed)
     }
 
     pub fn is_transmitting(&self) -> bool {
@@ -630,6 +646,7 @@ fn run_worker(
     voice_activation: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
+    icmp_rejections: Arc<AtomicU32>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
@@ -693,9 +710,11 @@ fn run_worker(
             }) {
                 // Windows reports an ICMP port-unreachable from a previous
                 // datagram as WSAECONNRESET on the next send; that is a
-                // reachability signal, not a socket failure - it is counted
-                // by the unanswered-attempts warning below instead.
-                if !error.is_connection_reset() {
+                // reachability signal, not a socket failure. It is counted and
+                // explained by the unanswered-attempts warning below.
+                if error.is_icmp_rejection() {
+                    icmp_rejections.fetch_add(1, Ordering::Relaxed);
+                } else {
                     eprintln!("[svchorizon] sending authentication failed: {error}");
                 }
             }
@@ -707,16 +726,25 @@ fn run_worker(
             }
             if attempts == 15 {
                 let peer = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".into());
-                eprintln!(
-                    "[svchorizon] The voice server at {peer} never answered authentication for 15s. If official voice chat works on this server from this PC, the UDP replies are being filtered locally - check that horizon-client.exe is allowed in Windows Firewall (inbound UDP) and in any antivirus with network protection. Otherwise the server's voice UDP port is likely not opened/forwarded (hosting panels need a second UDP port for voice chat)."
-                );
+                let rejections = icmp_rejections.load(Ordering::Relaxed);
+                if rejections > 0 {
+                    eprintln!(
+                        "[svchorizon] The host of {peer} answered {rejections} datagram(s) with an ICMP port-unreachable: the machine is reachable but NOTHING IS LISTENING on that UDP port. The Simple Voice Chat server is not bound to it, or the hosting panel/NAT does not map that UDP port to the server. Check the plugin's `port` setting and the server's network allocations (UDP)."
+                    );
+                } else {
+                    eprintln!(
+                        "[svchorizon] The voice server at {peer} never answered authentication for 15s and sent no ICMP rejection, so the datagrams are being silently dropped or ignored. Most often the host/cloud firewall does not allow inbound UDP on that port. If official voice chat works on this server from this PC, check that horizon-client.exe is allowed in Windows Firewall (inbound UDP) and in any antivirus with network protection. (The loopback self-test above does not exercise the firewall or the network.)"
+                    );
+                }
             }
             last_auth = Some(Instant::now());
         } else if authenticated && !validated
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
             if let Err(error) = send_packet(&socket, &info, &Packet::ConnectionCheck) {
-                if !error.is_connection_reset() {
+                if error.is_icmp_rejection() {
+                    icmp_rejections.fetch_add(1, Ordering::Relaxed);
+                } else {
                     eprintln!("[svchorizon] sending connection check failed: {error}");
                 }
             }
@@ -751,7 +779,9 @@ fn run_worker(
                     Packet::KeepAlive => {
                         last_keepalive = Instant::now();
                         if let Err(error) = send_packet(&socket, &info, &Packet::KeepAlive) {
-                            if !error.is_connection_reset() {
+                            if error.is_icmp_rejection() {
+                                icmp_rejections.fetch_add(1, Ordering::Relaxed);
+                            } else {
                                 eprintln!("[svchorizon] sending keepalive failed: {error}");
                             }
                         }
@@ -795,13 +825,19 @@ fn run_worker(
                     _ => {}
                 }
             }
+            // Windows surfaces an ICMP port-unreachable as WSAECONNRESET on a
+            // connected UDP socket (Linux/macOS: ConnectionRefused). Keep
+            // running, but count it: it is the one signal that tells "host
+            // reachable, nothing listening" apart from "silently dropped".
+            Err(error) if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+            ) => {
+                icmp_rejections.fetch_add(1, Ordering::Relaxed);
+            }
             Err(error) if matches!(
                 error.kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
-                // Windows surfaces a stray ICMP port-unreachable as
-                // WSAECONNRESET on a connected UDP socket; keep running and
-                // let the unanswered-authentication counter report it.
-                | std::io::ErrorKind::ConnectionReset
             ) => {}
             Err(error) => {
                 connected.store(false, Ordering::Release);
@@ -1442,6 +1478,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_real_closed_udp_port_is_classified_as_an_icmp_rejection() {
+        // Bind then drop to get a loopback port nothing listens on, then talk to
+        // it over a connected UDP socket exactly like the voice worker does. The
+        // OS answers with an ICMP port-unreachable, surfaced as ConnectionReset
+        // (Windows) or ConnectionRefused (Linux/macOS).
+        let closed = {
+            let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect(closed).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut rejected = false;
+        let mut buffer = [0u8; 16];
+        for _ in 0..5 {
+            let _ = socket.send(b"x");
+            if let Err(error) = socket.recv(&mut buffer) {
+                if VoiceError::from(error).is_icmp_rejection() {
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected, "closed loopback UDP port was not reported as an ICMP rejection");
+    }
+
+    #[test]
     fn voice_endpoint_prefers_ipv4_over_an_earlier_ipv6_address() {
         let v6: SocketAddr = "[2001:db8::1]:24454".parse().unwrap();
         let v4: SocketAddr = "192.0.2.7:24454".parse().unwrap();
@@ -1468,22 +1531,26 @@ mod tests {
     }
 
     #[test]
-    fn voice_error_reports_connection_reset_only_for_io_errors() {
+    fn voice_error_reports_icmp_rejection_only_for_io_errors() {
         // Regression: send_packet() returns VoiceError, which has no `kind()`
         // of its own. The worker's "ignore Windows WSAECONNRESET" checks must
         // go through VoiceError, not assume a bare std::io::Error.
         let reset = VoiceError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert_eq!(reset.io_kind(), Some(std::io::ErrorKind::ConnectionReset));
-        assert!(reset.is_connection_reset());
+        assert!(reset.is_icmp_rejection());
+
+        // Linux/macOS report the same ICMP port-unreachable as ConnectionRefused.
+        let refused = VoiceError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(refused.is_icmp_rejection());
 
         let denied = VoiceError::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert_eq!(denied.io_kind(), Some(std::io::ErrorKind::PermissionDenied));
-        assert!(!denied.is_connection_reset());
+        assert!(!denied.is_icmp_rejection());
 
         // Non-I/O failures must never be swallowed as a reachability signal.
         assert_eq!(VoiceError::WorkerStopped.io_kind(), None);
-        assert!(!VoiceError::WorkerStopped.is_connection_reset());
-        assert!(!VoiceError::InvalidServerInfo("x").is_connection_reset());
+        assert!(!VoiceError::WorkerStopped.is_icmp_rejection());
+        assert!(!VoiceError::InvalidServerInfo("x").is_icmp_rejection());
     }
 
     #[test]

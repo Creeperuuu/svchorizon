@@ -1043,7 +1043,14 @@ pub fn on_hud(
         if !client.is_connected() && client.unanswered_auth_attempts() >= 15 {
             // Never mask an unreachable voice server behind "Transmitting":
             // packets are being dropped before they can reach anyone.
-            ("SVC: Voice server unreachable (UDP blocked?)", 0xFF5555)
+            if client.icmp_rejections() > 0 {
+                // The host replied with ICMP port-unreachable: reachable, but
+                // nothing is listening on the voice UDP port.
+                ("SVC: Voice port closed on server (nothing listening)", 0xFF5555)
+            } else {
+                // No reply and no rejection: the datagrams are silently dropped.
+                ("SVC: Voice server unreachable (UDP dropped)", 0xFF5555)
+            }
         } else if client.is_transmitting() && client.is_whispering() {
             ("SVC: Whispering", 0x55FF55)
         } else if client.is_transmitting() {
