@@ -44,7 +44,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Minecraft: 26.3
 - Horizon: `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`
 - horizon-mixins: `d9c83d7096b7ea5b83678da2efdfd6161f74997e`
-- Simple Voice Chat compatibility: probes 21 first (current upstream SVC 2.7.0-pre1 for MC 26.3), then 20 as a delayed fallback for SVC 2.6.x servers.
+- Simple Voice Chat compatibility: negotiates SVC protocol 20 (stable 2.6.x) first, then protocol 21 (2.7.x) as a delayed fallback. These are SVC protocol generations, not Minecraft versions; the same SVC generation is used across multiple Minecraft server releases.
 
 ## Interop test harness
 
