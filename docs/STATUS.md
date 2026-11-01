@@ -148,16 +148,24 @@ Evidence gathered the same day:
   servers: the voice UDP port is not opened/forwarded by the hosting panel
   (most Pterodactyl-style hosts need a second UDP allocation for voice chat).
 
-Conclusion: the voice UDP packets are dropped between the client and the
-plugin — server-side port forwarding or the user's local network, not the mod
-wire (which is proven end-to-end against a live official plugin). Client-side
-changes shipped with this diagnosis: the unanswered-attempt count is now
-surfaced on the HUD (`SVC: Voice server unreachable (UDP blocked?)` in red
-after 15 s, taking precedence over the misleading "Transmitting" label), send
-failures are logged (Windows WSAECONNRESET/ICMP noise filtered), a stray
-ConnectionReset no longer tears down the UDP worker, and a one-time log line
-at 15 s explains the likely cause and the differential test with the official
-client.
+Conclusion (updated after the user's differential test, same day): the
+official voice chat client works on this server from the same PC, which rules
+out server-side port blocking and user-side network filtering. Endpoint,
+DNS, wire generation and packet bytes are all proven identical to what the
+official client sends (single stable A record = SRV target; compat-20 secret
+decodes strictly; a compat-21 server would have refused to send a secret at
+all). The remaining suspects are local per-application filtering of
+horizon-client.exe's UDP replies (Windows Firewall block rule created by a
+dismissed first-run prompt, or antivirus network protection — established
+outbound TCP keeps working while UDP reply flows are dropped), or a
+process-level UDP receive restriction. Client-side changes shipped with this
+diagnosis: a localhost UDP self-test at connect (proves the game process can
+receive UDP at all), the unanswered-attempt count surfaced on the HUD
+(`SVC: Voice server unreachable (UDP blocked?)` in red after 15 s, taking
+precedence over the misleading "Transmitting" label), send failures logged
+with Windows WSAECONNRESET/ICMP noise filtered, a stray ConnectionReset no
+longer tears down the UDP worker, and a one-time log line at 15 s naming the
+firewall/AV check and the hosting-panel port-forwarding fallback.
 
 ## Validation policy
 

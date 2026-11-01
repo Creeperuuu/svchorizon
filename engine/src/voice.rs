@@ -274,6 +274,12 @@ impl VoiceClient {
         // a custom UDP port.
         let address = resolve_voice_address(&info.host, fallback_host, info.port)?;
         eprintln!("[svchorizon] Voice endpoint: {address}");
+        match udp_self_test() {
+            Ok(()) => eprintln!("[svchorizon] UDP self-test: ok (the game process can receive UDP)"),
+            Err(error) => eprintln!(
+                "[svchorizon] UDP self-test FAILED: {error} - the game process cannot receive UDP at all; a sandbox/antivirus is blocking it"
+            ),
+        }
         let bind_address = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let socket = UdpSocket::bind(bind_address)?;
         socket.connect(address)?;
@@ -660,7 +666,7 @@ fn run_worker(
             if attempts == 15 {
                 let peer = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".into());
                 eprintln!(
-                    "[svchorizon] The voice server at {peer} never answered authentication for 15s. Voice UDP traffic is being dropped along the way - most often the server's voice UDP port is not opened/forwarded (hosting panels need a second UDP port for voice chat). Compare with the official voice chat client on the same network."
+                    "[svchorizon] The voice server at {peer} never answered authentication for 15s. If official voice chat works on this server from this PC, the UDP replies are being filtered locally - check that horizon-client.exe is allowed in Windows Firewall (inbound UDP) and in any antivirus with network protection. Otherwise the server's voice UDP port is likely not opened/forwarded (hosting panels need a second UDP port for voice chat)."
                 );
             }
             last_auth = Some(Instant::now());
@@ -1226,6 +1232,24 @@ enum Packet {
         channel: [u8; 16], sender: [u8; 16], location: [f64; 3],
         opus: Vec<u8>, sequence: i64, distance: f32, category: Option<String>,
     },
+}
+
+fn udp_self_test() -> Result<(), std::io::Error> {
+    let receiver = UdpSocket::bind("127.0.0.1:0")?;
+    let sender = UdpSocket::bind("127.0.0.1:0")?;
+    let address = receiver.local_addr()?;
+    receiver.set_read_timeout(Some(Duration::from_millis(500)))?;
+    sender.send_to(&[0x53, 0x56, 0x43], address)?;
+    let mut buffer = [0u8; 16];
+    let received = receiver.recv(&mut buffer)?;
+    if received == 3 && buffer[..3] == [0x53, 0x56, 0x43] {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected self-test datagram",
+        ))
+    }
 }
 
 fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> Result<(), VoiceError> {
