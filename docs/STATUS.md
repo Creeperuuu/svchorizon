@@ -53,7 +53,7 @@ Last updated: 2026-11-01.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client supports Simple Voice Chat compatibility **21** and **20**. It probes 21 first (the current upstream SVC 2.7.0-pre1 build for Minecraft 26.3), then probes 20 after a short timeout for older 2.6.x servers. Probes are sequential because the official server emits a visible incompatibility message for a mismatched request. The secret response selects the matching UDP wire generation; compatibility is a property of the server plugin build, not Minecraft alone.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client supports Simple Voice Chat compatibility **20** and **21**. It probes 20 first (the stable 2.6.x release line used across Minecraft server versions), then probes 21 after a short timeout for servers running the newer 2.7.x protocol. Probes are sequential because the official server emits a visible incompatibility message for a mismatched request. The secret response selects the matching UDP wire generation. These compatibility numbers identify the SVC protocol generation, not the Minecraft server version.
 
 ## Interop-critical wire details (verified against the 2.6.27 plugin jar and a live server)
 
