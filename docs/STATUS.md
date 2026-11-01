@@ -49,6 +49,25 @@ Last updated: 2026-11-01.
 - [ ] Server-transfer race testing and real reconnect interoperability testing. Basic automatic reconnect with exponential backoff and live audio-device reconfiguration are implemented in source.
 - [ ] Better spatial audio interpolation and cross-dimension handling.
 
+## CI fix: `VoiceError` has no `kind()` (2026-11-01, branch fix/voice-error-kind)
+
+The `Build game (Windows)` job failed to compile `svchorizon-engine` with three
+`E0599: no method named kind found for enum VoiceError` errors in `voice.rs`.
+The diagnostics added in `f4057e0` call `error.kind()` on the result of
+`send_packet()`, which returns `VoiceError`, not `std::io::Error`. `VoiceError`
+now exposes `io_kind()` and `is_connection_reset()`; the authentication,
+connection-check and keepalive send paths use the latter to keep ignoring the
+transient Windows `WSAECONNRESET` (caused by an ICMP port-unreachable on a
+connected UDP socket) while still logging every other send failure. A
+regression unit test covers the helper.
+
+Wire format re-audited against upstream `henkelmax/simple-voice-chat` (branch
+`26.3`, last commit before the 2026-10-30 compat-21 changes, i.e. the 2.6.x
+wire): framing, `MicPacket`, `PlayerSoundPacket`, `GroupSoundPacket`,
+`LocationSoundPacket`, `PingPacket`, `AuthenticatePacket`, the 1275-byte Opus and
+2048-byte datagram limits, and the 12-byte-IV AES-GCM envelope all match the
+engine's codec.
+
 ## Compatibility pin
 
 The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.

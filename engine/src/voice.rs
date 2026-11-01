@@ -221,6 +221,26 @@ impl fmt::Display for VoiceError {
         }
     }
 }
+impl VoiceError {
+    /// The underlying `std::io::ErrorKind` when this error wraps an I/O error.
+    ///
+    /// Non-I/O errors (bad metadata, encryption failures, ...) have no kind and
+    /// return `None`, so they are never mistaken for e.g. a Windows
+    /// `ConnectionReset` caused by a stray ICMP port-unreachable.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io(error) => Some(error.kind()),
+            _ => None,
+        }
+    }
+
+    /// True when this is the transient `ConnectionReset` a connected UDP socket
+    /// reports on Windows after an earlier datagram drew an ICMP
+    /// port-unreachable. It signals reachability, not a broken socket.
+    pub fn is_connection_reset(&self) -> bool {
+        self.io_kind() == Some(std::io::ErrorKind::ConnectionReset)
+    }
+}
 impl Error for VoiceError {}
 impl From<std::io::Error> for VoiceError {
     fn from(value: std::io::Error) -> Self { Self::Io(value) }
@@ -653,7 +673,7 @@ fn run_worker(
                 // datagram as WSAECONNRESET on the next send; that is a
                 // reachability signal, not a socket failure - it is counted
                 // by the unanswered-attempts warning below instead.
-                if error.kind() != std::io::ErrorKind::ConnectionReset {
+                if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending authentication failed: {error}");
                 }
             }
@@ -674,7 +694,7 @@ fn run_worker(
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
             if let Err(error) = send_packet(&socket, &info, &Packet::ConnectionCheck) {
-                if error.kind() != std::io::ErrorKind::ConnectionReset {
+                if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending connection check failed: {error}");
                 }
             }
@@ -709,7 +729,7 @@ fn run_worker(
                     Packet::KeepAlive => {
                         last_keepalive = Instant::now();
                         if let Err(error) = send_packet(&socket, &info, &Packet::KeepAlive) {
-                            if error.kind() != std::io::ErrorKind::ConnectionReset {
+                            if !error.is_connection_reset() {
                                 eprintln!("[svchorizon] sending keepalive failed: {error}");
                             }
                         }
@@ -1398,6 +1418,25 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_error_reports_connection_reset_only_for_io_errors() {
+        // Regression: send_packet() returns VoiceError, which has no `kind()`
+        // of its own. The worker's "ignore Windows WSAECONNRESET" checks must
+        // go through VoiceError, not assume a bare std::io::Error.
+        let reset = VoiceError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(reset.io_kind(), Some(std::io::ErrorKind::ConnectionReset));
+        assert!(reset.is_connection_reset());
+
+        let denied = VoiceError::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(denied.io_kind(), Some(std::io::ErrorKind::PermissionDenied));
+        assert!(!denied.is_connection_reset());
+
+        // Non-I/O failures must never be swallowed as a reachability signal.
+        assert_eq!(VoiceError::WorkerStopped.io_kind(), None);
+        assert!(!VoiceError::WorkerStopped.is_connection_reset());
+        assert!(!VoiceError::InvalidServerInfo("x").is_connection_reset());
+    }
 
     #[test]
     fn resolves_voice_host_overrides_like_the_official_client() {
