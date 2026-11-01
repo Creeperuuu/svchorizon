@@ -31,7 +31,7 @@ static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
 /// for every request whose compatibility number does not match. Probe one
 /// generation at a time so a supported server does not receive a false
 /// incompatibility warning for the other generation.
-const SECRET_PROBE_TIMEOUT_MS: u64 = 1_500;
+const SECRET_PROBE_TIMEOUT_MS: u64 = 3_000;
 /// Retry the preferred generation if neither probe receives a secret.
 const SECRET_REQUEST_RETRY_MS: u64 = 10_000;
 /// Current upstream SVC for Minecraft 26.3 is compat 21 (2.7.0-pre1).
