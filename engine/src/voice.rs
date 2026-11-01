@@ -244,6 +244,7 @@ pub struct VoiceClient {
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
     connected: Arc<AtomicBool>,
+    auth_attempts: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
     listener: Arc<Mutex<ListenerPose>>,
@@ -291,6 +292,7 @@ impl VoiceClient {
         let voice_activation_threshold = Arc::new(AtomicU32::new(0.025f32.to_bits()));
         let microphone_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let connected = Arc::new(AtomicBool::new(false));
+        let auth_attempts = Arc::new(AtomicU32::new(0));
 
         let audio_running = Arc::clone(&running);
         let audio_transmitting = Arc::clone(&transmitting);
@@ -317,6 +319,7 @@ impl VoiceClient {
         let worker_whispering = Arc::clone(&whispering);
         let worker_voice_activation = Arc::clone(&voice_activation);
         let worker_connected = Arc::clone(&connected);
+        let worker_auth_attempts = Arc::clone(&auth_attempts);
         let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
@@ -324,7 +327,7 @@ impl VoiceClient {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
                     worker_running, worker_transmitting, worker_whispering, worker_voice_activation,
-                    worker_connected, worker_positions,
+                    worker_connected, worker_auth_attempts, worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -337,7 +340,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, microphone_gain, connected,
+            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts,
             worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
             audio_devices,
         })
@@ -381,6 +384,13 @@ impl VoiceClient {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
+    }
+
+    /// Authentication attempts sent since the last answer from the voice
+    /// server (0 once authenticated). The HUD uses this to distinguish
+    /// "still connecting" from "the server is not answering at all".
+    pub fn unanswered_auth_attempts(&self) -> u32 {
+        self.auth_attempts.load(Ordering::Relaxed)
     }
 
     pub fn is_transmitting(&self) -> bool {
@@ -571,6 +581,7 @@ fn run_worker(
     whispering: Arc<AtomicBool>,
     voice_activation: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    auth_attempts: Arc<AtomicU32>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
@@ -586,7 +597,6 @@ fn run_worker(
     let mut decoders: HashMap<[u8; 16], OpusDecoder> = HashMap::new();
     let mut jitter = AudioJitterBuffer::default();
     let mut authenticated = false;
-    let mut auth_attempts = 0u32;
     let mut validated = false;
     let mut sequence = 0i64;
     let mut last_auth: Option<Instant> = None;
@@ -629,21 +639,39 @@ fn run_worker(
         if !running.load(Ordering::Acquire) { break; }
 
         if !authenticated && last_auth.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
-            let _ = send_packet(&socket, &info, &Packet::Authenticate {
+            if let Err(error) = send_packet(&socket, &info, &Packet::Authenticate {
                 player: info.player,
                 secret: info.secret,
-            });
-            auth_attempts += 1;
-            if auth_attempts % 5 == 0 {
+            }) {
+                // Windows reports an ICMP port-unreachable from a previous
+                // datagram as WSAECONNRESET on the next send; that is a
+                // reachability signal, not a socket failure - it is counted
+                // by the unanswered-attempts warning below instead.
+                if error.kind() != std::io::ErrorKind::ConnectionReset {
+                    eprintln!("[svchorizon] sending authentication failed: {error}");
+                }
+            }
+            let attempts = auth_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+            if attempts % 5 == 0 {
                 eprintln!(
-                    "[svchorizon] Voice server has not answered {auth_attempts} authentication attempts yet (voice UDP port blocked or wrong endpoint?)"
+                    "[svchorizon] Voice server has not answered {attempts} authentication attempts yet (voice UDP port blocked or wrong endpoint?)"
+                );
+            }
+            if attempts == 15 {
+                let peer = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".into());
+                eprintln!(
+                    "[svchorizon] The voice server at {peer} never answered authentication for 15s. Voice UDP traffic is being dropped along the way - most often the server's voice UDP port is not opened/forwarded (hosting panels need a second UDP port for voice chat). Compare with the official voice chat client on the same network."
                 );
             }
             last_auth = Some(Instant::now());
         } else if authenticated && !validated
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
-            let _ = send_packet(&socket, &info, &Packet::ConnectionCheck);
+            if let Err(error) = send_packet(&socket, &info, &Packet::ConnectionCheck) {
+                if error.kind() != std::io::ErrorKind::ConnectionReset {
+                    eprintln!("[svchorizon] sending connection check failed: {error}");
+                }
+            }
             last_check = Some(Instant::now());
         }
 
@@ -661,7 +689,7 @@ fn run_worker(
                 match packet {
                     Packet::AuthenticateAck => {
                         authenticated = true;
-                        auth_attempts = 0;
+                        auth_attempts.store(0, Ordering::Relaxed);
                         last_check = None;
                     }
                     Packet::ConnectionCheckAck => {
@@ -674,7 +702,11 @@ fn run_worker(
                     }
                     Packet::KeepAlive => {
                         last_keepalive = Instant::now();
-                        let _ = send_packet(&socket, &info, &Packet::KeepAlive);
+                        if let Err(error) = send_packet(&socket, &info, &Packet::KeepAlive) {
+                            if error.kind() != std::io::ErrorKind::ConnectionReset {
+                                eprintln!("[svchorizon] sending keepalive failed: {error}");
+                            }
+                        }
                     }
                     Packet::Ping { id, timestamp } => {
                         let _ = send_packet(&socket, &info, &Packet::Ping { id, timestamp });
@@ -718,6 +750,10 @@ fn run_worker(
             Err(error) if matches!(
                 error.kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                // Windows surfaces a stray ICMP port-unreachable as
+                // WSAECONNRESET on a connected UDP socket; keep running and
+                // let the unanswered-authentication counter report it.
+                | std::io::ErrorKind::ConnectionReset
             ) => {}
             Err(error) => {
                 connected.store(false, Ordering::Release);

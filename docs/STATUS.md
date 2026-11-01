@@ -33,13 +33,14 @@ Last updated: 2026-11-01.
 - [x] Bounded per-speaker Opus jitter queues with sequence reordering, a 40 ms gap window and decoder-driven concealment for up to three missing frames.
 - [x] Manual-only Windows/Linux protocol tests, Windows engine compile, Linux native-mixin validation and .hnmod packaging workflow.
 - [x] Source-only .hnmod packager with pinned Horizon and horizon-mixins revisions.
+- [x] Cloud Windows game build: the `Build game (Windows)` workflow produces a runnable `horizon-client.exe` artifact (first confirmed working run on 2026-11-01, branch `ci/windows-game-build`).
 
 ## Still missing before a complete Simple Voice Chat client
 
 - [x] Real Paper interoperability test against the official plugin: the protocol crate now completes the full official handshake/auth/keepalive/microphone flow against a live Paper 26.3 server running unmodified `voicechat-bukkit-2.6.27` (see "Live interop validation").
 - [x] The vendored engine's `VoiceClient` (the code the game runs) passes the same live-server handshake, validation and keepalive flow, including the empty-voice_host fallback (see "Live engine validation").
-- [ ] Two-client audio relay test (a second client actually hearing the first) and cross-talk with official Fabric/Forge/NeoForge clients on the same server.
-- [ ] Run the manual GitHub Actions workflow on CI runners (Windows engine compile + packaging matrix); the source is now build-validated locally (see below).
+- [ ] Two-client audio relay test (a second client actually hearing the first) and cross-talk with official Fabric/Forge/NeoForge clients — on a server whose voice UDP port is confirmed open (see "First live-server runtime test").
+- [x] Run the manual GitHub Actions workflow on CI runners: the `Build game (Windows)` workflow produced a working exe (2026-11-01); the Linux native-mixin and packaging jobs run on every push.
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Group invites, persistent group settings and a full graphical group UI. Password entry and custom group names/types are available through `/svchorizon group` chat commands; basic discovery/cycling and quick controls remain keybind-driven.
 - [ ] Remaining TCP custom payloads for recording-related controls and any newly introduced upstream extensions. Player-state and volume-category payloads are now decoded; the official UDP microphone/player/group/location sound variants and connection packets are implemented.
@@ -117,6 +118,46 @@ log now shows the resolved voice endpoint, unanswered-authentication warnings,
 microphone/speaker device names, and the HUD distinguishes "Not on a server",
 "No voice chat on this server", "Connecting" and "Reconnecting"; a failed
 initial connect now retries through the reconnect path instead of stalling.
+
+## First live-server runtime test (2026-11-01, branch ci/windows-game-build)
+
+The Actions-built Windows exe was tested against a real third-party server
+(`axocraftseason8.playwithbao.com`, Paper 26.3 + official SVC plugin). The TCP
+side is fully healthy: channel registration, secret request, and the secret
+payload (strict compat-20 decode, groups enabled, voice port 47230, keepalive
+1000 ms, empty voice_host) all work; group discovery works. The UDP side gets
+no answer: the client sends a valid `AuthenticatePacket` every second and the
+server never replies — 45 unanswered attempts, zero socket errors.
+
+Evidence gathered the same day:
+
+- DNS: the A record and the `_minecraft._tcp` SRV record both resolve to
+  `172.197.205.171` (game on SRV port 47157), so the empty-voice_host fallback
+  computes the same IP an official client would use.
+- Official server source (henkelmax/simple-voice-chat branch `26.3`,
+  `Server.java` ProcessThread): only `AuthenticatePacket` and
+  `ConnectionCheckPacket` are answered before authentication; pings from
+  unauthenticated sources are ignored. So external UDP probing cannot
+  distinguish a blocked port from a healthy one — but a missing
+  AuthenticateAck for a *valid* auth is decisive, and the engine harness had
+  already proven that exact packet against the real 2.6.27 plugin.
+- Sandbox probes: TCP 47157 open; UDP 47230 and a control closed port are
+  both silently dropped (ICMP suppressed by the provider), so no vantage point
+  could see the plugin at all.
+- Upstream troubleshooting documents exactly this failure mode for hosted
+  servers: the voice UDP port is not opened/forwarded by the hosting panel
+  (most Pterodactyl-style hosts need a second UDP allocation for voice chat).
+
+Conclusion: the voice UDP packets are dropped between the client and the
+plugin — server-side port forwarding or the user's local network, not the mod
+wire (which is proven end-to-end against a live official plugin). Client-side
+changes shipped with this diagnosis: the unanswered-attempt count is now
+surfaced on the HUD (`SVC: Voice server unreachable (UDP blocked?)` in red
+after 15 s, taking precedence over the misleading "Transmitting" label), send
+failures are logged (Windows WSAECONNRESET/ICMP noise filtered), a stray
+ConnectionReset no longer tears down the UDP worker, and a one-time log line
+at 15 s explains the likely cause and the differential test with the official
+client.
 
 ## Validation policy
 
