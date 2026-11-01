@@ -8,7 +8,7 @@ Last updated: 2026-11-01.
 - [x] Minecraft VarInt, UUID, byte-array, integer, float and double primitives.
 - [x] AES-128-GCM using Horizon's existing `ring` dependency (random 12-byte IV + authenticated ciphertext).
 - [x] Official client/server UDP datagram envelopes and packet framing.
-- [x] Cross-generation protocol support: the client detects and speaks both deployed Simple Voice Chat wire generations - compatibility 20 (SVC 2.6.x) and compatibility 21 (SVC 2.7.x, connection-UUID envelopes with nonce-challenge validation) - so older and newer servers work without any single-version workaround.
+- [x] Cross-generation protocol support: the client detects and speaks all three deployed Simple Voice Chat wire generations - compatibility 20 (SVC 2.6.x), compatibility 21 (SVC 2.7.x, connection-UUID envelopes with nonce-challenge validation) and compatibility 18 (SVC 2.5.x, wire-identical to 20) - so older and newer servers work without any single-version workaround.
 - [x] Authentication, connection-check, keepalive, ping, microphone and player/group/location sound packet codecs.
 - [x] TCP `voicechat:request_secret` payload and `voicechat:secret` metadata decoder.
 - [x] Official group create/join/leave request codecs and joined/add/remove group response decoders.
@@ -53,7 +53,7 @@ Last updated: 2026-11-01.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client advertises Simple Voice Chat compatibility version **20** and **21**: on every join both generations are probed (the server answers only the request whose number matches its own plugin build), and the UDP layer switches to the matching wire format. Compat 20 is the release line published for Minecraft 1.12.2 through the current 1.21.x/26.x servers (`voicechat-bukkit-2.6.27` and friends); compat 21 is upstream 2.7.x. This is a property of the server's plugin build, not of one Minecraft version, so probing both covers older and newer servers alike.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client speaks Simple Voice Chat compatibility versions **20**, **21** and **18**: on every join the generations are probed one at a time (the server answers only the request whose number matches its own plugin build and sends the player an incompatibility chat notice for every other number; the client detects that notice and skips to the next generation), and the UDP layer switches to the matching wire format. Compat 20 is the release line published for Minecraft 1.12.2 through the current 1.21.x/26.x servers (`voicechat-bukkit-2.6.27` and friends); compat 21 is upstream 2.7.x (2.7.0-pre1); compat 18 is the 2.5.x line on servers that never updated, wire-identical to compat 20. This is a property of the server's plugin build, not of one Minecraft version, so probing all three covers older and newer servers alike.
 
 ## Interop-critical wire details (verified against the 2.6.27 plugin jar and a live server)
 
@@ -175,15 +175,24 @@ After the first third-party runtime test, the client was extended along two
 independent axes, both verified against upstream source (the `2.6.x/*`
 branches and the 2.7.0-pre1 release branches of henkelmax/simple-voice-chat):
 
-- **Both wire generations.** The plugin-channel secret request now probes
-  compatibility 20 and 21 (only the number the server accepts gets a
-  response), the secret payload decodes under both layouts, and the UDP
+- **All three wire generations, probed serially.** The plugin-channel secret
+  request asks about one compatibility number at a time - 20, then 21, then
+  18 (only the number the server accepts gets a secret; every other number
+  gets the player `message.voicechat.incompatible_version` as a system chat
+  notice, which the client detects and treats as a definitive "not this
+  generation"). The secret payload decodes under all layouts, and the UDP
   layer switches per generation: envelope UUID (player vs connection),
   Authenticate payload (player+secret vs empty) and the 2.7.x nonce
   challenge (AuthenticateAck carries a 16-byte nonce echoed in
-  ConnectionCheck). A session remembers the generation that answered and
-  re-probes every 10 s while no server has answered at all. No part of this
-  is keyed to one Minecraft version: it follows the server's plugin build.
+  ConnectionCheck). The round repeats while no generation has answered so a
+  dropped first request recovers without a relog, and rejected generations
+  are never probed again this login (at most one notice per server).
+  Serial probing is not a style choice: upstream stores the compatibility
+  number of the LAST request per player and silently drops all non-secret
+  payloads from a player whose stored number does not match, so a stale
+  second probe would break state/group sync even after a successful
+  handshake. No part of this is keyed to one Minecraft version: it follows
+  the server's plugin build.
 - **Endpoint rotation.** All addresses the voice host resolves to (dual
   stack or multi-record) become candidates; the worker starts with the
   first (the address an official client would use) and rotates every 5
@@ -193,6 +202,11 @@ branches and the 2.7.0-pre1 release branches of henkelmax/simple-voice-chat):
 
 The HUD's 15-second message now says `SVC: Voice server not responding`
 (the previous "UDP blocked?" wording blamed either side before any evidence).
+During generation detection the HUD shows `SVC: Detecting voice chat`, a
+server that rejects every supported generation shows
+`SVC: Server voice chat version incompatible`, and a server that stays
+silent for 15 s falls back to `SVC: No voice chat on this server` while
+probing continues in the background.
 The build workflow gained a `profile` input (`fast` = Horizon's
 `[profile.fast]`, no LTO / 16 codegen units / incremental, the new default;
 `release` = the shippable thin-LTO build), split cache-restore/save steps

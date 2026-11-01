@@ -1,17 +1,26 @@
 # Simple Voice Chat protocol notes
 
-These notes track the implementation against the two deployed official Simple
-Voice Chat wire generations. Compat 20 is the **shipped** release line (e.g.
-`voicechat-bukkit-2.6.27`); compat 21 is upstream's 2.7.x generation. Every
-compat-20 detail below was verified twice: first against the plugin jar's
-bytecode (javap), then by a live end-to-end run against a real Paper 26.3
-server running that unmodified plugin. The compat-21 differences were
-verified against the upstream `2.7.0` source (branches `1.21.11`, `26.x`):
-an extra connection UUID in the secret payload and the UDP envelopes, an
-empty Authenticate packet, and a nonce challenge echoed through the
-connection check. The client probes both compatibility numbers on every join
-and switches its wire format to whichever the server answers with, so older
-and newer servers are supported without any single-version workaround.
+These notes track the implementation against the three official Simple
+Voice Chat wire generations this client speaks. Compat 20 is the **shipped**
+release line (e.g. `voicechat-bukkit-2.6.27`, published for every Minecraft
+version from 1.8.8 to the current 26.x); compat 21 is upstream's 2.7.x
+generation (released as 2.7.0-pre1); compat 18 is the previous 2.5.x release
+line still running on servers that have not updated. Every compat-20 detail
+below was verified twice: first against the plugin jar's bytecode (javap),
+then by a live end-to-end run against a real Paper 26.3 server running that
+unmodified plugin. The compat-21 differences were verified against the
+upstream `2.7.0` source (branches `1.21.11`, `26.x`): an extra connection
+UUID in the secret payload and the UDP envelopes, an empty Authenticate
+packet, and a nonce challenge echoed through the connection check. The
+compat-18 wire was verified against upstream `outdated/1.21.6-2.5.30`: its
+secret payload, UDP envelope, packet type ids and Authenticate layout are
+byte-identical to compat 20 - only the handshake number differs.
+
+The compatibility number is a property of the server's plugin build, not of
+one Minecraft version. The client therefore probes 20, 21 and 18 **one at a
+time** on every join and switches its wire format to whichever generation the
+server answers with, so older and newer servers are supported without any
+single-version workaround.
 
 The Rust protocol and audio engine are isolated from Horizon's game hooks so
 their wire behavior can be tested independently.
@@ -24,17 +33,39 @@ Bukkit/Paper deliver a custom payload only for channels the client registered, s
 1. Channel: `minecraft:register`, body: every `voicechat:*` channel the official plugin
    registers (NetManager.init), NUL-separated, mirroring the official client.
 2. Channel: `voicechat:request_secret`, body: 32-bit big-endian compatibility
-   version, `20` and `21` probed together until the server answers (the server
-   compares the client version exactly and silently ignores any other number
-   without sending a secret; a session remembers which number worked).
+   version - **one generation per request**, in the order 20, 21, 18. The
+   server compares the number against its own build: a match answers with the
+   secret, a mismatch answers with the `message.voicechat.incompatible_version`
+   system chat notice (ServerVoiceEvents.getIncompatibleMessage) and **no**
+   secret, and a repeat of the matching number is silently ignored because the
+   secret is generated once per login ("Player already requested secret").
+
+Probing is strictly serial for three reasons:
+
+- A rejection notice is a definitive answer. The client detects the notice
+  key in the `system_chat` packet and immediately probes the next generation
+  instead of waiting for a timeout, and never probes a rejected generation
+  again this login (at most one notice per server in the chat).
+- Upstream stores the compatibility number of the **last** request per player
+  and drops every non-secret payload from a player whose stored number does
+  not match (PaperNetManager's `isCompatible` gate). A stale second probe
+  would flip that flag after a successful handshake and make the server
+  silently discard this client's state and group packets.
+- One request at a time leaves the server's per-player compatibility flag on
+  the generation that actually worked.
+
+While no generation has answered, the probe round repeats (4 s per
+generation during the first 15 s, then every 10 s) so a dropped first
+request - a channel-registration race - recovers without a relog.
 
 The server replies on `voicechat:secret` with (SecretPacket.toBytes order,
-verified from the 2.6.27 jar):
+verified from the 2.6.27 jar; 2.5.x sends the identical field order):
 
 1. 16-byte AES secret (random bytes; there is **no** connection UUID in the
    2.6.27 payload — the 2.7.x generation inserts a server-assigned connection
    UUID here, which is what compatibility version 21 signals; the client
-   decodes both layouts strictly and picks the one that parses)
+   decodes both layouts strictly and picks the one that parses, expecting
+   the layout of the generation it probed)
 2. UDP port (32-bit integer)
 3. Player UUID (16 bytes)
 4. Codec ordinal (byte)
@@ -51,7 +82,7 @@ The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, t
 
 | Channel | Direction | Current behavior |
 |---|---|---|
-| `voicechat:request_secret` | Client → server | Probes compatibility 20 and 21; remembers the generation the server accepted |
+| `voicechat:request_secret` | Client → server | Probes compatibility 20, then 21, then 18 one at a time; a rejection notice skips to the next generation, a secret locks it in for the session |
 | `voicechat:secret` | Server → client | Decodes session secret and UDP metadata; starts voice workers |
 | `voicechat:client_state` | Client → server | Synchronizes local microphone mute/disabled flags |
 | `voicechat:states` | Server → client | Parses bounded player-state snapshots |

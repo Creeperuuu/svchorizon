@@ -41,9 +41,10 @@ const CONNECTION_CHECK: u8 = 0x09;
 const CONNECTION_CHECK_ACK: u8 = 0x0a;
 
 /// Which wire generation the server speaks. The plugin-channel handshake is
-/// gated by a compatibility number (the server silently ignores a request
-/// carrying a different one), and the UDP layer differs between the two
-/// generations that are deployed in the wild:
+/// gated by a compatibility number: a `request_secret` carrying a different
+/// number makes the server send the player an incompatibility chat notice
+/// instead of a secret, and the UDP layer differs between the generations
+/// that are deployed in the wild:
 ///
 /// * `Compat20` - Simple Voice Chat 2.6.x (compatibility version 20, the
 ///   release line published for Minecraft 1.12.2 up to the current versions).
@@ -54,14 +55,21 @@ const CONNECTION_CHECK_ACK: u8 = 0x0a;
 ///   connection UUID instead of the player, `Authenticate` is empty, and the
 ///   `AuthenticateAck` carries a 16-byte HMAC nonce that the client must echo
 ///   in `ConnectionCheck` from the same source address.
+/// * `Compat18` - Simple Voice Chat 2.5.x (compatibility version 18, the
+///   previous release line still running on servers that have not updated).
+///   Verified against upstream `outdated/1.21.6-2.5.30`: the secret payload,
+///   the UDP envelope, the packet type ids and the Authenticate layout are
+///   byte-identical to the 2.6.x generation - only the handshake number
+///   differs, so this variant reuses the compat-20 encoders.
 ///
-/// Neither is a special case for one Minecraft version: the generation is a
-/// property of the server's Simple Voice Chat build and the client supports
-/// both, which covers older and newer game servers alike.
+/// None of these is a special case for one Minecraft version: the generation
+/// is a property of the server's Simple Voice Chat build and the client
+/// supports all three, which covers older and newer game servers alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SvcProfile {
     Compat20,
     Compat21,
+    Compat18,
 }
 
 impl SvcProfile {
@@ -71,6 +79,17 @@ impl SvcProfile {
         match self {
             Self::Compat20 => 20,
             Self::Compat21 => 21,
+            Self::Compat18 => 18,
+        }
+    }
+
+    /// The generation a given compatibility number belongs to.
+    pub fn from_compatibility_version(version: i32) -> Option<Self> {
+        match version {
+            20 => Some(Self::Compat20),
+            21 => Some(Self::Compat21),
+            18 => Some(Self::Compat18),
+            _ => None,
         }
     }
 
@@ -79,12 +98,15 @@ impl SvcProfile {
         match self {
             Self::Compat20 => "compat-20 (Simple Voice Chat 2.6.x)",
             Self::Compat21 => "compat-21 (Simple Voice Chat 2.7.x)",
+            Self::Compat18 => "compat-18 (Simple Voice Chat 2.5.x)",
         }
     }
 }
 
-/// Every UDP generation supported by this client, in probe order.
-pub const SVC_PROFILES: &[SvcProfile] = &[SvcProfile::Compat20, SvcProfile::Compat21];
+/// Every UDP generation supported by this client, in probe order: the
+/// released 2.6.x line first (every Minecraft version ships it), then the
+/// 2.7.x pre-release, then the 2.5.x line on servers that never updated.
+pub const SVC_PROFILES: &[SvcProfile] = &[SvcProfile::Compat20, SvcProfile::Compat21, SvcProfile::Compat18];
 
 #[derive(Clone, Debug)]
 pub struct VoiceServerInfo {
@@ -917,7 +939,7 @@ fn run_worker(
             // payload; compat-21 servers identify the datagram by the
             // connection UUID in the envelope and the payload is empty.
             let authenticate = match info.profile {
-                SvcProfile::Compat20 => Packet::Authenticate {
+                SvcProfile::Compat20 | SvcProfile::Compat18 => Packet::Authenticate {
                     player: info.player,
                     secret: info.secret,
                 },
@@ -957,7 +979,7 @@ fn run_worker(
                         .iter()
                         .map(|p| p.compatibility_version().to_string())
                         .collect::<Vec<_>>()
-                        .join(" and "),
+                        .join(", "),
                     info.port
                 );
             }
@@ -969,7 +991,9 @@ fn run_worker(
             // Compat-21 validation echoes the nonce the server handed out in
             // the AuthenticateAck; compat-20 servers expect an empty packet.
             let check = match info.profile {
-                SvcProfile::Compat20 => Packet::ConnectionCheck { nonce: None },
+                SvcProfile::Compat20 | SvcProfile::Compat18 => {
+                    Packet::ConnectionCheck { nonce: None }
+                }
                 SvcProfile::Compat21 => Packet::ConnectionCheck {
                     nonce: Some(auth_nonce),
                 },
@@ -1845,7 +1869,7 @@ fn send_packet(
     // UUID, compat-21 servers from the per-connection UUID issued in the
     // secret response (upstream ClientNetworkMessage.writeClient).
     let envelope_id = match info.profile {
-        SvcProfile::Compat20 => info.player,
+        SvcProfile::Compat20 | SvcProfile::Compat18 => info.player,
         SvcProfile::Compat21 => info.connection_id,
     };
     datagram.extend_from_slice(&envelope_id);
@@ -1897,9 +1921,9 @@ fn encode_packet(packet: &Packet, profile: SvcProfile) -> Option<Vec<u8>> {
         }
         Packet::Authenticate { player, secret } => {
             out.push(AUTHENTICATE);
-            if profile == SvcProfile::Compat20 {
-                // Upstream 2.6.x AuthenticatePacket.toBytes: UUID, then the
-                // raw secret. The 2.7.x AuthenticatePacket is empty; the
+            if matches!(profile, SvcProfile::Compat20 | SvcProfile::Compat18) {
+                // Upstream 2.5.x/2.6.x AuthenticatePacket.toBytes: UUID, then
+                // the raw secret. The 2.7.x AuthenticatePacket is empty; the
                 // server identifies the connection from the envelope UUID.
                 out.extend_from_slice(player);
                 out.extend_from_slice(secret);
@@ -2194,6 +2218,39 @@ mod tests {
     }
 
     #[test]
+    fn compat18_wire_is_identical_to_compat20_except_the_handshake_number() {
+        // Upstream `outdated/1.21.6-2.5.30`: same AuthenticatePacket layout,
+        // same envelope UUID, same type ids - only request_secret differs.
+        let auth18 = encode_packet(
+            &Packet::Authenticate {
+                player: [0x11; 16],
+                secret: [0x42; 16],
+            },
+            SvcProfile::Compat18,
+        )
+        .unwrap();
+        let auth20 = encode_packet(
+            &Packet::Authenticate {
+                player: [0x11; 16],
+                secret: [0x42; 16],
+            },
+            SvcProfile::Compat20,
+        )
+        .unwrap();
+        assert_eq!(auth18, auth20);
+        assert_eq!(
+            SvcProfile::Compat18.compatibility_version(),
+            18,
+            "the generation is told apart only by the probed number"
+        );
+        assert_eq!(
+            SvcProfile::from_compatibility_version(18),
+            Some(SvcProfile::Compat18)
+        );
+        assert_eq!(SvcProfile::from_compatibility_version(19), None);
+    }
+
+    #[test]
     fn authenticate_ack_decodes_with_and_without_nonce() {
         // Compat-20 servers answer with an empty packet...
         let empty = vec![AUTHENTICATE_ACK];
@@ -2252,7 +2309,7 @@ mod tests {
 
         let info21 = VoiceServerInfo {
             profile: SvcProfile::Compat21,
-            ..info
+            ..info.clone()
         };
         send_packet(
             &socket_a,
@@ -2270,6 +2327,27 @@ mod tests {
         assert_eq!(&buffer[1..17], &[0x22; 16]);
         // Same envelope payload shape either way (varint-prefixed body).
         assert!(length > 17);
+
+        // The 2.5.x generation keys the envelope with the player UUID just
+        // like 2.6.x.
+        let info18 = VoiceServerInfo {
+            profile: SvcProfile::Compat18,
+            ..info.clone()
+        };
+        send_packet(
+            &socket_a,
+            &info18,
+            target,
+            dual_stack,
+            &Packet::Authenticate {
+                player: [0; 16],
+                secret: [0; 16],
+            },
+        )
+        .unwrap();
+        socket_b.recv(&mut buffer).unwrap();
+        assert_eq!(buffer[0], MAGIC);
+        assert_eq!(&buffer[1..17], &[0x11; 16]);
     }
 
     /// Two UDP sockets bound on the loopback, kept alive for the test body.

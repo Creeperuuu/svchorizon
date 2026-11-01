@@ -1,34 +1,55 @@
 use std::{
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
-use svchorizon_engine::voice::{
-    SVC_PROFILES, SvcProfile, VoiceClient, VoiceEvent, VoiceServerInfo,
-};
+use svchorizon_engine::voice::{SvcProfile, VoiceClient, VoiceEvent, VoiceServerInfo};
 
-// Compatibility numbers of the two Simple Voice Chat wire generations this
-// client speaks. The server silently ignores a request_secret carrying any
-// other value, so both are probed on every join: whichever generation the
-// server runs answers the matching request with its secret payload.
+// Compatibility numbers of the Simple Voice Chat wire generations this
+// client speaks, probed ONE AT A TIME, most likely first. A server answers
+// only the request whose number matches its own plugin build: every other
+// number gets the player an incompatibility chat notice instead of a secret
+// (upstream ServerVoiceEvents.getIncompatibleMessage), and a repeated
+// matching request is silently ignored because the secret is generated once
+// per login. Asking one number at a time also keeps the server's per-player
+// compatibility flag on the generation that actually worked - upstream
+// stores the number of the LAST request, so a stale extra probe would make
+// the server drop this client's state and group packets.
 //
 // Compat 20 = Simple Voice Chat 2.6.x (the release line across Minecraft
-// 1.12.2 up to and including 1.21.x/26.x servers). Compat 21 = Simple Voice
-// Chat 2.7.x (connection UUID + nonce-challenge UDP generation). This is a
+// 1.12.2 up to and including 1.21.x/26.x servers, e.g. voicechat-bukkit
+// 2.6.27). Compat 21 = Simple Voice Chat 2.7.x (connection UUID + nonce
+// challenge UDP generation, currently released as 2.7.0-pre1). Compat 18 =
+// Simple Voice Chat 2.5.x (the previous release line still running on
+// servers that have not updated; wire-identical to compat 20). This is a
 // property of the server's plugin build, not of one Minecraft version, so
-// probing both supports older and newer servers alike.
+// probing the whole list supports older and newer servers alike.
 const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
 const REGISTER: &str = "minecraft:register";
-/// The compatibility number that last produced a secret on this session
-/// (0 = unknown, probe both generations).
-static KNOWN_COMPAT: AtomicI32 = AtomicI32::new(0);
-/// Unix millis of the last secret request; drives the re-probe timer.
-static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
-/// How often a secret request is re-sent while no secret has arrived.
-const SECRET_REQUEST_RETRY_MS: u64 = 10_000;
+/// Compatibility numbers to ask about, in probe order.
+const PROBE_SEQUENCE: &[i32] = &[20, 21, 18];
+/// How long to wait for an answer (secret or rejection notice) before the
+/// next generation is probed.
+const PROBE_TIMEOUT_MS: u64 = 4_000;
+/// How long after the first probe a fully silent server is reported as
+/// having no voice chat (probing continues in the background regardless).
+const NO_VOICE_CHAT_AFTER_MS: u64 = 15_000;
+/// The generation the outstanding request was sent for (0 = none).
+static PENDING_PROBE: AtomicI32 = AtomicI32::new(0);
+/// The generation the most recent request was sent for; late rejection
+/// notices that arrive after the timeout are attributed to it.
+static LAST_PROBED: AtomicI32 = AtomicI32::new(0);
+/// Unix millis the outstanding request was sent at (also the send pacemaker).
+static PENDING_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// Unix millis of the first probe of this login.
+static FIRST_PROBE_MS: AtomicU64 = AtomicU64::new(0);
+/// Bitmask of generations the server actively rejected (one bit per index in
+/// PROBE_SEQUENCE); a rejected generation is never probed again this login,
+/// which keeps the incompatibility chat notices to at most one per server.
+static REJECTED_MASK: AtomicU32 = AtomicU32::new(0);
 /// Every custom-payload channel the official plugin registers (NetManager.init).
 /// Bukkit/Paper deliver a payload only for channels the client registered, so
 /// this must go out before the secret request on every server join.
@@ -317,30 +338,51 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
-    // Compat-20 (Simple Voice Chat 2.6.x) SecretPacket.toBytes order:
-    // secret, port, player, codec, mtu, distance, keepalive, groups, host,
-    // recording. There is no server-assigned connection UUID in this wire
-    // generation: the secret doubles as the UUID that keys every UDP
-    // datagram we send, so the engine derives it from the secret bytes.
-    let mut c = Cursor::new(bytes);
-    if let Some(secret) = c.take(16).and_then(|s| <[u8; 16]>::try_from(s).ok()) {
-        if let Some(info) = finish_secret(&mut c, secret, SvcProfile::Compat20, [0u8; 16]) {
-            return Some(info);
-        }
+/// Decodes the SecretPacket without a generation hint, trying the 2.6.x
+/// layout first (which also covers 2.5.x) and then the 2.7.x layout.
+fn decode_secret_for_generation(bytes: &[u8], expected: i32) -> Option<VoiceServerInfo> {
+    let mut order: Vec<SvcProfile> = Vec::new();
+    if let Some(profile) = SvcProfile::from_compatibility_version(expected) {
+        order.push(profile);
     }
-    // Compat-21 (Simple Voice Chat 2.7.x) SecretPacket.toBytes order adds a
-    // server-assigned connection UUID between the secret and the port:
-    // secret, connectionId, port, player, codec, mtu, distance, keepalive,
-    // groups, host, recording. That UUID replaces the player UUID inside
-    // every UDP envelope this generation.
-    let mut c = Cursor::new(bytes);
-    let secret: [u8; 16] = c.take(16)?.try_into().ok()?;
-    let connection_id = c.uuid()?;
-    finish_secret(&mut c, secret, SvcProfile::Compat21, connection_id)
+    if !order.contains(&SvcProfile::Compat20) {
+        order.push(SvcProfile::Compat20);
+    }
+    if !order.contains(&SvcProfile::Compat21) {
+        order.push(SvcProfile::Compat21);
+    }
+    order
+        .iter()
+        .find_map(|profile| parse_secret_layout(bytes, *profile))
 }
 
-/// Decodes the SecretPacket tail shared by both wire generations, starting
+/// Parses the SecretPacket in the field order of `profile`'s wire generation.
+fn parse_secret_layout(bytes: &[u8], profile: SvcProfile) -> Option<VoiceServerInfo> {
+    let mut c = Cursor::new(bytes);
+    let secret: [u8; 16] = c.take(16)?.try_into().ok()?;
+    match profile {
+        // Compat-20/18 (Simple Voice Chat 2.5.x/2.6.x) SecretPacket.toBytes
+        // order: secret, port, player, codec, mtu, distance, keepalive,
+        // groups, host, recording. There is no server-assigned connection
+        // UUID in this wire generation: the secret doubles as the UUID that
+        // keys every UDP datagram we send, so the engine derives it from the
+        // secret bytes.
+        SvcProfile::Compat20 | SvcProfile::Compat18 => {
+            finish_secret(&mut c, secret, profile, [0u8; 16])
+        }
+        // Compat-21 (Simple Voice Chat 2.7.x) SecretPacket.toBytes order
+        // adds a server-assigned connection UUID between the secret and the
+        // port: secret, connectionId, port, player, codec, mtu, distance,
+        // keepalive, groups, host, recording. That UUID replaces the player
+        // UUID inside every UDP envelope this generation.
+        SvcProfile::Compat21 => {
+            let connection_id = c.uuid()?;
+            finish_secret(&mut c, secret, profile, connection_id)
+        }
+    }
+}
+
+/// Decodes the SecretPacket tail shared by the wire generations, starting
 /// at the port field, and validates the trailing metadata.
 fn finish_secret(
     c: &mut Cursor<'_>,
@@ -389,20 +431,84 @@ fn send_client_state(game: &mut crate::game::Game<'_>, muted: bool, disabled: bo
     }));
 }
 
+/// Resets the serial probe state; runs on every login and disconnect.
+fn reset_probe_state() {
+    PENDING_PROBE.store(0, Ordering::Release);
+    LAST_PROBED.store(0, Ordering::Release);
+    PENDING_AT_MS.store(0, Ordering::Release);
+    FIRST_PROBE_MS.store(0, Ordering::Release);
+    REJECTED_MASK.store(0, Ordering::Release);
+}
+
+fn rejection_bit(generation: i32) -> Option<u32> {
+    PROBE_SEQUENCE
+        .iter()
+        .position(|candidate| *candidate == generation)
+        .map(|index| 1 << index)
+}
+
+/// The next compatibility number to ask about: the first entry of
+/// PROBE_SEQUENCE the server has not rejected yet, starting after the
+/// generation of the most recent request. None once every generation was
+/// rejected - the server runs a Simple Voice Chat build this client cannot
+/// speak.
+fn next_probe_generation() -> Option<i32> {
+    let start = PROBE_SEQUENCE
+        .iter()
+        .position(|candidate| *candidate == LAST_PROBED.load(Ordering::Acquire))
+        .map_or(0, |index| (index + 1) % PROBE_SEQUENCE.len());
+    let mask = REJECTED_MASK.load(Ordering::Acquire);
+    for offset in 0..PROBE_SEQUENCE.len() {
+        let index = (start + offset) % PROBE_SEQUENCE.len();
+        if mask & (1 << index) == 0 {
+            return Some(PROBE_SEQUENCE[index]);
+        }
+    }
+    None
+}
+
+fn all_generations_rejected() -> bool {
+    next_probe_generation().is_none()
+}
+
 fn send_secret_request(game: &mut crate::game::Game<'_>) {
     use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
-    // Once a generation is known, ask only for it. Otherwise probe every
-    // supported generation: the server answers only the request whose
-    // compatibility number matches its own and ignores the other.
-    let known = KNOWN_COMPAT.load(Ordering::Acquire);
-    let versions: &[i32] = if known != 0 { &[known] } else { &[20, 21] };
-    for version in versions {
-        game.send(Serverbound::CustomPayload(CustomPayload {
-            channel: REQUEST_SECRET.to_owned(),
-            data: version.to_be_bytes().to_vec(),
-        }));
+    let Some(generation) = next_probe_generation() else {
+        return;
+    };
+    game.send(Serverbound::CustomPayload(CustomPayload {
+        channel: REQUEST_SECRET.to_owned(),
+        data: generation.to_be_bytes().to_vec(),
+    }));
+    let now = now_millis();
+    if FIRST_PROBE_MS.load(Ordering::Acquire) == 0 {
+        FIRST_PROBE_MS.store(now, Ordering::Release);
     }
-    LAST_SECRET_REQUEST.store(now_millis(), Ordering::Release);
+    PENDING_PROBE.store(generation, Ordering::Release);
+    LAST_PROBED.store(generation, Ordering::Release);
+    PENDING_AT_MS.store(now, Ordering::Release);
+    eprintln!("[svchorizon] Probing Simple Voice Chat compatibility version {generation}");
+}
+
+/// Marks the outstanding generation as rejected: the server answered the
+/// request with its incompatibility chat notice instead of a secret.
+fn reject_pending_generation() {
+    let pending = PENDING_PROBE.swap(0, Ordering::AcqRel);
+    let generation = if pending != 0 {
+        pending
+    } else {
+        LAST_PROBED.load(Ordering::Acquire)
+    };
+    if generation == 0 {
+        return;
+    }
+    if let Some(bit) = rejection_bit(generation) {
+        REJECTED_MASK.fetch_or(bit, Ordering::AcqRel);
+    }
+    eprintln!(
+        "[svchorizon] Server rejected Simple Voice Chat compatibility version {generation} \
+         (incompatible_version notice) - trying the next generation"
+    );
 }
 
 fn now_millis() -> u64 {
@@ -1076,14 +1182,16 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             .expect("SVC reconnect state poisoned") = None;
         RECONNECTING.store(false, Ordering::Release);
         GROUPS_ENABLED.store(false, Ordering::Release);
+        reset_probe_state();
         return;
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
 
-    // Re-probe the secret handshake while the server has not answered at
-    // all: the request is only retried here so a server that ignored the
-    // first probe (channel registration race, or a compatibility number we
-    // did not guess) gets asked again without a manual rejoin.
+    // Serial generation probe: ask about one compatibility number at a
+    // time and move on after a timeout or the server's rejection notice
+    // (handled in the SystemChat arm). This repeats while no secret has
+    // arrived at all, so a dropped first request (channel registration
+    // race) recovers without a manual rejoin.
     if game.native_on("svchorizon")
         && voice_client()
             .lock()
@@ -1094,9 +1202,26 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             .expect("SVC reconnect state poisoned")
             .is_none()
     {
-        let last = LAST_SECRET_REQUEST.load(Ordering::Acquire);
         let now = now_millis();
-        if last == 0 || now.saturating_sub(last) >= SECRET_REQUEST_RETRY_MS {
+        let pending = PENDING_PROBE.load(Ordering::Acquire);
+        let pending_expired = pending != 0
+            && now.saturating_sub(PENDING_AT_MS.load(Ordering::Acquire)) >= PROBE_TIMEOUT_MS;
+        if pending_expired {
+            PENDING_PROBE.store(0, Ordering::Release);
+        }
+        // Once the quick detection window is over, slow the background
+        // probing down: a server that was going to answer has answered.
+        let pacing = if now.saturating_sub(FIRST_PROBE_MS.load(Ordering::Acquire))
+            >= NO_VOICE_CHAT_AFTER_MS
+        {
+            10_000
+        } else {
+            0
+        };
+        if (pending == 0 || pending_expired)
+            && now.saturating_sub(PENDING_AT_MS.load(Ordering::Acquire)) >= pacing
+            && next_probe_generation().is_some()
+        {
             send_secret_request(game);
         }
     }
@@ -1441,6 +1566,11 @@ pub fn on_hud(game: &crate::game::Game<'_>, batch: &mut horizon_client::hud::Hud
         ("SVC: Not on a server", 0xAAAAAA)
     } else if RECONNECTING.load(Ordering::Acquire) {
         ("SVC: Reconnecting", 0xFFCC55)
+    } else if all_generations_rejected() {
+        // Every generation this client speaks was answered with the
+        // server's incompatibility notice: the server runs Simple Voice
+        // Chat, but a wire generation this client cannot speak.
+        ("SVC: Server voice chat version incompatible", 0xFF5555)
     } else if last_server_info()
         .lock()
         .expect("SVC reconnect state poisoned")
@@ -1448,7 +1578,14 @@ pub fn on_hud(game: &crate::game::Game<'_>, batch: &mut horizon_client::hud::Hud
     {
         ("SVC: Connecting", 0xFFCC55)
     } else {
-        ("SVC: No voice chat on this server", 0xAAAAAA)
+        let first_probe = FIRST_PROBE_MS.load(Ordering::Acquire);
+        let detecting =
+            first_probe == 0 || now_millis().saturating_sub(first_probe) < NO_VOICE_CHAT_AFTER_MS;
+        if detecting {
+            ("SVC: Detecting voice chat", 0xFFCC55)
+        } else {
+            ("SVC: No voice chat on this server", 0xAAAAAA)
+        }
     };
     game.native_text(batch, label, [8.0, 42.0], color, true);
     let groups = group_state().lock().expect("SVC group state poisoned");
@@ -1591,10 +1728,10 @@ pub fn on_packet(
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") {
                 // Bukkit/Paper only deliver payloads the client registered.
-                // The known-generation cache is per server: a different
-                // server may run the other SVC generation, so probe both
-                // again on every join.
-                KNOWN_COMPAT.store(0, Ordering::Release);
+                // The probe state is per server: a different server may run
+                // another SVC generation, so start the probe round from the
+                // beginning on every join.
+                reset_probe_state();
                 send_channel_registration(game);
                 send_secret_request(game);
             }
@@ -1602,9 +1739,14 @@ pub fn on_packet(
         Clientbound::CustomPayload(payload)
             if payload.channel == SECRET && game.native_on("svchorizon") =>
         {
-            match decode_secret(&payload.data) {
+            // Decode expecting the layout of the generation this login is
+            // currently probing, falling back to the other layouts.
+            match decode_secret_for_generation(
+                &payload.data,
+                PENDING_PROBE.load(Ordering::Acquire),
+            ) {
                 Some(info) => {
-                    KNOWN_COMPAT.store(info.profile.compatibility_version(), Ordering::Release);
+                    PENDING_PROBE.store(0, Ordering::Release);
                     eprintln!(
                         "[svchorizon] Secret received ({}): voice host '{}' port {} keepalive {}ms groups {}",
                         info.profile.label(),
@@ -1659,7 +1801,34 @@ pub fn on_packet(
                             }
                         });
                 }
-                None => eprintln!("[svchorizon] Rejected malformed voicechat:secret payload."),
+                None => {
+                    eprintln!(
+                        "[svchorizon] Rejected malformed voicechat:secret payload ({} bytes, head {:02x?}).",
+                        payload.data.len(),
+                        &payload.data[..payload.data.len().min(8)]
+                    );
+                }
+            }
+        }
+        Clientbound::SystemChat(payload)
+            if !payload.overlay && game.native_on("svchorizon") =>
+        {
+            // The official plugin answers a request_secret whose
+            // compatibility number does not match its build with this chat
+            // notice instead of a secret
+            // (ServerVoiceEvents.getIncompatibleMessage). Horizon has no
+            // Simple Voice Chat language table, so the translatable key
+            // arrives verbatim; use it as a definitive rejection signal for
+            // the pending generation and move on to the next one right away.
+            if PENDING_PROBE.load(Ordering::Acquire) != 0
+                && horizon_client::scoreboard::tag_to_json(&payload.content)
+                    .to_string()
+                    .contains("message.voicechat.incompatible_version")
+            {
+                reject_pending_generation();
+                if next_probe_generation().is_some() {
+                    send_secret_request(game);
+                }
             }
         }
         Clientbound::CustomPayload(payload)
@@ -1693,6 +1862,7 @@ pub fn on_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use svchorizon_engine::voice::SVC_PROFILES;
 
     #[test]
     fn decodes_official_category_metadata_and_optional_fields() {
@@ -1828,7 +1998,7 @@ mod tests {
         bytes.push(b"voice.example.test".len() as u8);
         bytes.extend_from_slice(b"voice.example.test");
         bytes.push(0);
-        let info = decode_secret(&bytes).unwrap();
+        let info = decode_secret_for_generation(&bytes, 0).unwrap();
         assert_eq!(info.profile, SvcProfile::Compat20);
         assert_eq!(info.profile.compatibility_version(), 20);
         assert_eq!(info.player, [0x11; 16]);
@@ -1856,7 +2026,7 @@ mod tests {
         bytes.push(1);
         bytes.push(0); // empty voice host
         bytes.push(0);
-        let info = decode_secret(&bytes).unwrap();
+        let info = decode_secret_for_generation(&bytes, 0).unwrap();
         assert_eq!(info.profile, SvcProfile::Compat21);
         assert_eq!(info.profile.compatibility_version(), 21);
         assert_eq!(info.connection_id, [0x77; 16]);
@@ -1867,7 +2037,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated_or_trailing_payloads() {
-        assert!(decode_secret(&[0; 8]).is_none());
+        assert!(decode_secret_for_generation(&[0; 8], 0).is_none());
         let mut bytes = vec![0x42; 16];
         bytes.extend_from_slice(&24454i32.to_be_bytes());
         bytes.extend_from_slice(&[0x11; 16]);
@@ -1879,7 +2049,7 @@ mod tests {
         bytes.push(0);
         bytes.push(0);
         bytes.push(99);
-        assert!(decode_secret(&bytes).is_none());
+        assert!(decode_secret_for_generation(&bytes, 0).is_none());
         // The same trailing-garbage rejection for the 2.7.x layout.
         let mut bytes21 = vec![0x42; 16];
         bytes21.extend_from_slice(&[0x77; 16]);
@@ -1893,21 +2063,82 @@ mod tests {
         bytes21.push(0);
         bytes21.push(0);
         bytes21.push(99);
-        assert!(decode_secret(&bytes21).is_none());
+        assert!(decode_secret_for_generation(&bytes21, 0).is_none());
     }
 
     #[test]
     fn probes_every_supported_compatibility_generation() {
         // The request payload is exactly the 4-byte big-endian compatibility
-        // number, and an unknown server gets both generations probed.
+        // number, and the generations are probed one at a time, most likely
+        // first: the released 2.6.x line, then the 2.7.x pre-release, then
+        // the 2.5.x line on servers that never updated.
         assert_eq!(20i32.to_be_bytes(), [0, 0, 0, 20]);
         assert_eq!(21i32.to_be_bytes(), [0, 0, 0, 21]);
+        assert_eq!(18i32.to_be_bytes(), [0, 0, 0, 18]);
         assert_eq!(
             SVC_PROFILES
                 .iter()
                 .map(|p| p.compatibility_version())
                 .collect::<Vec<_>>(),
-            vec![20, 21]
+            vec![20, 21, 18]
+        );
+    }
+
+    #[test]
+    fn rejection_notices_remove_a_generation_from_the_probe_round() {
+        // Walk the probe state the way the packet handlers drive it: 20 is
+        // rejected by the incompatibility notice, then 21, then a compat-18
+        // server answers with a secret.
+        reset_probe_state();
+        assert_eq!(next_probe_generation(), Some(20));
+        PENDING_PROBE.store(20, Ordering::Release);
+        LAST_PROBED.store(20, Ordering::Release);
+        reject_pending_generation();
+        assert_eq!(next_probe_generation(), Some(21));
+        PENDING_PROBE.store(21, Ordering::Release);
+        LAST_PROBED.store(21, Ordering::Release);
+        reject_pending_generation();
+        assert_eq!(next_probe_generation(), Some(18));
+        // A late notice after the timeout is attributed to the last probe.
+        PENDING_PROBE.store(0, Ordering::Release);
+        LAST_PROBED.store(18, Ordering::Release);
+        reject_pending_generation();
+        assert_eq!(next_probe_generation(), None);
+        assert!(all_generations_rejected());
+        // And a fresh login starts the round from the beginning again.
+        reset_probe_state();
+        assert_eq!(next_probe_generation(), Some(20));
+        assert!(!all_generations_rejected());
+    }
+
+    #[test]
+    fn decodes_secret_payload_for_a_compat_18_server() {
+        // 2.5.x (compatibility 18) sends the same field order as 2.6.x; the
+        // expected-generation hint only decides which profile is recorded.
+        let mut bytes = vec![0x42; 16];
+        bytes.extend_from_slice(&24454i32.to_be_bytes());
+        bytes.extend_from_slice(&[0x11; 16]);
+        bytes.push(0);
+        bytes.extend_from_slice(&1200i32.to_be_bytes());
+        bytes.extend_from_slice(&48.0f64.to_bits().to_be_bytes());
+        bytes.extend_from_slice(&1000i32.to_be_bytes());
+        bytes.push(1);
+        bytes.push(0); // empty voice host
+        bytes.push(0);
+        let info = decode_secret_for_generation(&bytes, 18).unwrap();
+        assert_eq!(info.profile, SvcProfile::Compat18);
+        assert_eq!(info.profile.compatibility_version(), 18);
+        assert_eq!(info.player, [0x11; 16]);
+        assert_eq!(info.port, 24454);
+        // Without a hint the shared layout still decodes (recorded as the
+        // compat-20 generation), and a compat-21 hint falls back to it too.
+        assert_eq!(
+            decode_secret_for_generation(&bytes, 0).unwrap().profile,
+            SvcProfile::Compat20
+        );
+        assert_eq!(
+            decode_secret_for_generation(&bytes, 21).unwrap().profile,
+            SvcProfile::Compat20
         );
     }
 }
