@@ -1,6 +1,13 @@
 name: Build SVC Horizon hnmod
 on:
   workflow_dispatch:
+    # The native-mixin-check job also runs on every push to the working
+    # branch: it compiles the real mixin against the pinned Horizon and
+    # catches compile errors before any manual game build is dispatched.
+    # The Windows-minute-heavy jobs below stay manual.
+  push:
+    branches:
+      - ci/windows-game-build
 
 permissions:
   contents: read
