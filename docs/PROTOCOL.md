@@ -127,6 +127,47 @@ KeepAlivePacket (reply) and enforces the server's keepalive timeout. Automatic
 reconnect uses exponential backoff while the Minecraft play session remains
 active.
 
+## Unauthenticated reachability probe (PING_V1)
+
+Every released generation ships a debug ping (`debug/PingHandler`): a datagram
+addressed to the magic UUID `58bc9ae9-c7a8-45e4-a11c-efbb67199425` is answered
+with an unencrypted 24-byte echo whenever `allow_pings` is on (the default).
+The frame is `[0xff][PING_V1 uuid][varint 24][16-byte id][8-byte timestamp]`
+and the answer is exactly the 24-byte payload. It needs no secret, no
+encryption and no envelope key, and it is byte-identical across 2.5.x, 2.6.x
+and 2.7.x.
+
+The client sends this probe every 5 seconds beside the authentication loop
+while it is unauthenticated and reports the result:
+
+- **Pong received** - the datagram path to the voice server works; the server
+  is ignoring the authentication datagrams themselves (protocol or secret
+  mismatch, e.g. a custom server build). Log: "Voice server answered an
+  unauthenticated ping ..." and the HUD shows
+  `SVC: Voice server rejects authentication`.
+- **No pong** - nothing at all came back over UDP; the path is blocked
+  (Windows Firewall/antivirus for horizon-client.exe, a proxy that does not
+  forward UDP, or the server's firewall/hoster). Log: "No answer at all from
+  the voice server ..." and the HUD shows `SVC: Voice server not responding`.
+
+## Datagram envelope fallback
+
+The envelope UUID keys the server-side secret lookup and differs per
+generation: the player's profile UUID (2.5.x/2.6.x) or the per-connection UUID
+from the secret response (2.7.x). The 16-byte secret is itself a UUID, and
+custom server builds are known to key the lookup by it instead. While
+authentication goes unanswered the worker therefore cycles the envelope
+through `player UUID -> secret UUID -> connection UUID` (generation primary
+first, duplicates and zero keys dropped) every 5 attempts, and freezes the key
+that received the ack for all further traffic. On upstream builds the first
+candidate always wins, so the fallback changes nothing.
+
+A server that answers a `request_secret` with the incompatibility notice and
+*still* issues a secret in another generation's wire layout (the server
+rejected version 20 but sent a compat-20-layout secret, for example) is
+running a custom build; the client logs the contradiction and trusts the
+secret bytes, because the secret payload is the authoritative wire description.
+
 ## UDP packet coverage
 
 | ID | Packet | Current status |

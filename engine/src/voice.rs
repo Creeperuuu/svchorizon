@@ -40,6 +40,19 @@ const KEEP_ALIVE: u8 = 0x08;
 const CONNECTION_CHECK: u8 = 0x09;
 const CONNECTION_CHECK_ACK: u8 = 0x0a;
 
+/// Upstream `debug/PingHandler.PING_V1`: while `allow_pings` is on (the
+/// default in every released generation), a voice server answers datagrams
+/// addressed to this UUID with an unauthenticated, unencrypted 24-byte echo.
+/// The probe therefore works identically against Simple Voice Chat 2.5.x,
+/// 2.6.x and 2.7.x and separates "the UDP path is blocked" from "the server
+/// ignores our authentication datagrams".
+const PING_V1: [u8; 16] = [
+    0x58, 0xbc, 0x9a, 0xe9, 0xc7, 0xa8, 0x45, 0xe4, 0xa1, 0x1c, 0xef, 0xbb, 0x67, 0x19, 0x94, 0x25,
+];
+/// Size of the ping payload (UUID + timestamp) the server echoes verbatim.
+const PING_PONG_BYTES: usize = 24;
+const PING_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Which wire generation the server speaks. The plugin-channel handshake is
 /// gated by a compatibility number: a `request_secret` carrying a different
 /// number makes the server send the player an incompatibility chat notice
@@ -348,6 +361,7 @@ pub struct VoiceClient {
     microphone_gain: Arc<AtomicU32>,
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
+    ping_answered: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
     listener: Arc<Mutex<ListenerPose>>,
@@ -426,6 +440,7 @@ impl VoiceClient {
         let microphone_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let connected = Arc::new(AtomicBool::new(false));
         let auth_attempts = Arc::new(AtomicU32::new(0));
+        let ping_answered = Arc::new(AtomicBool::new(false));
 
         let audio_running = Arc::clone(&running);
         let audio_transmitting = Arc::clone(&transmitting);
@@ -463,6 +478,7 @@ impl VoiceClient {
         let worker_voice_activation = Arc::clone(&voice_activation);
         let worker_connected = Arc::clone(&connected);
         let worker_auth_attempts = Arc::clone(&auth_attempts);
+        let worker_ping_answered = Arc::clone(&ping_answered);
         let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
@@ -482,6 +498,7 @@ impl VoiceClient {
                     worker_voice_activation,
                     worker_connected,
                     worker_auth_attempts,
+                    worker_ping_answered,
                     worker_positions,
                 );
             }) {
@@ -504,6 +521,7 @@ impl VoiceClient {
             microphone_gain,
             connected,
             auth_attempts,
+            ping_answered,
             worker: Some(worker),
             audio_worker: Some(audio_worker),
             listener,
@@ -571,6 +589,14 @@ impl VoiceClient {
     /// "still connecting" from "the server is not answering at all".
     pub fn unanswered_auth_attempts(&self) -> u32 {
         self.auth_attempts.load(Ordering::Relaxed)
+    }
+
+    /// Whether the voice server answered an unauthenticated PING_V1 probe.
+    /// True means the datagram path works and only authentication datagrams
+    /// are being ignored; false with unanswered authentication attempts means
+    /// nothing at all came back over UDP.
+    pub fn ping_answered(&self) -> bool {
+        self.ping_answered.load(Ordering::Acquire)
     }
 
     pub fn is_transmitting(&self) -> bool {
@@ -864,6 +890,7 @@ fn run_worker(
     voice_activation: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
+    ping_answered: Arc<AtomicBool>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
@@ -896,8 +923,18 @@ fn run_worker(
     let mut attempts_on_endpoint: u32 = 0;
     let mut auth_nonce: [u8; 16] = [0u8; 16];
     let mut endpoint = endpoints[endpoint_index];
+    // Datagram envelope candidates, most likely first (see envelope_keys).
+    // While authentication goes unanswered the worker cycles through them so
+    // custom server builds that key the secret lookup differently still work;
+    // once an ack arrives the working key is frozen for all traffic.
+    let envelopes = envelope_keys(&info);
+    let mut envelope_index = 0usize;
+    let mut ping_counter = 0u64;
+    let mut last_ping: Option<Instant> = None;
+    let mut last_ping_id = [0u8; 16];
 
     while running.load(Ordering::Acquire) {
+        let envelope = envelopes[envelope_index];
         loop {
             match commands.try_recv() {
                 Ok(Command::Pcm(pcm)) => {
@@ -915,7 +952,14 @@ fn run_worker(
                                 whispering: whispering.load(Ordering::Relaxed),
                             };
                             sequence = sequence.wrapping_add(1);
-                            let _ = send_packet(&socket, &info, endpoint, dual_stack, &packet);
+                            let _ = send_packet(
+                                &socket,
+                                &info,
+                                endpoint,
+                                dual_stack,
+                                &packet,
+                                envelope,
+                            );
                         }
                     }
                 }
@@ -934,6 +978,25 @@ fn run_worker(
             break;
         }
 
+        // Unauthenticated reachability probe (upstream PingHandler, on by
+        // default): a pong proves the datagram path to the voice server works
+        // and that only our authentication datagrams are being ignored. It
+        // runs beside the authentication loop until the first ack arrives.
+        if !authenticated && last_ping.is_none_or(|at| at.elapsed() >= PING_PROBE_INTERVAL) {
+            ping_counter = ping_counter.wrapping_add(1);
+            last_ping_id[..8].copy_from_slice(&ping_counter.to_be_bytes());
+            let probe = encode_ping_probe(last_ping_id, now_millis() as i64);
+            if let Err(error) = socket.send_to(&probe, mapped_target(dual_stack, endpoint)) {
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::WouldBlock
+                ) {
+                    eprintln!("[svchorizon] sending ping probe failed: {error}");
+                }
+            }
+            last_ping = Some(Instant::now());
+        }
+
         if !authenticated && last_auth.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
             // Compat-20 servers identify the player inside the Authenticate
             // payload; compat-21 servers identify the datagram by the
@@ -948,7 +1011,9 @@ fn run_worker(
                     secret: [0u8; 16],
                 },
             };
-            if let Err(error) = send_packet(&socket, &info, endpoint, dual_stack, &authenticate) {
+            if let Err(error) =
+                send_packet(&socket, &info, endpoint, dual_stack, &authenticate, envelope)
+            {
                 // A connectionless socket should not surface stale ICMP
                 // failures; if one still appears it is a reachability
                 // signal, not a socket failure - the unanswered-attempts
@@ -964,24 +1029,39 @@ fn run_worker(
                     "[svchorizon] Voice server has not answered {attempts} authentication attempts yet (endpoint {endpoint})"
                 );
             }
-            if attempts_on_endpoint >= ENDPOINT_RETRY_THRESHOLD && endpoints.len() > 1 {
-                endpoint_index = (endpoint_index + 1) % endpoints.len();
-                endpoint = endpoints[endpoint_index];
+            if attempts_on_endpoint >= ENDPOINT_RETRY_THRESHOLD {
                 attempts_on_endpoint = 0;
-                eprintln!(
-                    "[svchorizon] No answer yet - switching voice endpoint candidate to {endpoint}"
-                );
+                if endpoints.len() > 1 {
+                    endpoint_index = (endpoint_index + 1) % endpoints.len();
+                    endpoint = endpoints[endpoint_index];
+                    eprintln!(
+                        "[svchorizon] No answer yet - switching voice endpoint candidate to {endpoint}"
+                    );
+                }
+                if envelopes.len() > 1 {
+                    envelope_index = (envelope_index + 1) % envelopes.len();
+                    eprintln!(
+                        "[svchorizon] Still no authentication answer - also addressing datagrams to the {} (custom server builds key the secret lookup differently)",
+                        describe_envelope(&info, envelopes[envelope_index])
+                    );
+                }
             }
             if attempts == 15 {
-                eprintln!(
-                    "[svchorizon] No voice UDP answer for 15s. This client speaks Simple Voice Chat protocol generations {} - if the server runs something else it will stay silent. Otherwise check that horizon-client.exe is allowed in Windows Firewall (inbound UDP) and any antivirus, and that the server's voice UDP port {} is open/forwarded.",
-                    SVC_PROFILES
-                        .iter()
-                        .map(|p| p.compatibility_version().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    info.port
-                );
+                if ping_answered.load(Ordering::Acquire) {
+                    eprintln!(
+                        "[svchorizon] The voice server at {endpoint} answers unauthenticated pings but ignored {attempts} authentication attempts. The client speaks Simple Voice Chat protocol generations {} and tried every known datagram envelope - the server likely runs a custom voice build or rejects this client's secret.",
+                        SVC_PROFILES
+                            .iter()
+                            .map(|p| p.compatibility_version().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                } else {
+                    eprintln!(
+                        "[svchorizon] No answer at all from the voice server at {endpoint} - not even to unauthenticated pings. The UDP path to port {} is blocked somewhere in between: check that horizon-client.exe is allowed in Windows Firewall and any antivirus, and that the server's voice UDP port {} is open/forwarded (a proxy in front of the game server must forward UDP as well).",
+                        info.port, info.port
+                    );
+                }
             }
             last_auth = Some(Instant::now());
         } else if authenticated
@@ -998,7 +1078,7 @@ fn run_worker(
                     nonce: Some(auth_nonce),
                 },
             };
-            if let Err(error) = send_packet(&socket, &info, endpoint, dual_stack, &check) {
+            if let Err(error) = send_packet(&socket, &info, endpoint, dual_stack, &check, envelope) {
                 if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending connection check failed: {error}");
                 }
@@ -1016,6 +1096,16 @@ fn run_worker(
 
         match socket.recv(&mut receive) {
             Ok(length) => {
+                if !ping_answered.load(Ordering::Acquire)
+                    && last_ping_id != [0u8; 16]
+                    && decode_ping_pong(&receive[..length]) == Some(last_ping_id)
+                {
+                    ping_answered.store(true, Ordering::Release);
+                    eprintln!(
+                        "[svchorizon] Voice server answered an unauthenticated ping - the UDP path to {endpoint} works; authentication datagrams are being ignored (protocol or secret mismatch)"
+                    );
+                    continue;
+                }
                 let Some(packet) = decode_server_datagram(&receive[..length], &info.secret) else {
                     continue;
                 };
@@ -1039,9 +1129,14 @@ fn run_worker(
                     }
                     Packet::KeepAlive => {
                         last_keepalive = Instant::now();
-                        if let Err(error) =
-                            send_packet(&socket, &info, endpoint, dual_stack, &Packet::KeepAlive)
-                        {
+                        if let Err(error) = send_packet(
+                            &socket,
+                            &info,
+                            endpoint,
+                            dual_stack,
+                            &Packet::KeepAlive,
+                            envelope,
+                        ) {
                             if !error.is_connection_reset() {
                                 eprintln!("[svchorizon] sending keepalive failed: {error}");
                             }
@@ -1054,6 +1149,7 @@ fn run_worker(
                             endpoint,
                             dual_stack,
                             &Packet::Ping { id, timestamp },
+                            envelope,
                         );
                     }
                     Packet::PlayerSound {
@@ -1844,6 +1940,7 @@ fn send_packet(
     endpoint: SocketAddr,
     dual_stack: bool,
     packet: &Packet,
+    envelope: [u8; 16],
 ) -> Result<(), VoiceError> {
     let plain = encode_packet(packet, info.profile)
         .ok_or(VoiceError::InvalidServerInfo("invalid outbound packet"))?;
@@ -1867,12 +1964,10 @@ fn send_packet(
     // The envelope UUID keys the server-side secret lookup and changes with
     // the wire generation: compat-20 servers map it from the player's profile
     // UUID, compat-21 servers from the per-connection UUID issued in the
-    // secret response (upstream ClientNetworkMessage.writeClient).
-    let envelope_id = match info.profile {
-        SvcProfile::Compat20 | SvcProfile::Compat18 => info.player,
-        SvcProfile::Compat21 => info.connection_id,
-    };
-    datagram.extend_from_slice(&envelope_id);
+    // secret response (upstream ClientNetworkMessage.writeClient). The worker
+    // picks the candidate - and falls back to the alternates while
+    // authentication goes unanswered.
+    datagram.extend_from_slice(&envelope);
     let mut body = Vec::with_capacity(NONCE_BYTES + encrypted.len());
     body.extend_from_slice(&nonce);
     body.extend_from_slice(&encrypted);
@@ -1901,6 +1996,70 @@ fn decode_server_datagram(datagram: &[u8], secret: &[u8; 16]) -> Option<Packet> 
         )
         .ok()?;
     decode_packet(opened)
+}
+
+/// Datagram envelope UUIDs the client may address a generation with, most
+/// likely first. Upstream keys the server-side secret lookup by the player's
+/// profile UUID (2.5.x/2.6.x, `Server.getSecret(playerID)`) or the
+/// per-connection UUID issued in the secret response (2.7.x,
+/// `ConnectionSecrets.getByConnectionId`). The 16-byte secret is itself a
+/// UUID, and custom server builds are known to key the lookup by it instead;
+/// keeping it as a fallback costs nothing upstream and recovers on forks.
+fn envelope_keys(info: &VoiceServerInfo) -> Vec<[u8; 16]> {
+    let mut keys = Vec::with_capacity(3);
+    let primary = match info.profile {
+        SvcProfile::Compat20 | SvcProfile::Compat18 => info.player,
+        SvcProfile::Compat21 => info.connection_id,
+    };
+    for key in [primary, info.player, info.secret, info.connection_id] {
+        if key != [0u8; 16] && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// Human-readable envelope description for the diagnostics log.
+fn describe_envelope(info: &VoiceServerInfo, key: [u8; 16]) -> &'static str {
+    if key == info.player {
+        "player UUID"
+    } else if key == info.connection_id {
+        "connection UUID"
+    } else if key == info.secret {
+        "secret UUID"
+    } else {
+        "fallback UUID"
+    }
+}
+
+/// Builds the unauthenticated reachability probe frame (upstream
+/// PingHandler): envelope magic, the PING_V1 UUID and a 24-byte payload
+/// (UUID + timestamp) the server echoes verbatim. Not encrypted.
+fn encode_ping_probe(ping_id: [u8; 16], timestamp: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16 + 5 + PING_PONG_BYTES);
+    out.push(MAGIC);
+    out.extend_from_slice(&PING_V1);
+    let mut payload = Vec::with_capacity(PING_PONG_BYTES);
+    payload.extend_from_slice(&ping_id);
+    payload.extend_from_slice(&timestamp.to_be_bytes());
+    write_byte_array(&mut out, &payload);
+    out
+}
+
+/// Recognizes the 24-byte pong the voice server answers a PING_V1 probe
+/// with (raw payload, no envelope, no encryption) and returns the id.
+fn decode_ping_pong(datagram: &[u8]) -> Option<[u8; 16]> {
+    if datagram.len() != PING_PONG_BYTES {
+        return None;
+    }
+    Some(datagram[..16].try_into().ok()?)
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn encode_packet(packet: &Packet, profile: SvcProfile) -> Option<Vec<u8>> {
@@ -2300,6 +2459,7 @@ mod tests {
                 player: [0; 16],
                 secret: [0; 16],
             },
+            info.player,
         )
         .unwrap();
         let mut buffer = [0u8; MAX_DATAGRAM];
@@ -2320,6 +2480,7 @@ mod tests {
                 player: [0; 16],
                 secret: [0; 16],
             },
+            info21.connection_id,
         )
         .unwrap();
         let length = socket_b.recv(&mut buffer).unwrap();
@@ -2343,6 +2504,7 @@ mod tests {
                 player: [0; 16],
                 secret: [0; 16],
             },
+            info18.player,
         )
         .unwrap();
         socket_b.recv(&mut buffer).unwrap();
@@ -2497,5 +2659,93 @@ mod tests {
     fn rejects_varint_overflow() {
         let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
         assert!(reader.varint().is_none());
+    }
+
+    #[test]
+    fn ping_probe_frame_matches_upstream_pinghandler() {
+        // PingHandler reads MAGIC, a UUID and a 24-byte payload (UUID + long)
+        // and echoes exactly those 24 payload bytes back, unencrypted.
+        let id = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        let frame = encode_ping_probe(id, 0x1122334455667788);
+        assert_eq!(&frame[..1], &[MAGIC]);
+        assert_eq!(&frame[1..17], &PING_V1);
+        let mut reader = Reader::new(&frame[17..]);
+        let payload = reader.byte_array(usize::MAX).unwrap();
+        assert!(reader.done());
+        assert_eq!(payload.len(), PING_PONG_BYTES);
+        assert_eq!(&payload[..16], &id);
+        assert_eq!(&payload[16..], &0x1122334455667788i64.to_be_bytes());
+    }
+
+    #[test]
+    fn ping_pong_recognition_ignores_other_traffic() {
+        let id = [7u8; 16];
+        let mut pong = id.to_vec();
+        pong.extend_from_slice(&42i64.to_be_bytes());
+        assert_eq!(decode_ping_pong(&pong), Some(id));
+        // Wrong length: not a pong (encrypted datagrams carry a varint
+        // length and never total exactly 24 bytes with a full tag).
+        assert_eq!(decode_ping_pong(&pong[..23]), None);
+        let mut long = pong.clone();
+        long.push(0);
+        assert_eq!(decode_ping_pong(&long), None);
+    }
+
+    #[test]
+    fn envelope_keys_follow_the_generation_and_dedupe() {
+        let mut info = VoiceServerInfo {
+            secret: [1; 16],
+            port: 24454,
+            player: [2; 16],
+            profile: SvcProfile::Compat20,
+            connection_id: [0; 16],
+            codec: 0,
+            mtu: 1024,
+            distance: 48.0,
+            keep_alive_ms: 1000,
+            groups: true,
+            host: String::new(),
+            allow_recording: true,
+        };
+        // Compat-20 keys lookups by the player UUID; the secret UUID is the
+        // fallback for custom builds, the zeroed connection UUID is dropped.
+        assert_eq!(
+            envelope_keys(&info),
+            vec![[2; 16], [1; 16]]
+        );
+        // Compat-21 keys lookups by the per-connection UUID first.
+        info.profile = SvcProfile::Compat21;
+        info.connection_id = [3; 16];
+        assert_eq!(
+            envelope_keys(&info),
+            vec![[3; 16], [2; 16], [1; 16]]
+        );
+        // A server that assigns the secret as the connection UUID still
+        // yields a sane, duplicate-free candidate list.
+        info.connection_id = [1; 16];
+        assert_eq!(envelope_keys(&info), vec![[1; 16], [2; 16]]);
+    }
+
+    #[test]
+    fn envelope_descriptions_name_the_key() {
+        let info = VoiceServerInfo {
+            secret: [1; 16],
+            port: 24454,
+            player: [2; 16],
+            profile: SvcProfile::Compat20,
+            connection_id: [0; 16],
+            codec: 0,
+            mtu: 1024,
+            distance: 48.0,
+            keep_alive_ms: 1000,
+            groups: true,
+            host: String::new(),
+            allow_recording: true,
+        };
+        assert_eq!(describe_envelope(&info, info.player), "player UUID");
+        assert_eq!(describe_envelope(&info, info.secret), "secret UUID");
     }
 }

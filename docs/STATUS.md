@@ -2,6 +2,18 @@
 
 Last updated: 2026-11-01.
 
+## Live-server diagnosis (axocraftseason8, Paper 1.21.11)
+
+The client reaches the full plugin-channel handshake on the live server: the
+serial generation probe receives a secret in the compat-20 wire layout
+(port 47230, keepalive 1000 ms) and starts the voice workers, but the voice
+server never answers a single authentication datagram. The secret layout is
+authoritative, so the client speaks compat-20 wire to this server; the
+remaining silence is between the two UDP stacks and is now measured, not
+guessed: the PING_V1 probe reports whether *anything* at all comes back, and
+the envelope fallback cycles the datagram key. The 15-second diagnostic and
+the HUD reflect the probe result instead of speculating about firewalls.
+
 ## Implemented in source
 
 - [x] Rust workspace and isolated protocol crate.
@@ -18,6 +30,8 @@ Last updated: 2026-11-01.
 - [x] Native group discovery, group cycling, quick-create, join-public-group and leave-group keybinds, plus native chat commands for listing groups, joining password-protected groups and creating named/passworded NORMAL, OPEN or ISOLATED groups.
 - [x] Native Horizon packet hook sends the request on play login and consumes the server's secret response.
 - [x] UDP worker with authentication retry, connection validation, ping echo, keepalive response and timeout handling.
+- [x] Unauthenticated PING_V1 reachability probe (upstream `debug/PingHandler`, identical across 2.5.x/2.6.x/2.7.x) beside the authentication loop: a pong separates "the UDP path is blocked" from "the server ignores our authentication" in the log and the HUD.
+- [x] Datagram envelope fallback: while authentication goes unanswered the worker cycles the envelope UUID through player/secret/connection candidates (generation primary first) and freezes the key that received the ack, so custom server builds that key the secret lookup differently still connect.
 - [x] Voice endpoint candidate rotation: every address the voice host resolves to (dual-stack A/AAAA or multi-record) is tried in turn while authentication goes unanswered, on a connectionless socket shared by both families.
 - [x] Automatic voice UDP reconnect worker with exponential backoff, session-generation checks and preserved per-player audio controls.
 - [x] Vendored pure-Rust Opus encoder/decoder, with tests for 48 kHz 20 ms VOIP frames and all upstream codec modes.

@@ -1547,10 +1547,15 @@ pub fn on_hud(game: &crate::game::Game<'_>, batch: &mut horizon_client::hud::Hud
         ("SVC: Microphone muted", 0xFF5555)
     } else if let Some(client) = guard.as_ref() {
         if !client.is_connected() && client.unanswered_auth_attempts() >= 15 {
-            // Packets are going out but no authenticated datagram is coming
-            // back. This is neither proof of a blocked server nor of a
-            // blocked client: it means no UDP answer arrived yet.
-            ("SVC: Voice server not responding", 0xFF5555)
+            // No authenticated datagram is coming back. The unauthenticated
+            // ping probe separates the two possible causes: a pong proves the
+            // datagram path works and the server ignores our authentication
+            // datagrams; no pong means nothing at all came back over UDP.
+            if client.ping_answered() {
+                ("SVC: Voice server rejects authentication", 0xFF5555)
+            } else {
+                ("SVC: Voice server not responding", 0xFF5555)
+            }
         } else if client.is_transmitting() && client.is_whispering() {
             ("SVC: Whispering", 0x55FF55)
         } else if client.is_transmitting() {
@@ -1747,6 +1752,21 @@ pub fn on_packet(
             ) {
                 Some(info) => {
                     PENDING_PROBE.store(0, Ordering::Release);
+                    if rejection_bit(info.profile.compatibility_version())
+                        .is_some_and(|bit| REJECTED_MASK.load(Ordering::Acquire) & bit != 0)
+                    {
+                        // The server answered a request with the
+                        // incompatibility notice but still issued a secret in
+                        // another generation's wire layout: the secret bytes
+                        // are authoritative, so use their layout - and say
+                        // so, this is the signature of a custom/forked voice
+                        // build.
+                        eprintln!(
+                            "[svchorizon] Note: the server rejected compatibility version {} earlier but issued a {} secret - trusting the secret bytes (custom Simple Voice Chat build?)",
+                            info.profile.compatibility_version(),
+                            info.profile.label()
+                        );
+                    }
                     eprintln!(
                         "[svchorizon] Secret received ({}): voice host '{}' port {} keepalive {}ms groups {}",
                         info.profile.label(),
