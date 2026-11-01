@@ -32,6 +32,8 @@ static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
 /// generation at a time so a supported server does not receive a false
 /// incompatibility warning for the other generation.
 const SECRET_PROBE_TIMEOUT_MS: u64 = 1_500;
+/// Retry the preferred generation if neither probe receives a secret.
+const SECRET_REQUEST_RETRY_MS: u64 = 10_000;
 /// Current upstream SVC for Minecraft 26.3 is compat 21 (2.7.0-pre1).
 /// Compat 20 remains supported as a delayed fallback for 2.6.x servers.
 const SECRET_PROBE_ORDER: &[i32] = &[21, 20];
@@ -1104,6 +1106,16 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             SECRET_PROBE_INDEX.store(next_probe + 1, Ordering::Release);
             send_secret_request(game, version);
             eprintln!("[svchorizon] Probing SVC compatibility {version}.");
+        } else if next_probe >= SECRET_PROBE_ORDER.len()
+            && last != 0
+            && now.saturating_sub(last) >= SECRET_REQUEST_RETRY_MS
+        {
+            // No secret arrived from either supported generation. Keep the
+            // connection-detection path alive without spamming both versions.
+            SECRET_PROBE_INDEX.store(1, Ordering::Release);
+            let version = SECRET_PROBE_ORDER[0];
+            send_secret_request(game, version);
+            eprintln!("[svchorizon] Retrying SVC compatibility {version}.");
         }
     }
 
