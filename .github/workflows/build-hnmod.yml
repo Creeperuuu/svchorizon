@@ -1,14 +1,6 @@
 name: Build SVC Horizon hnmod
 on:
   workflow_dispatch:
-  # Every push runs the Linux native-mixin-check job so compile errors in the
-  # mixin surface immediately instead of at the next manual run. The other
-  # jobs (full test matrix, Windows engine check, packaging) stay manual: on
-  # a private repository they would otherwise burn Windows runner minutes on
-  # every push.
-  push:
-    branches:
-      - "**"
 
 permissions:
   contents: read
