@@ -28,6 +28,10 @@ The GitHub Actions workflows are manual-trigger only. Open **Actions → Build S
 
 The workflow artifact is `svchorizon-0.1.0.hnmod`. It is a source-based native mod bundle, not a Java mod or a modified Minecraft executable.
 
+### Building the game itself (Windows)
+
+**Actions → Build game (Windows) → Run workflow** compiles `horizon-client.exe` (Windows x64) from the pinned Horizon revision with this mod's mixins compiled in, so the hour-long local build is not needed. The job stages the vendored engine bundle, applies the mod with `horizon-mixins apply` into a staged workspace, and builds the game from it with the same settings Horizon's own release build uses on Windows (release profile, `--locked`, the C runtime linked in via `crt-static`). The exe is uploaded as the `horizon-client-windows-x64-svchorizon` artifact; replace `horizon-client.exe` in your Horizon game folder with it (keep a backup of the original). The cargo target directory is cached between runs: the first run compiles everything from scratch, later runs rebuild only the crates the mod touched.
+
 Local protocol checks:
 
 ```sh

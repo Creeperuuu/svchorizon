@@ -1,0 +1,128 @@
+name: Build game (Windows)
+# Builds horizon-client.exe (Windows x64) from the pinned Horizon revision with the
+# SVC mod's native mixins compiled in, replacing the hour-long local build.
+#
+# The flow mirrors build-hnmod.yml's native-mixin-check job (stage the vendored engine
+# bundle, then horizon-mixins apply into a staged workspace) and Horizon's own
+# game-build.yml Windows matrix (release profile, --locked, the C runtime linked in
+# with crt-static so the game runs without the Visual C++ redistributable).
+# After apply, the staged workspace is a normal Cargo workspace: the game is built
+# from it with a shared --target-dir so the actions/cache below makes later runs
+# rebuild only what changed instead of the whole hour.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-game-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HORIZON_REVISION: ba6344a59cb9e755b730dcf02285fc0d33b97d3c
+  HORIZON_MIXINS_REVISION: d9c83d7096b7ea5b83678da2efdfd6161f74997e
+
+jobs:
+  windows:
+    name: horizon-client.exe (windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The C runtime linked in, so the game runs without the Visual C++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned Horizon
+        uses: actions/checkout@v4
+        with:
+          repository: horizon-rust/horizon
+          ref: ${{ env.HORIZON_REVISION }}
+          path: horizon
+          persist-credentials: false
+
+      - name: Materialize tracked symlinks in pinned Horizon
+        run: |
+          cd horizon
+          git ls-files -s | awk '$1 == 120000 {print $4}' | while IFS= read -r link; do
+            [ -n "$link" ] || continue
+            target=$(git cat-file blob "HEAD:$link")
+            rm -f "$link"
+            cp -L "$target" "$link"
+          done
+
+      - name: Checkout pinned horizon-mixins
+        uses: actions/checkout@v4
+        with:
+          repository: horizon-rust/horizon-mixins
+          ref: ${{ env.HORIZON_MIXINS_REVISION }}
+          path: horizon-mixins
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache cargo registry and the game's target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/index
+            ~/.cargo/git
+            game-target
+          # The game target directory is keyed on the pinned Horizon lockfile, not the
+          # mod sources: cargo's own fingerprints rebuild only the crates the mod touched.
+          key: horizon-game-win-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}
+          restore-keys: horizon-game-win-1.95.0-${{ env.HORIZON_REVISION }}-
+
+      - name: Fetch dependencies
+        run: |
+          cargo fetch --locked --manifest-path horizon-mixins/Cargo.toml
+          cargo fetch --locked --manifest-path horizon/Cargo.toml
+
+      - name: Stage vendored Opus engine into the native bundle
+        run: python tools/prepare_bundle.py
+
+      - name: Apply the SVC mod into a staged Horizon workspace
+        run: |
+          cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- \
+            apply --workspace horizon --mods mixins --out game-stage
+
+      - name: Build horizon-client.exe (release)
+        run: |
+          cargo build --release --locked -p horizon-client --bin horizon-client \
+            --manifest-path game-stage/Cargo.toml --target-dir game-target
+
+      - name: The game starts
+        run: |
+          test -f game-target/release/horizon-client.exe
+          game-target/release/horizon-client.exe --help | grep -q -- '--resources'
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### horizon-client.exe (Windows x64, SVC mod compiled in)"
+            echo
+            echo "- Horizon: \`${{ env.HORIZON_REVISION }}\`"
+            echo "- Mod commit: \`${{ github.sha }}\`"
+            echo
+            echo "Download the \`horizon-client-windows-x64-svchorizon\` artifact and replace"
+            echo "\`horizon-client.exe\` in your Horizon game folder (keep a backup of the original)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-client-windows-x64-svchorizon
+          path: game-target/release/horizon-client.exe
+          if-no-files-found: error
+          compression-level: 0
