@@ -803,6 +803,15 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
 
+    // A failed initial connect (bad endpoint, refused socket) must not leave
+    // the session stuck with no client: retry through the reconnect path.
+    if voice_client().lock().expect("SVC client state poisoned").is_none()
+        && !RECONNECTING.load(Ordering::Acquire)
+        && last_server_info().lock().expect("SVC reconnect state poisoned").is_some()
+    {
+        start_reconnect();
+    }
+
     let playing = game.native_playing();
     if !playing || !game.native_window() {
         PTT_DOWN.store(false, Ordering::Relaxed);
@@ -1042,10 +1051,14 @@ pub fn on_hud(
         } else {
             ("SVC: Connecting", 0xFFCC55)
         }
+    } else if game.remote.is_none() {
+        ("SVC: Not on a server", 0xAAAAAA)
     } else if RECONNECTING.load(Ordering::Acquire) {
         ("SVC: Reconnecting", 0xFFCC55)
-    } else {
+    } else if last_server_info().lock().expect("SVC reconnect state poisoned").is_some() {
         ("SVC: Connecting", 0xFFCC55)
+    } else {
+        ("SVC: No voice chat on this server", 0xAAAAAA)
     };
     game.native_text(batch, label, [8.0, 42.0], color, true);
     let groups = group_state().lock().expect("SVC group state poisoned");
@@ -1145,6 +1158,13 @@ pub fn on_packet(
                     let fallback_host = game.remote.as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
+                    eprintln!(
+                        "[svchorizon] Secret received: voice host '{}' port {} keepalive {}ms groups {} (game address: '{fallback_host}')",
+                        if info.host.is_empty() { "<same as game server>" } else { info.host.as_str() },
+                        info.port,
+                        info.keep_alive_ms,
+                        info.groups
+                    );
                     *last_server_info().lock().expect("SVC reconnect state poisoned") =
                         Some((info.clone(), fallback_host.clone()));
                     let generation = SESSION_GENERATION.load(Ordering::Acquire);

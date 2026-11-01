@@ -272,6 +272,7 @@ impl VoiceClient {
         // treating "24454" as a hostname breaks servers that configure only
         // a custom UDP port.
         let address = resolve_voice_address(&info.host, fallback_host, info.port)?;
+        eprintln!("[svchorizon] Voice endpoint: {address}");
         let bind_address = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let socket = UdpSocket::bind(bind_address)?;
         socket.connect(address)?;
@@ -585,6 +586,7 @@ fn run_worker(
     let mut decoders: HashMap<[u8; 16], OpusDecoder> = HashMap::new();
     let mut jitter = AudioJitterBuffer::default();
     let mut authenticated = false;
+    let mut auth_attempts = 0u32;
     let mut validated = false;
     let mut sequence = 0i64;
     let mut last_auth: Option<Instant> = None;
@@ -631,6 +633,12 @@ fn run_worker(
                 player: info.player,
                 secret: info.secret,
             });
+            auth_attempts += 1;
+            if auth_attempts % 5 == 0 {
+                eprintln!(
+                    "[svchorizon] Voice server has not answered {auth_attempts} authentication attempts yet (voice UDP port blocked or wrong endpoint?)"
+                );
+            }
             last_auth = Some(Instant::now());
         } else if authenticated && !validated
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
@@ -653,6 +661,7 @@ fn run_worker(
                 match packet {
                     Packet::AuthenticateAck => {
                         authenticated = true;
+                        auth_attempts = 0;
                         last_check = None;
                     }
                     Packet::ConnectionCheckAck => {
@@ -778,12 +787,21 @@ fn run_audio_io(
                 None => host.default_input_device(),
             };
             match input {
-                Some(device) => match build_input_stream(&device, command_tx.clone(), Arc::clone(&transmitting),
-                    Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
-                    Arc::clone(&microphone_gain), events.clone()) {
-                    Ok(stream) => match stream.play() { Ok(()) => streams.push(stream), Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {err}"))); } },
-                    Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("microphone unavailable: {err}"))); }
-                },
+                Some(device) => {
+                    let name = device.name().unwrap_or_else(|_| "<unknown>".into());
+                    match build_input_stream(&device, command_tx.clone(), Arc::clone(&transmitting),
+                        Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+                        Arc::clone(&microphone_gain), events.clone()) {
+                        Ok(stream) => match stream.play() {
+                            Ok(()) => {
+                                eprintln!("[svchorizon] Microphone opened: {name}");
+                                streams.push(stream);
+                            }
+                            Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {err}"))); }
+                        },
+                        Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("microphone unavailable: {err}"))); }
+                    }
+                }
                 None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default microphone device".into())); }
             }
             let output = match selected.output.as_deref() {
@@ -792,11 +810,20 @@ fn run_audio_io(
                 None => host.default_output_device(),
             };
             match output {
-                Some(device) => match build_output_stream(&device, Arc::clone(&shared_rx), events.clone(),
-                    Arc::clone(&listener), Arc::clone(&player_audio_settings)) {
-                    Ok(stream) => match stream.play() { Ok(()) => streams.push(stream), Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {err}"))); } },
-                    Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("speaker unavailable: {err}"))); }
-                },
+                Some(device) => {
+                    let name = device.name().unwrap_or_else(|_| "<unknown>".into());
+                    match build_output_stream(&device, Arc::clone(&shared_rx), events.clone(),
+                        Arc::clone(&listener), Arc::clone(&player_audio_settings)) {
+                        Ok(stream) => match stream.play() {
+                            Ok(()) => {
+                                eprintln!("[svchorizon] Speaker opened: {name}");
+                                streams.push(stream);
+                            }
+                            Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {err}"))); }
+                        },
+                        Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("speaker unavailable: {err}"))); }
+                    }
+                }
                 None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default speaker device".into())); }
             }
             active_selection = Some(selected);

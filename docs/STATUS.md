@@ -37,6 +37,7 @@ Last updated: 2026-11-01.
 ## Still missing before a complete Simple Voice Chat client
 
 - [x] Real Paper interoperability test against the official plugin: the protocol crate now completes the full official handshake/auth/keepalive/microphone flow against a live Paper 26.3 server running unmodified `voicechat-bukkit-2.6.27` (see "Live interop validation").
+- [x] The vendored engine's `VoiceClient` (the code the game runs) passes the same live-server handshake, validation and keepalive flow, including the empty-voice_host fallback (see "Live engine validation").
 - [ ] Two-client audio relay test (a second client actually hearing the first) and cross-talk with official Fabric/Forge/NeoForge clients on the same server.
 - [ ] Run the manual GitHub Actions workflow on CI runners (Windows engine compile + packaging matrix); the source is now build-validated locally (see below).
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
@@ -96,6 +97,26 @@ microphone packets for five seconds and exits 0. This validates the TCP
 handshake, secret decoding, AES-GCM transport, UDP authentication, connection
 validation and keepalive path against the real plugin — it does not yet prove
 two-client audio relay (needs a second voice client on the server).
+
+## Live engine validation (2026-11-01, branch ci/windows-game-build)
+
+`tools/engine-harness` (standalone, excluded from the workspace like the
+engine itself) repeats the same live-server flow but drives the session with
+`svchorizon_engine::voice::VoiceClient` — the exact code the compiled game
+runs — including the empty-`voice_host` fallback to the game server address.
+Reproduce: boot the server as above, then `cargo run --release
+--manifest-path tools/engine-harness/Cargo.toml`.
+
+Observed, unedited: the engine reports `VoiceEvent::Connected` and the plugin
+logs the same authentication/validation lines as above, then answers
+keepalives for six seconds with no disconnect (exit 0). The sandbox has no
+sound devices, so the engine's expected `AudioUnavailable` events for the
+default microphone and speaker appear; every other path is the one the game
+runs. The mod's in-game diagnosis paths were extended the same day: the game
+log now shows the resolved voice endpoint, unanswered-authentication warnings,
+microphone/speaker device names, and the HUD distinguishes "Not on a server",
+"No voice chat on this server", "Connecting" and "Reconnecting"; a failed
+initial connect now retries through the reconnect path instead of stalling.
 
 ## Validation policy
 

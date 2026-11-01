@@ -7,4 +7,5 @@ mixins/svchorizon/engine/Cargo.lock
 mixins/svchorizon/engine/src/
 mixins/svchorizon/engine/tests/
 mixins/svchorizon/engine/target/
+tools/engine-harness/target/
 mixins/svchorizon/engine/COPYING
