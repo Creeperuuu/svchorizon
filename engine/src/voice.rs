@@ -271,6 +271,8 @@ pub struct VoiceClient {
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
     icmp_rejections: Arc<AtomicU32>,
+    received_datagrams: Arc<AtomicU32>,
+    rejected_replies: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
     listener: Arc<Mutex<ListenerPose>>,
@@ -327,6 +329,8 @@ impl VoiceClient {
         let connected = Arc::new(AtomicBool::new(false));
         let auth_attempts = Arc::new(AtomicU32::new(0));
         let icmp_rejections = Arc::new(AtomicU32::new(0));
+        let received_datagrams = Arc::new(AtomicU32::new(0));
+        let rejected_replies = Arc::new(AtomicU32::new(0));
 
         let audio_running = Arc::clone(&running);
         let audio_transmitting = Arc::clone(&transmitting);
@@ -355,6 +359,8 @@ impl VoiceClient {
         let worker_connected = Arc::clone(&connected);
         let worker_auth_attempts = Arc::clone(&auth_attempts);
         let worker_icmp_rejections = Arc::clone(&icmp_rejections);
+        let worker_received = Arc::clone(&received_datagrams);
+        let worker_rejected = Arc::clone(&rejected_replies);
         let worker_positions = Arc::clone(&player_positions);
         let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
@@ -362,7 +368,7 @@ impl VoiceClient {
                 run_worker(
                     socket, info, application, command_rx, event_tx, audio_tx,
                     worker_running, worker_transmitting, worker_whispering, worker_voice_activation,
-                    worker_connected, worker_auth_attempts, worker_icmp_rejections, worker_positions,
+                    worker_connected, worker_auth_attempts, worker_icmp_rejections, worker_received, worker_rejected, worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -375,7 +381,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts, icmp_rejections,
+            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts, icmp_rejections, received_datagrams, rejected_replies,
             worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
             audio_devices, endpoint: address,
         })
@@ -438,6 +444,12 @@ impl VoiceClient {
     pub fn icmp_rejections(&self) -> u32 {
         self.icmp_rejections.load(Ordering::Relaxed)
     }
+
+    /// Datagrams received from the voice server, and how many of them were
+    /// rejected as undecodable. Non-zero received with an unauthenticated client
+    /// means the server IS answering and the reply is being refused locally.
+    pub fn received_datagrams(&self) -> u32 { self.received_datagrams.load(Ordering::Relaxed) }
+    pub fn rejected_replies(&self) -> u32 { self.rejected_replies.load(Ordering::Relaxed) }
 
     pub fn is_transmitting(&self) -> bool {
         self.transmitting.load(Ordering::Relaxed)
@@ -647,6 +659,8 @@ fn run_worker(
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
     icmp_rejections: Arc<AtomicU32>,
+    received_datagrams: Arc<AtomicU32>,
+    rejected_replies: Arc<AtomicU32>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
 ) {
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
@@ -727,7 +741,12 @@ fn run_worker(
             if attempts == 15 {
                 let peer = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".into());
                 let rejections = icmp_rejections.load(Ordering::Relaxed);
-                if rejections > 0 {
+                let replies = received_datagrams.load(Ordering::Relaxed);
+                if replies > 0 {
+                    eprintln!(
+                        "[svchorizon] The voice server at {peer} DID send {replies} datagram(s) back, so the network path works; the replies are being refused locally (see the 'rejected it' lines above for the reason)."
+                    );
+                } else if rejections > 0 {
                     eprintln!(
                         "[svchorizon] The host of {peer} answered {rejections} datagram(s) with an ICMP port-unreachable: the machine is reachable but NOTHING IS LISTENING on that UDP port. The Simple Voice Chat server is not bound to it, or the hosting panel/NAT does not map that UDP port to the server. Check the plugin's `port` setting and the server's network allocations (UDP)."
                     );
@@ -759,8 +778,20 @@ fn run_worker(
 
         match socket.recv(&mut receive) {
             Ok(length) => {
-                let Some(packet) = decode_server_datagram(&receive[..length], &info.secret) else {
-                    continue;
+                let received = received_datagrams.fetch_add(1, Ordering::Relaxed) + 1;
+                let packet = match decode_server_datagram_checked(&receive[..length], &info.secret) {
+                    Ok(packet) => packet,
+                    Err(reason) => {
+                        let rejected = rejected_replies.fetch_add(1, Ordering::Relaxed) + 1;
+                        if rejected <= 3 {
+                            let head: Vec<String> = receive[..length.min(8)].iter().map(|b| format!("{b:02x}")).collect();
+                            eprintln!(
+                                "[svchorizon] Received a {length}-byte datagram from the voice server but rejected it: {reason} (first bytes {}; reply #{received})",
+                                head.join(" ")
+                            );
+                        }
+                        continue;
+                    }
                 };
                 match packet {
                     Packet::AuthenticateAck => {
@@ -1356,16 +1387,27 @@ fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> R
     Ok(())
 }
 
-fn decode_server_datagram(datagram: &[u8], secret: &[u8; 16]) -> Option<Packet> {
+/// Decode a server datagram, or say why it cannot be used. The reason is only
+/// for diagnostics: a server that answers but whose reply we reject looks
+/// exactly like a silent network from the outside.
+fn decode_server_datagram_checked(datagram: &[u8], secret: &[u8; 16]) -> Result<Packet, &'static str> {
     let mut reader = Reader::new(datagram);
-    if reader.u8()? != MAGIC { return None; }
-    let encrypted = reader.byte_array(MAX_DATAGRAM)?;
-    if !reader.done() || encrypted.len() < NONCE_BYTES + TAG_BYTES { return None; }
-    let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES].try_into().ok()?;
+    if reader.u8() != Some(MAGIC) { return Err("bad magic byte"); }
+    let Some(encrypted) = reader.byte_array(MAX_DATAGRAM) else { return Err("bad length prefix"); };
+    if !reader.done() { return Err("trailing bytes after the payload"); }
+    if encrypted.len() < NONCE_BYTES + TAG_BYTES { return Err("payload shorter than IV + GCM tag"); }
+    let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES].try_into().map_err(|_| "bad IV")?;
     let mut plaintext = encrypted[NONCE_BYTES..].to_vec();
-    let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, secret).ok()?);
-    let opened = key.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut plaintext).ok()?;
-    decode_packet(opened)
+    let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, secret).map_err(|_| "bad key")?);
+    let opened = key
+        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut plaintext)
+        .map_err(|_| "AES-GCM authentication failed (the reply was not encrypted with our secret)")?;
+    decode_packet(opened).ok_or("decrypted, but the packet body is malformed or unknown")
+}
+
+#[cfg(test)]
+fn decode_server_datagram(datagram: &[u8], secret: &[u8; 16]) -> Option<Packet> {
+    decode_server_datagram_checked(datagram, secret).ok()
 }
 
 fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
@@ -1476,6 +1518,44 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A datagram the way the server writes it (NetworkMessage.writeServer):
+    /// magic, then a VarInt-prefixed `IV || AES-GCM(type || body) || tag`.
+    fn server_datagram(secret: &[u8; 16], plain: &[u8]) -> Vec<u8> {
+        let nonce = [7u8; NONCE_BYTES];
+        let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, secret).unwrap());
+        let mut sealed = plain.to_vec();
+        key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut sealed).unwrap();
+        let mut body = nonce.to_vec();
+        body.extend_from_slice(&sealed);
+        let mut datagram = vec![MAGIC];
+        write_byte_array(&mut datagram, &body);
+        datagram
+    }
+
+    #[test]
+    fn server_replies_are_decoded_or_rejected_with_a_reason() {
+        let secret = [3u8; 16];
+        let ack = server_datagram(&secret, &[AUTHENTICATE_ACK]);
+        assert!(matches!(decode_server_datagram_checked(&ack, &secret), Ok(Packet::AuthenticateAck)));
+
+        let mut wrong_magic = ack.clone();
+        wrong_magic[0] = 0x00;
+        assert_eq!(decode_server_datagram_checked(&wrong_magic, &secret).unwrap_err(), "bad magic byte");
+
+        // Encrypted with a different secret: the failure that makes a working
+        // server look dead (stale or mismatched secret).
+        let other = server_datagram(&[9u8; 16], &[AUTHENTICATE_ACK]);
+        assert!(decode_server_datagram_checked(&other, &secret).unwrap_err().starts_with("AES-GCM authentication failed"));
+
+        let mut trailing = ack.clone();
+        trailing.push(0);
+        assert_eq!(decode_server_datagram_checked(&trailing, &secret).unwrap_err(), "trailing bytes after the payload");
+        assert!(decode_server_datagram_checked(&[MAGIC], &secret).is_err());
+
+        let unknown = server_datagram(&secret, &[0x7e]);
+        assert!(decode_server_datagram_checked(&unknown, &secret).unwrap_err().starts_with("decrypted, but"));
+    }
 
     #[test]
     fn a_real_closed_udp_port_is_classified_as_an_icmp_rejection() {

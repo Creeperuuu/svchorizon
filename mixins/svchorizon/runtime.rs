@@ -57,6 +57,12 @@ static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LOCAL_PLAYER_UUID: OnceLock<Mutex<Option<[u8; 16]>>> = OnceLock::new();
 static LAST_SERVER_INFO: OnceLock<Mutex<Option<(VoiceServerInfo, String)>>> = OnceLock::new();
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
+/// The first connect for the current secret is still starting. The server binds a
+/// player's voice connection to the first UDP source address that authenticates
+/// and sends every later reply there, so a second socket started for the same
+/// secret (a reconnect racing the initial connect) is never answered - and can
+/// poison the binding for the real client. Exactly one client per secret.
+static CONNECTING: AtomicBool = AtomicBool::new(false);
 static GROUPS_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUDIO_DEVICE_PREFS: OnceLock<Mutex<(Option<String>, Option<String>)>> = OnceLock::new();
 
@@ -111,6 +117,14 @@ fn start_reconnect() {
                 || SESSION_GENERATION.load(Ordering::Acquire) != generation
             {
                 break;
+            }
+            // Never open a second UDP socket for a secret that already has (or is
+            // about to have) a client: see CONNECTING.
+            if voice_client().lock().expect("SVC client state poisoned").is_some() {
+                break;
+            }
+            if CONNECTING.load(Ordering::Acquire) {
+                continue;
             }
             match VoiceClient::connect(info.clone(), &fallback_host) {
                 Ok(client) => {
@@ -798,6 +812,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
         *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
         RECONNECTING.store(false, Ordering::Release);
+        CONNECTING.store(false, Ordering::Release);
         GROUPS_ENABLED.store(false, Ordering::Release);
         return;
     }
@@ -807,6 +822,7 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     // the session stuck with no client: retry through the reconnect path.
     if voice_client().lock().expect("SVC client state poisoned").is_none()
         && !RECONNECTING.load(Ordering::Acquire)
+        && !CONNECTING.load(Ordering::Acquire)
         && last_server_info().lock().expect("SVC reconnect state poisoned").is_some()
     {
         start_reconnect();
@@ -1043,7 +1059,11 @@ pub fn on_hud(
         if !client.is_connected() && client.unanswered_auth_attempts() >= 15 {
             // Never mask an unreachable voice server behind "Transmitting":
             // packets are being dropped before they can reach anyone.
-            if client.icmp_rejections() > 0 {
+            if client.received_datagrams() > 0 {
+                // The server IS answering; the reply is refused locally (the log
+                // has the reason).
+                ("SVC: Server replies but the reply was rejected (see log)", 0xFF5555)
+            } else if client.icmp_rejections() > 0 {
                 // The host replied with ICMP port-unreachable: reachable, but
                 // nothing is listening on the voice UDP port.
                 ("SVC: Voice port closed on server (nothing listening)", 0xFF5555)
@@ -1155,6 +1175,7 @@ pub fn on_packet(
             *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
             *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
             RECONNECTING.store(false, Ordering::Release);
+            CONNECTING.store(false, Ordering::Release);
             GROUPS_ENABLED.store(false, Ordering::Release);
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
@@ -1200,7 +1221,8 @@ pub fn on_packet(
                     *last_server_info().lock().expect("SVC reconnect state poisoned") =
                         Some((info.clone(), fallback_host.clone()));
                     let generation = SESSION_GENERATION.load(Ordering::Acquire);
-                    let _ = thread::Builder::new().name("svchorizon-connect".into()).spawn(move || {
+                    CONNECTING.store(true, Ordering::Release);
+                    let spawned = thread::Builder::new().name("svchorizon-connect".into()).spawn(move || {
                         match VoiceClient::connect(info, &fallback_host) {
                             Ok(client) => {
                                 apply_player_controls(&client);
@@ -1212,7 +1234,13 @@ pub fn on_packet(
                             }
                             Err(error) => eprintln!("[svchorizon] Could not start voice connection: {error}"),
                         }
+                        if SESSION_GENERATION.load(Ordering::Acquire) == generation {
+                            CONNECTING.store(false, Ordering::Release);
+                        }
                     });
+                    if spawned.is_err() {
+                        CONNECTING.store(false, Ordering::Release);
+                    }
                 }
                 None => eprintln!("[svchorizon] Rejected malformed voicechat:secret payload."),
             }

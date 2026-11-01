@@ -124,6 +124,34 @@ elsewhere), instead of swallowing them:
   allowing inbound UDP on that port, or local filtering). HUD: "Voice server
   unreachable (UDP dropped)".
 
+## Port open and official voice works, yet no answer (2026-11-01)
+
+The wire was re-audited against the 2.6.28 server for both the common and the
+Bukkit/Paper builds: magic byte, raw player UUID, VarInt-prefixed
+`IV(12) || AES-128-GCM(type || body) || tag(16)`, no AAD, and the SecretPacket
+field order all match the engine. The server silently drops (debug log only) any
+datagram with a bad magic byte, an unknown player UUID or a failed decrypt, so a
+mismatch there is indistinguishable from a dead network from the client side.
+
+Server behaviour that matters (Server.java, AuthenticatePacket branch): the
+player's connection is bound to the first UDP source address that authenticates,
+and every later AuthenticateAck is sent to that stored address, not to the
+sender. `generateNewSecret` ignores a second secret request while a secret
+exists. A player therefore gets exactly one UDP socket per login session; a
+second socket for the same secret is never answered.
+
+Bug found in the mod: after the secret arrived, `on_tick` saw "no client yet but
+server info exists" and started `start_reconnect`, which opened a second socket
+one second later (the second "Voice endpoint" line with a single "Secret
+received" in the log). Fixed with a `CONNECTING` flag; the reconnect thread now
+never opens a socket while a client exists or is starting.
+
+New diagnostics: every server datagram is counted, and one that cannot be used is
+logged with the reason (bad magic, bad length, wrong secret/GCM failure, unknown
+packet). HUD states after 15 unanswered attempts: "Server replies but the reply
+was rejected", "Voice port closed on server", "Voice server unreachable (UDP
+dropped)".
+
 ## Compatibility pin
 
 The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.
