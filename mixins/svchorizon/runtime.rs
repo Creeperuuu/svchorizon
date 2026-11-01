@@ -1065,6 +1065,16 @@ pub fn on_hud(
         ("SVC: No voice chat on this server", 0xAAAAAA)
     };
     game.native_text(batch, label, [8.0, 42.0], color, true);
+    if let Some(client) = guard.as_ref()
+        && !client.is_connected()
+        && client.unanswered_auth_attempts() >= 15
+    {
+        // Show where voice is being sent so it can be compared with the
+        // server's real address and voice port.
+        let note = format!("-> {}", client.endpoint());
+        let x = 8.0 + game.native_text_width(label) + 6.0;
+        game.native_text(batch, &note, [x, 42.0], 0xAAAAAA, true);
+    }
     let groups = group_state().lock().expect("SVC group state poisoned");
     let group_label = if !GROUPS_ENABLED.load(Ordering::Acquire) {
         "SVC Group: disabled by server".to_owned()
@@ -1159,15 +1169,26 @@ pub fn on_packet(
                         if state.players.is_empty() { state.selected_player = 0; }
                         else { state.selected_player %= state.players.len(); }
                     }
-                    let fallback_host = game.remote.as_ref()
+                    // The official client sends voice to the remote address of the
+                    // connection it actually made when voice_host is empty (after
+                    // SRV redirects and DNS), not to the name the player typed,
+                    // which can resolve to a different machine. Fall back to the
+                    // typed address only if the socket address is unavailable.
+                    let typed_address = game.remote.as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
+                    let peer_address = game.remote.as_ref()
+                        .and_then(|remote| horizon_client::net::svchorizon_net::peer_address(&remote.session));
+                    let fallback_host = peer_address
+                        .map(|peer| peer.to_string())
+                        .unwrap_or_else(|| typed_address.clone());
                     eprintln!(
-                        "[svchorizon] Secret received: voice host '{}' port {} keepalive {}ms groups {} (game address: '{fallback_host}')",
+                        "[svchorizon] Secret received: voice host '{}' port {} keepalive {}ms groups {} (typed address: '{typed_address}', connected peer: {})",
                         if info.host.is_empty() { "<same as game server>" } else { info.host.as_str() },
                         info.port,
                         info.keep_alive_ms,
-                        info.groups
+                        info.groups,
+                        peer_address.map_or_else(|| "<unknown>".to_owned(), |peer| peer.to_string())
                     );
                     *last_server_info().lock().expect("SVC reconnect state poisoned") =
                         Some((info.clone(), fallback_host.clone()));

@@ -271,6 +271,7 @@ pub struct VoiceClient {
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
     audio_devices: Arc<RwLock<AudioDeviceSelection>>,
+    endpoint: SocketAddr,
 }
 
 impl VoiceClient {
@@ -368,9 +369,12 @@ impl VoiceClient {
             command_tx, event_rx, running, transmitting, whispering,
             voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts,
             worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
-            audio_devices,
+            audio_devices, endpoint: address,
         })
     }
+
+    /// The voice server UDP endpoint this client sends to.
+    pub fn endpoint(&self) -> SocketAddr { self.endpoint }
 
     /// Enumerate available local microphone devices.
     pub fn input_devices() -> Vec<String> {
@@ -546,11 +550,29 @@ fn resolve_voice_address(
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    (host.as_str(), port)
+    let candidates: Vec<SocketAddr> = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(VoiceError::Io)?
-        .next()
+        .collect();
+    if candidates.len() > 1 {
+        eprintln!("[svchorizon] {host} resolves to {candidates:?}");
+    }
+    pick_preferred_address(&candidates)
         .ok_or_else(|| VoiceError::Resolve(format!("{host}:{port}")))
+}
+
+/// Pick the address to send voice datagrams to. IPv4 wins whenever the host has
+/// one, like the official client (Java prefers IPv4 by default) and like
+/// Horizon's own TCP connection (`ipv4_first`). The OS resolver may list an
+/// AAAA address first on dual-stack hosts, and Simple Voice Chat servers
+/// commonly listen on IPv4 only, so taking the first entry blindly can send
+/// every authentication datagram into the void.
+fn pick_preferred_address(candidates: &[SocketAddr]) -> Option<SocketAddr> {
+    candidates
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or_else(|| candidates.first())
+        .copied()
 }
 
 /// Split a Minecraft-style host authority without accidentally treating the
@@ -1418,6 +1440,32 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_endpoint_prefers_ipv4_over_an_earlier_ipv6_address() {
+        let v6: SocketAddr = "[2001:db8::1]:24454".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.7:24454".parse().unwrap();
+        let other_v4: SocketAddr = "192.0.2.8:24454".parse().unwrap();
+        // IPv6 listed first (common on Windows dual-stack lookups): IPv4 still wins.
+        assert_eq!(pick_preferred_address(&[v6, v4, other_v4]), Some(v4));
+        // Only IPv6 available: use it rather than fail.
+        assert_eq!(pick_preferred_address(&[v6]), Some(v6));
+        assert_eq!(pick_preferred_address(&[]), None);
+    }
+
+    #[test]
+    fn peer_socket_address_text_is_accepted_as_the_game_server_host() {
+        // The mod passes the real connected peer (`SocketAddr::to_string()`) as
+        // the fallback host; both families must keep their voice UDP port.
+        assert_eq!(
+            resolve_voice_address("", "203.0.113.9:25565", 24454).unwrap(),
+            "203.0.113.9:24454".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_voice_address("", "[2001:db8::9]:25565", 24454).unwrap(),
+            "[2001:db8::9]:24454".parse::<SocketAddr>().unwrap()
+        );
+    }
 
     #[test]
     fn voice_error_reports_connection_reset_only_for_io_errors() {

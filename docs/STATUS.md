@@ -68,6 +68,41 @@ wire): framing, `MicPacket`, `PlayerSoundPacket`, `GroupSoundPacket`,
 2048-byte datagram limits, and the 12-byte-IV AES-GCM envelope all match the
 engine's codec.
 
+## Voice endpoint selection and server versions (2026-11-01)
+
+Symptom on a 1.21.11 server: the HUD reached "Voice server unreachable (UDP
+blocked?)" after "Connecting". That state is only reachable after the secret
+packet was received and decoded, so the Minecraft version is not the cause.
+
+Version findings (upstream `henkelmax/simple-voice-chat`):
+- The wire is selected by the Simple Voice Chat *compatibility version*, not the
+  Minecraft version. Every 2.6.x branch (1.19.2 through 26.1, 1.21.11 and 26.3,
+  all 2.6.28) is compat 20, and the wire files are byte-identical between the
+  1.21.11 and 26.3 builds. This mod speaks compat 20 and therefore works with
+  any 2.6.x plugin or mod regardless of the server's Minecraft version.
+- Only the 2.7.0-pre1 line is compat 21 (new handshake). Not supported yet.
+- A server that sees a different compat version sends no secret, only a chat
+  message, so a client cannot learn the server's version from the handshake.
+
+Two real differences from the official client were fixed:
+1. UDP endpoint address family: the first DNS result was used, which on a
+   dual-stack host can be an AAAA address the (IPv4-only) voice server never
+   answers. IPv4 is now preferred, like Java and like Horizon's own TCP code.
+2. Empty `voice_host`: the typed server name was used. The official client uses
+   the remote address of the connection it made (after SRV redirects), which can
+   be a different machine. Two small support modules
+   (`svchorizon_peer` in horizon-protocol `connection.rs`, `svchorizon_net` in
+   horizon-client `net.rs`) expose the real peer address; it is used first and the
+   typed name is only a fallback.
+
+The HUD now shows `-> ip:port` next to the unreachable message and the log prints
+every resolved address, the typed address and the connected peer.
+
+Validated here: engine tests (84), `horizon-mixins apply` on the pinned Horizon,
+and `cargo check` of the staged `horizon-client` (whole game plus mod) with
+Rust 1.95.0. Not validated: a live server. If it is still unreachable the voice
+UDP port is almost certainly not open or forwarded on the host.
+
 ## Compatibility pin
 
 The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.

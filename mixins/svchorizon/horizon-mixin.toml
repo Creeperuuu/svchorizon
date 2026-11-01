@@ -85,3 +85,21 @@ id = "remote-positions"
 file = "crates/horizon-client/src/game/remote.rs"
 name = "svchorizon_voice"
 source = "remote.rs"
+
+# The real remote address of the game's TCP connection (the SRV target, not the
+# typed name), which is where an official client sends voice when the server's
+# voice_host is empty. Two support modules, because the stream is private to the
+# protocol crate and the session's writer is private to net.rs.
+[[module]]
+id = "protocol-peer"
+file = "crates/horizon-protocol/src/connection.rs"
+name = "svchorizon_peer"
+source = "peer_protocol.rs"
+visibility = "pub"
+
+[[module]]
+id = "net-peer"
+file = "crates/horizon-client/src/net.rs"
+name = "svchorizon_net"
+source = "peer_net.rs"
+visibility = "pub"
