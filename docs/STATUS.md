@@ -8,6 +8,7 @@ Last updated: 2026-11-01.
 - [x] Minecraft VarInt, UUID, byte-array, integer, float and double primitives.
 - [x] AES-128-GCM using Horizon's existing `ring` dependency (random 12-byte IV + authenticated ciphertext).
 - [x] Official client/server UDP datagram envelopes and packet framing.
+- [x] Cross-generation protocol support: the client detects and speaks both deployed Simple Voice Chat wire generations - compatibility 20 (SVC 2.6.x) and compatibility 21 (SVC 2.7.x, connection-UUID envelopes with nonce-challenge validation) - so older and newer servers work without any single-version workaround.
 - [x] Authentication, connection-check, keepalive, ping, microphone and player/group/location sound packet codecs.
 - [x] TCP `voicechat:request_secret` payload and `voicechat:secret` metadata decoder.
 - [x] Official group create/join/leave request codecs and joined/add/remove group response decoders.
@@ -17,6 +18,7 @@ Last updated: 2026-11-01.
 - [x] Native group discovery, group cycling, quick-create, join-public-group and leave-group keybinds, plus native chat commands for listing groups, joining password-protected groups and creating named/passworded NORMAL, OPEN or ISOLATED groups.
 - [x] Native Horizon packet hook sends the request on play login and consumes the server's secret response.
 - [x] UDP worker with authentication retry, connection validation, ping echo, keepalive response and timeout handling.
+- [x] Voice endpoint candidate rotation: every address the voice host resolves to (dual-stack A/AAAA or multi-record) is tried in turn while authentication goes unanswered, on a connectionless socket shared by both families.
 - [x] Automatic voice UDP reconnect worker with exponential backoff, session-generation checks and preserved per-player audio controls.
 - [x] Vendored pure-Rust Opus encoder/decoder, with tests for 48 kHz 20 ms VOIP frames and all upstream codec modes.
 - [x] CPAL microphone capture and speaker playback with local input/output device enumeration, F6/F7 device cycling, safe stream restart and default-device fallback.
@@ -40,7 +42,7 @@ Last updated: 2026-11-01.
 - [x] Real Paper interoperability test against the official plugin: the protocol crate now completes the full official handshake/auth/keepalive/microphone flow against a live Paper 26.3 server running unmodified `voicechat-bukkit-2.6.27` (see "Live interop validation").
 - [x] The vendored engine's `VoiceClient` (the code the game runs) passes the same live-server handshake, validation and keepalive flow, including the empty-voice_host fallback (see "Live engine validation").
 - [ ] Two-client audio relay test (a second client actually hearing the first) and cross-talk with official Fabric/Forge/NeoForge clients — on a server whose voice UDP port is confirmed open (see "First live-server runtime test").
-- [x] Run the manual GitHub Actions workflow on CI runners: the `Build game (Windows)` workflow produced a working exe (2026-11-01); the Linux native-mixin and packaging jobs run on every push.
+- [x] Run the manual GitHub Actions workflow on CI runners: the `Build game (Windows)` workflow produced a working exe (2026-11-01); the Linux native-mixin check runs on every push, the full matrix and packaging stay manual to save Windows runner minutes.
 - [ ] Adaptive jitter delay and end-to-end packet scheduling validation. Short-loss Opus PLC and bounded sequence reordering are implemented; long loss bursts still skip to the next available frame.
 - [ ] Group invites, persistent group settings and a full graphical group UI. Password entry and custom group names/types are available through `/svchorizon group` chat commands; basic discovery/cycling and quick controls remain keybind-driven.
 - [ ] Remaining TCP custom payloads for recording-related controls and any newly introduced upstream extensions. Player-state and volume-category payloads are now decoded; the official UDP microphone/player/group/location sound variants and connection packets are implemented.
@@ -51,14 +53,14 @@ Last updated: 2026-11-01.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.
+The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client advertises Simple Voice Chat compatibility version **20** and **21**: on every join both generations are probed (the server answers only the request whose number matches its own plugin build), and the UDP layer switches to the matching wire format. Compat 20 is the release line published for Minecraft 1.12.2 through the current 1.21.x/26.x servers (`voicechat-bukkit-2.6.27` and friends); compat 21 is upstream 2.7.x. This is a property of the server's plugin build, not of one Minecraft version, so probing both covers older and newer servers alike.
 
 ## Interop-critical wire details (verified against the 2.6.27 plugin jar and a live server)
 
 - The client sends `minecraft:register` with every `voicechat:*` channel before requesting the secret; Bukkit/Paper deliver payloads only to channels the client registered.
-- The `voicechat:secret` payload (compatibility 20) has **no** connection UUID: secret, port, player UUID, codec, mtu, distance, keepalive, groups, host, recording. Upstream 2.7.0-pre1 inserts a server-assigned connection UUID after the secret.
-- Every client UDP datagram prefixes the **player's own profile UUID**; the plugin keeps its per-player AES secrets in a map keyed by `player.getUniqueId()` and resolves the key with that UUID (verified by decompiling `NetworkMessage.readPacketServer` and `ServerVoiceEvents.initializePlayerConnection` in the shipped jar).
-- `AuthenticatePacket` (0x05) carries the player UUID followed by the raw 16-byte secret; `AuthenticateAckPacket`, `ConnectionCheckPacket` and `ConnectionCheckAckPacket` are empty in 2.6.27 (the nonce-carrying variants exist only in upstream 2.7.0-pre1).
+- The `voicechat:secret` payload (compatibility 20) has **no** connection UUID: secret, port, player UUID, codec, mtu, distance, keepalive, groups, host, recording. Compat 21 (SVC 2.7.x) inserts a server-assigned connection UUID after the secret; the client decodes both layouts strictly and picks the one that parses.
+- Every client UDP datagram prefixes the **player's own profile UUID** on compat-20 servers; the plugin keeps its per-player AES secrets in a map keyed by `player.getUniqueId()` and resolves the key with that UUID (verified by decompiling `NetworkMessage.readPacketServer` and `ServerVoiceEvents.initializePlayerConnection` in the shipped jar). On compat-21 servers the envelope carries the server-assigned **connection UUID** instead.
+- `AuthenticatePacket` (0x05) carries the player UUID followed by the raw 16-byte secret on compat-20 servers and is empty on compat-21 servers; `AuthenticateAckPacket` (0x06) and `ConnectionCheckPacket` (0x09) are empty on compat-20 servers, while compat-21 servers hand out a 16-byte HMAC nonce in the ack that the client must echo in the connection check from the same source address (upstream `Server.createNonce` binds it to connectionId + client socket address).
 - AES-128-GCM with a random 12-byte IV prefix and 128-bit tag, exactly as implemented (`Secret.IV_SIZE_BYTES = 12` in the jar).
 - The command registration hook (`native_commands`) does not exist at the pinned Horizon commit (hooks API 3), so `/svchorizon` runs through the `native_command` hook alone; chat feedback uses `native_chat`.
 
@@ -161,11 +163,41 @@ outbound TCP keeps working while UDP reply flows are dropped), or a
 process-level UDP receive restriction. Client-side changes shipped with this
 diagnosis: a localhost UDP self-test at connect (proves the game process can
 receive UDP at all), the unanswered-attempt count surfaced on the HUD
-(`SVC: Voice server unreachable (UDP blocked?)` in red after 15 s, taking
+(a red `SVC: Voice server not responding` after 15 s, taking
 precedence over the misleading "Transmitting" label), send failures logged
 with Windows WSAECONNRESET/ICMP noise filtered, a stray ConnectionReset no
 longer tears down the UDP worker, and a one-time log line at 15 s naming the
 firewall/AV check and the hosting-panel port-forwarding fallback.
+
+## Cross-generation and endpoint-rotation hardening (2026-11-01, branch ci/windows-game-build)
+
+After the first third-party runtime test, the client was extended along two
+independent axes, both verified against upstream source (the `2.6.x/*`
+branches and the 2.7.0-pre1 release branches of henkelmax/simple-voice-chat):
+
+- **Both wire generations.** The plugin-channel secret request now probes
+  compatibility 20 and 21 (only the number the server accepts gets a
+  response), the secret payload decodes under both layouts, and the UDP
+  layer switches per generation: envelope UUID (player vs connection),
+  Authenticate payload (player+secret vs empty) and the 2.7.x nonce
+  challenge (AuthenticateAck carries a 16-byte nonce echoed in
+  ConnectionCheck). A session remembers the generation that answered and
+  re-probes every 10 s while no server has answered at all. No part of this
+  is keyed to one Minecraft version: it follows the server's plugin build.
+- **Endpoint rotation.** All addresses the voice host resolves to (dual
+  stack or multi-record) become candidates; the worker starts with the
+  first (the address an official client would use) and rotates every 5
+  unanswered seconds, logging each switch. The socket is now
+  connectionless with a dual-stack bind, which also removes the Windows
+  WSAECONNRESET class of failures for connected sockets.
+
+The HUD's 15-second message now says `SVC: Voice server not responding`
+(the previous "UDP blocked?" wording blamed either side before any evidence).
+The build workflow gained a `profile` input (`fast` = Horizon's
+`[profile.fast]`, no LTO / 16 codegen units / incremental, the new default;
+`release` = the shippable thin-LTO build), split cache-restore/save steps
+that persist the cache even when a run fails, a cached `horizon-mixins/target`,
+and the Linux native-mixin check now runs on every push.
 
 ## Validation policy
 

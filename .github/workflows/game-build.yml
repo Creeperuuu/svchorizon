@@ -7,10 +7,26 @@ name: Build game (Windows)
 # game-build.yml Windows matrix (release profile, --locked, the C runtime linked in
 # with crt-static so the game runs without the Visual C++ redistributable).
 # After apply, the staged workspace is a normal Cargo workspace: the game is built
-# from it with a shared --target-dir so the actions/cache below makes later runs
-# rebuild only what changed instead of the whole hour.
+# from it with a shared --target-dir so the caches below make later runs rebuild
+# only what changed instead of the whole hour.
+#
+# Build profiles (workflow input):
+#   fast    - Horizon's own [profile.fast]: same optimization level as release but
+#             no LTO, 16 codegen units and incremental compilation. Much faster to
+#             build and link; ideal for iterating.
+#   release - the shippable profile (thin LTO, single codegen unit). Slower; use
+#             for a final binary.
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile to build horizon-client.exe with"
+        type: choice
+        required: true
+        default: fast
+        options:
+          - fast
+          - release
 
 permissions:
   contents: read
@@ -25,7 +41,7 @@ env:
 
 jobs:
   windows:
-    name: horizon-client.exe (windows x64)
+    name: horizon-client.exe (windows x64, ${{ inputs.profile }})
     runs-on: windows-latest
     timeout-minutes: 240
     defaults:
@@ -34,6 +50,8 @@ jobs:
     env:
       # The C runtime linked in, so the game runs without the Visual C++ redistributable.
       RUSTFLAGS: -C target-feature=+crt-static
+      # API-triggered runs may omit the input; the default keeps them working.
+      BUILD_PROFILE: ${{ inputs.profile || 'fast' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -87,18 +105,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache cargo registry and the game's target directory
-        uses: actions/cache@v4
+      # Restore and save are split so a failed or cancelled run still publishes
+      # the cache it managed to build up; with the single actions/cache@v4 step
+      # a failure threw the whole warm-up away.
+      - name: Restore cargo caches
+        id: restore-caches
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/index
             ~/.cargo/git
             game-target
+            horizon-mixins/target
           # The game target directory is keyed on the pinned Horizon lockfile, not the
           # mod sources: cargo's own fingerprints rebuild only the crates the mod touched.
-          key: horizon-game-win-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}
-          restore-keys: horizon-game-win-1.95.0-${{ env.HORIZON_REVISION }}-
+          # The mixin CLI cache is keyed on the horizon-mixins lockfile.
+          key: horizon-game-win-1.95.0-${{ inputs.profile }}-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}
+          restore-keys: |
+            horizon-game-win-1.95.0-${{ inputs.profile }}-${{ env.HORIZON_REVISION }}-
+            horizon-game-win-1.95.0-fast-${{ env.HORIZON_REVISION }}-
+            horizon-game-win-1.95.0-release-${{ env.HORIZON_REVISION }}-
+            horizon-game-win-1.95.0-
 
       - name: Fetch dependencies
         run: |
@@ -113,15 +141,33 @@ jobs:
           cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- \
             apply --workspace horizon --mods mixins --out game-stage
 
-      - name: Build horizon-client.exe (release)
+      - name: Build horizon-client.exe (${{ inputs.profile }})
         run: |
-          cargo build --release --locked -p horizon-client --bin horizon-client \
-            --manifest-path game-stage/Cargo.toml --target-dir game-target
+          if [ "$BUILD_PROFILE" = "fast" ]; then
+            cargo build --profile fast --locked -p horizon-client --bin horizon-client \
+              --manifest-path game-stage/Cargo.toml --target-dir game-target
+          else
+            cargo build --release --locked -p horizon-client --bin horizon-client \
+              --manifest-path game-stage/Cargo.toml --target-dir game-target
+          fi
 
       - name: The game starts
         run: |
-          test -f game-target/release/horizon-client.exe
-          game-target/release/horizon-client.exe --help | grep -q -- '--resources'
+          test -f "game-target/$BUILD_PROFILE/horizon-client.exe"
+          "game-target/$BUILD_PROFILE/horizon-client.exe" --help | grep -q -- '--resources'
+
+      - name: Save cargo caches
+        # Always, so failed builds still warm the cache for the next attempt.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/index
+            ~/.cargo/git
+            game-target
+            horizon-mixins/target
+          key: ${{ steps.restore-caches.outputs.cache-primary-key }}
 
       - name: Job summary
         if: always()
@@ -131,6 +177,7 @@ jobs:
             echo
             echo "- Horizon: \`${{ env.HORIZON_REVISION }}\`"
             echo "- Mod commit: \`${{ github.sha }}\`"
+            echo "- Profile: \`${{ inputs.profile }}\`"
             echo
             echo "Download the \`horizon-client-windows-x64-svchorizon\` artifact and replace"
             echo "\`horizon-client.exe\` in your Horizon game folder (keep a backup of the original)."
@@ -139,6 +186,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-client-windows-x64-svchorizon
-          path: game-target/release/horizon-client.exe
+          path: game-target/${{ inputs.profile }}/horizon-client.exe
           if-no-files-found: error
           compression-level: 0

@@ -1,13 +1,34 @@
-use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, thread};
-use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
+use std::{
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
+    },
+    thread,
+};
+use svchorizon_engine::voice::{
+    SVC_PROFILES, SvcProfile, VoiceClient, VoiceEvent, VoiceServerInfo,
+};
 
-// Compatibility number of the shipped Simple Voice Chat bukkit plugin for
-// MC 26.3 (2.6.27). Verified against the plugin jar: it logs "Compatibility
-// version 20" and rejects every other value without sending a secret.
-const SVC_COMPATIBILITY_VERSION: i32 = 20;
+// Compatibility numbers of the two Simple Voice Chat wire generations this
+// client speaks. The server silently ignores a request_secret carrying any
+// other value, so both are probed on every join: whichever generation the
+// server runs answers the matching request with its secret payload.
+//
+// Compat 20 = Simple Voice Chat 2.6.x (the release line across Minecraft
+// 1.12.2 up to and including 1.21.x/26.x servers). Compat 21 = Simple Voice
+// Chat 2.7.x (connection UUID + nonce-challenge UDP generation). This is a
+// property of the server's plugin build, not of one Minecraft version, so
+// probing both supports older and newer servers alike.
 const REQUEST_SECRET: &str = "voicechat:request_secret";
 const SECRET: &str = "voicechat:secret";
 const REGISTER: &str = "minecraft:register";
+/// The compatibility number that last produced a secret on this session
+/// (0 = unknown, probe both generations).
+static KNOWN_COMPAT: AtomicI32 = AtomicI32::new(0);
+/// Unix millis of the last secret request; drives the re-probe timer.
+static LAST_SECRET_REQUEST: AtomicU64 = AtomicU64::new(0);
+/// How often a secret request is re-sent while no secret has arrived.
+const SECRET_REQUEST_RETRY_MS: u64 = 10_000;
 /// Every custom-payload channel the official plugin registers (NetManager.init).
 /// Bukkit/Paper deliver a payload only for channels the client registered, so
 /// this must go out before the secret request on every server join.
@@ -31,7 +52,9 @@ const REGISTERED_CHANNELS: &[&str] = &[
 fn register_channels_payload() -> Vec<u8> {
     let mut data = Vec::new();
     for (index, channel) in REGISTERED_CHANNELS.iter().enumerate() {
-        if index > 0 { data.push(0); }
+        if index > 0 {
+            data.push(0);
+        }
         data.extend_from_slice(channel.as_bytes());
     }
     data
@@ -65,8 +88,10 @@ fn audio_device_preferences() -> &'static Mutex<(Option<String>, Option<String>)
 }
 
 fn apply_audio_device_preferences(client: &VoiceClient) {
-    let preferences = audio_device_preferences().lock()
-        .expect("SVC audio preferences poisoned").clone();
+    let preferences = audio_device_preferences()
+        .lock()
+        .expect("SVC audio preferences poisoned")
+        .clone();
     client.set_input_device(preferences.0);
     client.set_output_device(preferences.1);
 }
@@ -82,9 +107,11 @@ fn last_server_info() -> &'static Mutex<Option<(VoiceServerInfo, String)>> {
 fn apply_player_controls(client: &VoiceClient) {
     let controls = {
         let state = group_state().lock().expect("SVC player state poisoned");
-        state.players.iter().map(|player| {
-            (player.id, player.volume, player.ignored)
-        }).collect::<Vec<_>>()
+        state
+            .players
+            .iter()
+            .map(|player| (player.id, player.volume, player.ignored))
+            .collect::<Vec<_>>()
     };
     for (id, volume, ignored) in controls {
         client.set_player_volume(id, volume);
@@ -93,50 +120,57 @@ fn apply_player_controls(client: &VoiceClient) {
 }
 
 fn start_reconnect() {
-    if RECONNECTING.swap(true, Ordering::AcqRel) { return; }
+    if RECONNECTING.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let Some((info, fallback_host)) = last_server_info()
-        .lock().expect("SVC reconnect state poisoned").clone()
+        .lock()
+        .expect("SVC reconnect state poisoned")
+        .clone()
     else {
         RECONNECTING.store(false, Ordering::Release);
         return;
     };
     let generation = SESSION_GENERATION.load(Ordering::Acquire);
-    let spawned = thread::Builder::new().name("svchorizon-reconnect".into()).spawn(move || {
-        let mut delay_seconds = 1u64;
-        while REMOTE_ACTIVE.load(Ordering::Acquire)
-            && SESSION_GENERATION.load(Ordering::Acquire) == generation
-        {
-            thread::sleep(std::time::Duration::from_secs(delay_seconds));
-            if !REMOTE_ACTIVE.load(Ordering::Acquire)
-                || SESSION_GENERATION.load(Ordering::Acquire) != generation
+    let spawned = thread::Builder::new()
+        .name("svchorizon-reconnect".into())
+        .spawn(move || {
+            let mut delay_seconds = 1u64;
+            while REMOTE_ACTIVE.load(Ordering::Acquire)
+                && SESSION_GENERATION.load(Ordering::Acquire) == generation
             {
-                break;
-            }
-            match VoiceClient::connect(info.clone(), &fallback_host) {
-                Ok(client) => {
-                    apply_player_controls(&client);
-                    apply_audio_device_preferences(&client);
-                    if SESSION_GENERATION.load(Ordering::Acquire) == generation
-                        && REMOTE_ACTIVE.load(Ordering::Acquire)
-                    {
-                        let mut slot = voice_client().lock().expect("SVC client state poisoned");
-                        if slot.is_none() {
-                            *slot = Some(client);
-                            eprintln!("[svchorizon] Voice reconnect attempt started.");
-                        }
-                    }
+                thread::sleep(std::time::Duration::from_secs(delay_seconds));
+                if !REMOTE_ACTIVE.load(Ordering::Acquire)
+                    || SESSION_GENERATION.load(Ordering::Acquire) != generation
+                {
                     break;
                 }
-                Err(error) => {
-                    eprintln!("[svchorizon] Voice reconnect failed: {error}");
-                    delay_seconds = (delay_seconds * 2).min(30);
+                match VoiceClient::connect(info.clone(), &fallback_host) {
+                    Ok(client) => {
+                        apply_player_controls(&client);
+                        apply_audio_device_preferences(&client);
+                        if SESSION_GENERATION.load(Ordering::Acquire) == generation
+                            && REMOTE_ACTIVE.load(Ordering::Acquire)
+                        {
+                            let mut slot =
+                                voice_client().lock().expect("SVC client state poisoned");
+                            if slot.is_none() {
+                                *slot = Some(client);
+                                eprintln!("[svchorizon] Voice reconnect attempt started.");
+                            }
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("[svchorizon] Voice reconnect failed: {error}");
+                        delay_seconds = (delay_seconds * 2).min(30);
+                    }
                 }
             }
-        }
-        if SESSION_GENERATION.load(Ordering::Acquire) == generation {
-            RECONNECTING.store(false, Ordering::Release);
-        }
-    });
+            if SESSION_GENERATION.load(Ordering::Acquire) == generation {
+                RECONNECTING.store(false, Ordering::Release);
+            }
+        });
     if spawned.is_err() {
         RECONNECTING.store(false, Ordering::Release);
     }
@@ -213,57 +247,110 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self { Self { bytes, pos: 0 } }
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         let out = self.bytes.get(self.pos..end)?;
         self.pos = end;
         Some(out)
     }
-    fn u8(&mut self) -> Option<u8> { Some(*self.take(1)?.first()?) }
+    fn u8(&mut self) -> Option<u8> {
+        Some(*self.take(1)?.first()?)
+    }
     fn bool(&mut self) -> Option<bool> {
-        match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None }
+        match self.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
     }
     fn optional_string(&mut self, max_chars: usize) -> Option<Option<String>> {
-        if self.bool()? { Some(Some(self.string(max_chars)?)) } else { Some(None) }
+        if self.bool()? {
+            Some(Some(self.string(max_chars)?))
+        } else {
+            Some(None)
+        }
     }
-    fn i16(&mut self) -> Option<i16> { Some(i16::from_be_bytes(self.take(2)?.try_into().ok()?)) }
-    fn i32(&mut self) -> Option<i32> { Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?)) }
-    fn uuid(&mut self) -> Option<[u8; 16]> { self.take(16)?.try_into().ok() }
+    fn i16(&mut self) -> Option<i16> {
+        Some(i16::from_be_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn i32(&mut self) -> Option<i32> {
+        Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn uuid(&mut self) -> Option<[u8; 16]> {
+        self.take(16)?.try_into().ok()
+    }
     fn f64(&mut self) -> Option<f64> {
-        Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?)))
+        Some(f64::from_bits(u64::from_be_bytes(
+            self.take(8)?.try_into().ok()?,
+        )))
     }
     fn varint(&mut self) -> Option<usize> {
         let mut out = 0usize;
         for i in 0..5 {
             let b = self.u8()?;
-            if i == 4 && b & 0xf0 != 0 { return None; }
+            if i == 4 && b & 0xf0 != 0 {
+                return None;
+            }
             out |= usize::from(b & 0x7f).checked_shl(7 * i)?;
-            if b & 0x80 == 0 { return Some(out); }
+            if b & 0x80 == 0 {
+                return Some(out);
+            }
         }
         None
     }
     fn string(&mut self, max_chars: usize) -> Option<String> {
         let len = self.varint()?;
-        if len > max_chars.checked_mul(4)? { return None; }
+        if len > max_chars.checked_mul(4)? {
+            return None;
+        }
         let value = std::str::from_utf8(self.take(len)?).ok()?;
-        if value.chars().count() > max_chars { return None; }
+        if value.chars().count() > max_chars {
+            return None;
+        }
         Some(value.to_owned())
     }
-    fn done(&self) -> bool { self.pos == self.bytes.len() }
+    fn done(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
 }
 
 fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
+    // Compat-20 (Simple Voice Chat 2.6.x) SecretPacket.toBytes order:
+    // secret, port, player, codec, mtu, distance, keepalive, groups, host,
+    // recording. There is no server-assigned connection UUID in this wire
+    // generation: the secret doubles as the UUID that keys every UDP
+    // datagram we send, so the engine derives it from the secret bytes.
+    let mut c = Cursor::new(bytes);
+    if let Some(secret) = c.take(16).and_then(|s| <[u8; 16]>::try_from(s).ok()) {
+        if let Some(info) = finish_secret(&mut c, secret, SvcProfile::Compat20, [0u8; 16]) {
+            return Some(info);
+        }
+    }
+    // Compat-21 (Simple Voice Chat 2.7.x) SecretPacket.toBytes order adds a
+    // server-assigned connection UUID between the secret and the port:
+    // secret, connectionId, port, player, codec, mtu, distance, keepalive,
+    // groups, host, recording. That UUID replaces the player UUID inside
+    // every UDP envelope this generation.
     let mut c = Cursor::new(bytes);
     let secret: [u8; 16] = c.take(16)?.try_into().ok()?;
-    // SecretPacket.toBytes order for SVC 2.6.27 (compatibility 20): secret,
-    // port, player, codec, mtu, distance, keepalive, groups, host, recording.
-    // There is no server-assigned connection UUID in this wire generation: the
-    // secret doubles as the UUID that keys every UDP datagram we send, so the
-    // engine derives it from the secret bytes.
+    let connection_id = c.uuid()?;
+    finish_secret(&mut c, secret, SvcProfile::Compat21, connection_id)
+}
+
+/// Decodes the SecretPacket tail shared by both wire generations, starting
+/// at the port field, and validates the trailing metadata.
+fn finish_secret(
+    c: &mut Cursor<'_>,
+    secret: [u8; 16],
+    profile: svchorizon_engine::voice::SvcProfile,
+    connection_id: [u8; 16],
+) -> Option<VoiceServerInfo> {
     let port = c.i32()?;
     let port = u16::try_from(port).ok().filter(|p| *p != 0)?;
-    let player = c.take(16)?.try_into().ok()?;
+    let player = c.uuid()?;
     let codec = c.u8()?;
     let mtu = c.i32()?;
     let distance = c.f64()?;
@@ -278,6 +365,8 @@ fn decode_secret(bytes: &[u8]) -> Option<VoiceServerInfo> {
         secret,
         port,
         player,
+        profile,
+        connection_id,
         codec,
         mtu,
         distance,
@@ -301,14 +390,26 @@ fn send_client_state(game: &mut crate::game::Game<'_>, muted: bool, disabled: bo
 }
 
 fn send_secret_request(game: &mut crate::game::Game<'_>) {
-    use horizon_protocol::packets::{
-        configuration::CustomPayload,
-        play::Serverbound,
-    };
-    game.send(Serverbound::CustomPayload(CustomPayload {
-        channel: REQUEST_SECRET.to_owned(),
-        data: SVC_COMPATIBILITY_VERSION.to_be_bytes().to_vec(),
-    }));
+    use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
+    // Once a generation is known, ask only for it. Otherwise probe every
+    // supported generation: the server answers only the request whose
+    // compatibility number matches its own and ignores the other.
+    let known = KNOWN_COMPAT.load(Ordering::Acquire);
+    let versions: &[i32] = if known != 0 { &[known] } else { &[20, 21] };
+    for version in versions {
+        game.send(Serverbound::CustomPayload(CustomPayload {
+            channel: REQUEST_SECRET.to_owned(),
+            data: version.to_be_bytes().to_vec(),
+        }));
+    }
+    LAST_SECRET_REQUEST.store(now_millis(), Ordering::Release);
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn write_varint(out: &mut Vec<u8>, mut value: usize) {
@@ -336,7 +437,9 @@ fn create_group_payload(name: &str, password: Option<&str>, group_type: i16) -> 
     let mut data = Vec::new();
     write_utf(&mut data, name);
     data.push(u8::from(password.is_some()));
-    if let Some(password) = password { write_utf(&mut data, password); }
+    if let Some(password) = password {
+        write_utf(&mut data, password);
+    }
     data.extend_from_slice(&group_type.to_be_bytes());
     data
 }
@@ -344,7 +447,9 @@ fn create_group_payload(name: &str, password: Option<&str>, group_type: i16) -> 
 fn join_group_payload(group_id: [u8; 16], password: Option<&str>) -> Vec<u8> {
     let mut data = group_id.to_vec();
     data.push(u8::from(password.is_some()));
-    if let Some(password) = password { write_utf(&mut data, password); }
+    if let Some(password) = password {
+        write_utf(&mut data, password);
+    }
     data
 }
 
@@ -354,7 +459,11 @@ fn send_create_group_custom(
     password: Option<&str>,
     group_type: i16,
 ) {
-    send_group_payload(game, "voicechat:create_group", create_group_payload(name, password, group_type));
+    send_group_payload(
+        game,
+        "voicechat:create_group",
+        create_group_payload(name, password, group_type),
+    );
 }
 
 fn send_create_group(game: &mut crate::game::Game<'_>) {
@@ -367,15 +476,24 @@ fn send_join_group_password(
     password: Option<&str>,
 ) {
     if group.has_password && password.is_none() {
-        game.native_chat("SVC: This group requires a password. Use /svchorizon group join <password>.");
+        game.native_chat(
+            "SVC: This group requires a password. Use /svchorizon group join <password>.",
+        );
         return;
     }
-    send_group_payload(game, "voicechat:set_group", join_group_payload(group.id, password));
+    send_group_payload(
+        game,
+        "voicechat:set_group",
+        join_group_payload(group.id, password),
+    );
 }
 
 fn send_join_group(game: &mut crate::game::Game<'_>, group: &NativeGroup) {
     if group.has_password {
-        group_state().lock().expect("SVC group state poisoned").wrong_password = true;
+        group_state()
+            .lock()
+            .expect("SVC group state poisoned")
+            .wrong_password = true;
         return;
     }
     let mut data = group.id.to_vec();
@@ -388,7 +506,9 @@ fn send_leave_group(game: &mut crate::game::Game<'_>) {
 }
 
 fn command_words(input: &str) -> Option<Vec<String>> {
-    if input.len() > 1024 { return None; }
+    if input.len() > 1024 {
+        return None;
+    }
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -404,22 +524,36 @@ fn command_words(input: &str) -> Option<Vec<String>> {
         } else if ch.is_whitespace() && !quoted {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
-                if words.len() > 8 { return None; }
+                if words.len() > 8 {
+                    return None;
+                }
             }
         } else {
             current.push(ch);
         }
-        if current.chars().count() > 256 { return None; }
+        if current.chars().count() > 256 {
+            return None;
+        }
     }
-    if escaped || quoted { return None; }
-    if !current.is_empty() { words.push(current); }
+    if escaped || quoted {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
     (words.len() <= 8).then_some(words)
 }
 
 pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
-    if !game.native_on("svchorizon") { return; }
-    let Some(words) = command_words(command) else { return; };
-    if words.first().map(String::as_str) != Some("svchorizon") { return; }
+    if !game.native_on("svchorizon") {
+        return;
+    }
+    let Some(words) = command_words(command) else {
+        return;
+    };
+    if words.first().map(String::as_str) != Some("svchorizon") {
+        return;
+    }
     *ran = true;
     if !game.native_playing() || !GROUPS_ENABLED.load(Ordering::Acquire) {
         game.native_chat("SVC: Join a server with Simple Voice Chat enabled first.");
@@ -432,18 +566,34 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
     match words.get(2).map(String::as_str) {
         Some("list") => {
             let state = group_state().lock().expect("SVC group state poisoned");
-            let names = state.groups.iter().filter(|g| !g.hidden)
-                .map(|g| if g.has_password { format!("{} [locked]", g.name) } else { g.name.clone() })
+            let names = state
+                .groups
+                .iter()
+                .filter(|g| !g.hidden)
+                .map(|g| {
+                    if g.has_password {
+                        format!("{} [locked]", g.name)
+                    } else {
+                        g.name.clone()
+                    }
+                })
                 .collect::<Vec<_>>();
-            let message = if names.is_empty() { "SVC: No visible groups.".to_owned() }
-                else { format!("SVC groups: {}", names.join(", ")) };
+            let message = if names.is_empty() {
+                "SVC: No visible groups.".to_owned()
+            } else {
+                format!("SVC groups: {}", names.join(", "))
+            };
             drop(state);
             game.native_chat(&message);
         }
         Some("join") => {
             let selected = {
                 let state = group_state().lock().expect("SVC group state poisoned");
-                state.groups.get(state.selected).filter(|g| !g.hidden).cloned()
+                state
+                    .groups
+                    .get(state.selected)
+                    .filter(|g| !g.hidden)
+                    .cloned()
             };
             match selected {
                 Some(group) => {
@@ -459,21 +609,37 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
         }
         Some("create") => {
             let Some(name) = words.get(3).filter(|name| !name.is_empty()) else {
-                game.native_chat("Usage: /svchorizon group create <name> [password] [normal|open|isolated]");
+                game.native_chat(
+                    "Usage: /svchorizon group create <name> [password] [normal|open|isolated]",
+                );
                 return;
             };
-            let password = words.get(4).filter(|p| p.as_str() != "-").map(String::as_str);
+            let password = words
+                .get(4)
+                .filter(|p| p.as_str() != "-")
+                .map(String::as_str);
             let kind = words.get(5).map(String::as_str).unwrap_or("normal");
-            let group_type = match kind { "normal" => 0, "open" => 1, "isolated" => 2, _ => {
-                game.native_chat("SVC: Group type must be normal, open, or isolated.");
-                return;
-            }};
-            let invalid_name = name.chars().next().is_none_or(|c| c.is_control() || c.is_whitespace())
+            let group_type = match kind {
+                "normal" => 0,
+                "open" => 1,
+                "isolated" => 2,
+                _ => {
+                    game.native_chat("SVC: Group type must be normal, open, or isolated.");
+                    return;
+                }
+            };
+            let invalid_name = name
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_control() || c.is_whitespace())
                 || name.chars().any(|c| c.is_control());
             // Upstream's CreateGroupPacket writes both name and password with
             // MAX_GROUP_NAME_LENGTH (24); JoinGroupPacket allows 256. A create
             // password above 24 would abort the official client's write.
-            if invalid_name || name.chars().count() > 24 || password.is_some_and(|p| p.chars().count() > 24) {
+            if invalid_name
+                || name.chars().count() > 24
+                || password.is_some_and(|p| p.chars().count() > 24)
+            {
                 game.native_chat("SVC: Group names must start with a visible character, contain no control characters, and be 24 characters or fewer; create passwords may be up to 24 characters (join passwords up to 256).");
                 return;
             }
@@ -495,40 +661,73 @@ fn on_group_payload(channel: &str, bytes: &[u8]) {
             } else {
                 Some([0; 16])
             };
-            let Some(wrong_password) = cursor.bool() else { return; };
-            if !cursor.done() { return; }
+            let Some(wrong_password) = cursor.bool() else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
             state.active = group_id.filter(|id| *id != [0; 16]);
             state.wrong_password = wrong_password;
         }
         "voicechat:add_group" => {
-            let Some(id) = cursor.uuid() else { return; };
-            let Some(name) = cursor.string(24) else { return; };
-            let Some(has_password) = cursor.bool() else { return; };
-            let Some(persistent) = cursor.bool() else { return; };
-            let Some(hidden) = cursor.bool() else { return; };
-            let Some(group_type) = cursor.i16() else { return; };
-            if !cursor.done() { return; }
-            let group = NativeGroup { id, name, has_password, persistent, hidden, group_type };
+            let Some(id) = cursor.uuid() else {
+                return;
+            };
+            let Some(name) = cursor.string(24) else {
+                return;
+            };
+            let Some(has_password) = cursor.bool() else {
+                return;
+            };
+            let Some(persistent) = cursor.bool() else {
+                return;
+            };
+            let Some(hidden) = cursor.bool() else {
+                return;
+            };
+            let Some(group_type) = cursor.i16() else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
+            let group = NativeGroup {
+                id,
+                name,
+                has_password,
+                persistent,
+                hidden,
+                group_type,
+            };
             if let Some(existing) = state.groups.iter_mut().find(|entry| entry.id == id) {
                 *existing = group;
             } else if state.groups.len() < 128 {
                 state.groups.push(group);
-                if state.groups.len() == 1 { state.selected = 0; }
+                if state.groups.len() == 1 {
+                    state.selected = 0;
+                }
             }
             if !state.groups.is_empty() {
                 state.selected %= state.groups.len();
             }
         }
         "voicechat:remove_group" => {
-            let Some(id) = cursor.uuid() else { return; };
-            if !cursor.done() { return; }
+            let Some(id) = cursor.uuid() else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
             state.groups.retain(|group| group.id != id);
             if state.groups.is_empty() {
                 state.selected = 0;
             } else {
                 state.selected %= state.groups.len();
             }
-            if state.active == Some(id) { state.active = None; }
+            if state.active == Some(id) {
+                state.active = None;
+            }
         }
         _ => {}
     }
@@ -550,7 +749,13 @@ fn decode_category(cursor: &mut Cursor<'_>) -> Option<NativeCategory> {
     let tab = cursor.optional_string(16)?;
     let tab_name = cursor.optional_string(16)?;
     let _tab_translation_key = cursor.optional_string(256)?;
-    Some(NativeCategory { id, name, description, tab, tab_name })
+    Some(NativeCategory {
+        id,
+        name,
+        description,
+        tab,
+        tab_name,
+    })
 }
 
 fn on_category_payload(channel: &str, bytes: &[u8]) {
@@ -558,17 +763,29 @@ fn on_category_payload(channel: &str, bytes: &[u8]) {
     let mut cursor = Cursor::new(bytes);
     match channel {
         "voicechat:add_category" => {
-            let Some(category) = decode_category(&mut cursor) else { return; };
-            if !cursor.done() { return; }
-            if let Some(existing) = state.categories.iter_mut().find(|entry| entry.id == category.id) {
+            let Some(category) = decode_category(&mut cursor) else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
+            if let Some(existing) = state
+                .categories
+                .iter_mut()
+                .find(|entry| entry.id == category.id)
+            {
                 *existing = category;
             } else if state.categories.len() < 64 {
                 state.categories.push(category);
             }
         }
         "voicechat:remove_category" => {
-            let Some(id) = cursor.string(16) else { return; };
-            if !cursor.done() { return; }
+            let Some(id) = cursor.string(16) else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
             state.categories.retain(|category| category.id != id);
         }
         _ => {}
@@ -579,7 +796,11 @@ fn decode_player_state(cursor: &mut Cursor<'_>) -> Option<NativePlayer> {
     let flags = cursor.u8()?;
     let id = cursor.uuid()?;
     let name = cursor.string(256)?;
-    let group = if flags & (1 << 5) != 0 { Some(cursor.uuid()?) } else { None };
+    let group = if flags & (1 << 5) != 0 {
+        Some(cursor.uuid()?)
+    } else {
+        None
+    };
     Some(NativePlayer {
         id,
         name,
@@ -602,38 +823,64 @@ fn preserve_player_controls(player: &mut NativePlayer, old: &[NativePlayer]) {
 }
 
 fn on_player_payload(channel: &str, bytes: &[u8]) {
-    let local_id = *local_player_uuid().lock().expect("SVC local player state poisoned");
+    let local_id = *local_player_uuid()
+        .lock()
+        .expect("SVC local player state poisoned");
     let mut state = group_state().lock().expect("SVC player state poisoned");
     let mut reset_players = Vec::new();
     match channel {
         "voicechat:states" => {
             let mut cursor = Cursor::new(bytes);
-            let Some(count) = cursor.i32().and_then(|n| usize::try_from(n).ok()) else { return; };
-            if count > 512 { return; }
+            let Some(count) = cursor.i32().and_then(|n| usize::try_from(n).ok()) else {
+                return;
+            };
+            if count > 512 {
+                return;
+            }
             let old = state.players.clone();
             let mut players = Vec::with_capacity(count.min(128));
             for _ in 0..count {
-                let Some(mut player) = decode_player_state(&mut cursor) else { return; };
-                if Some(player.id) == local_id { continue; }
+                let Some(mut player) = decode_player_state(&mut cursor) else {
+                    return;
+                };
+                if Some(player.id) == local_id {
+                    continue;
+                }
                 preserve_player_controls(&mut player, &old);
-                if players.len() < 128 && !players.iter().any(|entry: &NativePlayer| entry.id == player.id) {
+                if players.len() < 128
+                    && !players
+                        .iter()
+                        .any(|entry: &NativePlayer| entry.id == player.id)
+                {
                     players.push(player);
                 }
             }
-            if !cursor.done() { return; }
-            reset_players = old.iter()
+            if !cursor.done() {
+                return;
+            }
+            reset_players = old
+                .iter()
                 .filter(|previous| !players.iter().any(|player| player.id == previous.id))
                 .map(|previous| previous.id)
                 .collect();
             state.players = players;
-            if state.players.is_empty() { state.selected_player = 0; }
-            else { state.selected_player %= state.players.len(); }
+            if state.players.is_empty() {
+                state.selected_player = 0;
+            } else {
+                state.selected_player %= state.players.len();
+            }
         }
         "voicechat:state" => {
             let mut cursor = Cursor::new(bytes);
-            let Some(mut player) = decode_player_state(&mut cursor) else { return; };
-            if !cursor.done() { return; }
-            if Some(player.id) == local_id { return; }
+            let Some(mut player) = decode_player_state(&mut cursor) else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
+            if Some(player.id) == local_id {
+                return;
+            }
             preserve_player_controls(&mut player, &state.players);
             if let Some(existing) = state.players.iter_mut().find(|entry| entry.id == player.id) {
                 *existing = player;
@@ -643,13 +890,24 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
         }
         "voicechat:remove_state" => {
             let mut cursor = Cursor::new(bytes);
-            let Some(id) = cursor.uuid() else { return; };
-            if !cursor.done() { return; }
+            let Some(id) = cursor.uuid() else {
+                return;
+            };
+            if !cursor.done() {
+                return;
+            }
             state.players.retain(|player| player.id != id);
-            if state.players.is_empty() { state.selected_player = 0; }
-            else { state.selected_player %= state.players.len(); }
+            if state.players.is_empty() {
+                state.selected_player = 0;
+            } else {
+                state.selected_player %= state.players.len();
+            }
             drop(state);
-            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+            if let Some(client) = voice_client()
+                .lock()
+                .expect("SVC client state poisoned")
+                .as_ref()
+            {
                 client.set_player_volume(id, 1.0);
                 client.set_player_muted(id, false);
             }
@@ -657,9 +915,17 @@ fn on_player_payload(channel: &str, bytes: &[u8]) {
         }
         _ => return,
     }
-    let controls = state.players.iter().map(|p| (p.id, p.volume, p.ignored)).collect::<Vec<_>>();
+    let controls = state
+        .players
+        .iter()
+        .map(|p| (p.id, p.volume, p.ignored))
+        .collect::<Vec<_>>();
     drop(state);
-    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+    if let Some(client) = voice_client()
+        .lock()
+        .expect("SVC client state poisoned")
+        .as_ref()
+    {
         for id in reset_players {
             client.set_player_volume(id, 1.0);
             client.set_player_muted(id, false);
@@ -677,12 +943,16 @@ fn poll_voice_events() {
     if let Some(client) = guard.as_ref() {
         while let Some(event) = client.poll_event() {
             match event {
-                VoiceEvent::Connected => eprintln!("[svchorizon] Voice UDP authenticated and validated."),
+                VoiceEvent::Connected => {
+                    eprintln!("[svchorizon] Voice UDP authenticated and validated.")
+                }
                 VoiceEvent::Disconnected(reason) => {
                     eprintln!("[svchorizon] Voice disconnected: {reason}");
                     disconnected = true;
                 }
-                VoiceEvent::AudioUnavailable(reason) => eprintln!("[svchorizon] Audio device warning: {reason}"),
+                VoiceEvent::AudioUnavailable(reason) => {
+                    eprintln!("[svchorizon] Audio device warning: {reason}")
+                }
             }
         }
     }
@@ -691,7 +961,9 @@ fn poll_voice_events() {
         PTT_DOWN.store(false, Ordering::Relaxed);
     }
     drop(guard);
-    if disconnected { start_reconnect(); }
+    if disconnected {
+        start_reconnect();
+    }
 }
 
 pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
@@ -790,24 +1062,56 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
         }
         PTT_DOWN.store(false, Ordering::Relaxed);
         WHISPER_DOWN.store(false, Ordering::Relaxed);
-        let old_client = voice_client().lock()
+        let old_client = voice_client()
+            .lock()
             .expect("SVC client state poisoned")
             .take();
         drop(old_client);
         *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
-        *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
-        *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
+        *local_player_uuid()
+            .lock()
+            .expect("SVC local player state poisoned") = None;
+        *last_server_info()
+            .lock()
+            .expect("SVC reconnect state poisoned") = None;
         RECONNECTING.store(false, Ordering::Release);
         GROUPS_ENABLED.store(false, Ordering::Release);
         return;
     }
     REMOTE_ACTIVE.store(true, Ordering::Release);
 
+    // Re-probe the secret handshake while the server has not answered at
+    // all: the request is only retried here so a server that ignored the
+    // first probe (channel registration race, or a compatibility number we
+    // did not guess) gets asked again without a manual rejoin.
+    if game.native_on("svchorizon")
+        && voice_client()
+            .lock()
+            .expect("SVC client state poisoned")
+            .is_none()
+        && last_server_info()
+            .lock()
+            .expect("SVC reconnect state poisoned")
+            .is_none()
+    {
+        let last = LAST_SECRET_REQUEST.load(Ordering::Acquire);
+        let now = now_millis();
+        if last == 0 || now.saturating_sub(last) >= SECRET_REQUEST_RETRY_MS {
+            send_secret_request(game);
+        }
+    }
+
     // A failed initial connect (bad endpoint, refused socket) must not leave
     // the session stuck with no client: retry through the reconnect path.
-    if voice_client().lock().expect("SVC client state poisoned").is_none()
+    if voice_client()
+        .lock()
+        .expect("SVC client state poisoned")
+        .is_none()
         && !RECONNECTING.load(Ordering::Acquire)
-        && last_server_info().lock().expect("SVC reconnect state poisoned").is_some()
+        && last_server_info()
+            .lock()
+            .expect("SVC reconnect state poisoned")
+            .is_some()
     {
         start_reconnect();
     }
@@ -831,12 +1135,16 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
     }
 
     let player = game.native_player();
-    let positions = game.remote.as_ref()
+    let positions = game
+        .remote
+        .as_ref()
         .map(crate::game::remote::svchorizon_voice::player_positions)
         .unwrap_or_default();
 
     let guard = voice_client().lock().expect("SVC client state poisoned");
-    let Some(client) = guard.as_ref() else { return; };
+    let Some(client) = guard.as_ref() else {
+        return;
+    };
 
     if let Some(player) = player {
         client.set_listener(player.x, player.y, player.z, player.yaw);
@@ -860,20 +1168,32 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     if key == ptt_binding {
         let transmitting = pressed && game.native_playing();
         PTT_DOWN.store(transmitting, Ordering::Relaxed);
-        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        if let Some(client) = voice_client()
+            .lock()
+            .expect("SVC client state poisoned")
+            .as_ref()
+        {
             client.set_transmitting(transmitting && !SELF_MUTED.load(Ordering::Relaxed));
         }
     } else if key == whisper_binding {
         let whispering = pressed && game.native_playing();
         WHISPER_DOWN.store(whispering, Ordering::Relaxed);
-        if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        if let Some(client) = voice_client()
+            .lock()
+            .expect("SVC client state poisoned")
+            .as_ref()
+        {
             client.set_whispering(whispering);
         }
     } else if key == game.native_mod_key("svchorizon", "voice_activation", "key.keyboard.c") {
         if pressed && !VOICE_ACTIVATION_KEY_DOWN.swap(true, Ordering::AcqRel) {
             let enabled = !VOICE_ACTIVATION.load(Ordering::Relaxed);
             VOICE_ACTIVATION.store(enabled, Ordering::Relaxed);
-            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+            if let Some(client) = voice_client()
+                .lock()
+                .expect("SVC client state poisoned")
+                .as_ref()
+            {
                 client.set_voice_activation(enabled && !SELF_MUTED.load(Ordering::Relaxed), 0.025);
             }
         } else if !pressed {
@@ -886,16 +1206,28 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             if game.native_playing() {
                 send_client_state(game, muted, false);
             }
-            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
-                client.set_transmitting(PTT_DOWN.load(Ordering::Relaxed) && !muted && game.native_playing());
-                client.set_voice_activation(VOICE_ACTIVATION.load(Ordering::Relaxed) && !muted, 0.025);
+            if let Some(client) = voice_client()
+                .lock()
+                .expect("SVC client state poisoned")
+                .as_ref()
+            {
+                client.set_transmitting(
+                    PTT_DOWN.load(Ordering::Relaxed) && !muted && game.native_playing(),
+                );
+                client.set_voice_activation(
+                    VOICE_ACTIVATION.load(Ordering::Relaxed) && !muted,
+                    0.025,
+                );
             }
         } else if !pressed {
             SELF_MUTE_KEY_DOWN.store(false, Ordering::Release);
         }
     } else if key == game.native_mod_key("svchorizon", "group_create", "key.keyboard.g") {
-        if pressed && !GROUP_CREATE_DOWN.swap(true, Ordering::AcqRel)
-            && game.native_playing() && GROUPS_ENABLED.load(Ordering::Acquire) {
+        if pressed
+            && !GROUP_CREATE_DOWN.swap(true, Ordering::AcqRel)
+            && game.native_playing()
+            && GROUPS_ENABLED.load(Ordering::Acquire)
+        {
             send_create_group(game);
         } else if !pressed {
             GROUP_CREATE_DOWN.store(false, Ordering::Release);
@@ -906,7 +1238,9 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             if !state.groups.is_empty() {
                 for _ in 0..state.groups.len() {
                     state.selected = (state.selected + 1) % state.groups.len();
-                    if !state.groups[state.selected].hidden { break; }
+                    if !state.groups[state.selected].hidden {
+                        break;
+                    }
                 }
             }
             state.wrong_password = false;
@@ -914,8 +1248,11 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             GROUP_NEXT_DOWN.store(false, Ordering::Release);
         }
     } else if key == game.native_mod_key("svchorizon", "group_join", "key.keyboard.j") {
-        if pressed && !GROUP_JOIN_DOWN.swap(true, Ordering::AcqRel)
-            && game.native_playing() && GROUPS_ENABLED.load(Ordering::Acquire) {
+        if pressed
+            && !GROUP_JOIN_DOWN.swap(true, Ordering::AcqRel)
+            && game.native_playing()
+            && GROUPS_ENABLED.load(Ordering::Acquire)
+        {
             let selected = {
                 let state = group_state().lock().expect("SVC group state poisoned");
                 state.groups.get(state.selected).cloned()
@@ -927,8 +1264,11 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             GROUP_JOIN_DOWN.store(false, Ordering::Release);
         }
     } else if key == game.native_mod_key("svchorizon", "group_leave", "key.keyboard.h") {
-        if pressed && !GROUP_LEAVE_DOWN.swap(true, Ordering::AcqRel)
-            && game.native_playing() && GROUPS_ENABLED.load(Ordering::Acquire) {
+        if pressed
+            && !GROUP_LEAVE_DOWN.swap(true, Ordering::AcqRel)
+            && game.native_playing()
+            && GROUPS_ENABLED.load(Ordering::Acquire)
+        {
             send_leave_group(game);
         } else if !pressed {
             GROUP_LEAVE_DOWN.store(false, Ordering::Release);
@@ -953,14 +1293,20 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
                 })
             };
             if let Some((id, ignored)) = control {
-                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                if let Some(client) = voice_client()
+                    .lock()
+                    .expect("SVC client state poisoned")
+                    .as_ref()
+                {
                     client.set_player_muted(id, ignored);
                 }
             }
         } else if !pressed {
             PLAYER_IGNORE_DOWN.store(false, Ordering::Release);
         }
-    } else if key == game.native_mod_key("svchorizon", "player_volume_down", "key.keyboard.page.down") {
+    } else if key
+        == game.native_mod_key("svchorizon", "player_volume_down", "key.keyboard.page.down")
+    {
         if pressed && !PLAYER_VOL_DOWN.swap(true, Ordering::AcqRel) {
             let control = {
                 let mut state = group_state().lock().expect("SVC player state poisoned");
@@ -971,7 +1317,11 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
                 })
             };
             if let Some((id, volume)) = control {
-                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                if let Some(client) = voice_client()
+                    .lock()
+                    .expect("SVC client state poisoned")
+                    .as_ref()
+                {
                     client.set_player_volume(id, volume);
                 }
             }
@@ -989,7 +1339,11 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
                 })
             };
             if let Some((id, volume)) = control {
-                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                if let Some(client) = voice_client()
+                    .lock()
+                    .expect("SVC client state poisoned")
+                    .as_ref()
+                {
                     client.set_player_volume(id, volume);
                 }
             }
@@ -1002,12 +1356,26 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             if !devices.is_empty() {
                 let step = INPUT_DEVICE_INDEX.fetch_add(1, Ordering::AcqRel);
                 let slot = step % (devices.len() + 1);
-                let selection = if slot == devices.len() { None } else { Some(devices[slot].clone()) };
-                audio_device_preferences().lock().expect("SVC audio preferences poisoned").0 = selection.clone();
-                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                let selection = if slot == devices.len() {
+                    None
+                } else {
+                    Some(devices[slot].clone())
+                };
+                audio_device_preferences()
+                    .lock()
+                    .expect("SVC audio preferences poisoned")
+                    .0 = selection.clone();
+                if let Some(client) = voice_client()
+                    .lock()
+                    .expect("SVC client state poisoned")
+                    .as_ref()
+                {
                     client.set_input_device(selection.clone());
                 }
-                eprintln!("[svchorizon] Microphone: {}", selection.as_deref().unwrap_or("OS default"));
+                eprintln!(
+                    "[svchorizon] Microphone: {}",
+                    selection.as_deref().unwrap_or("OS default")
+                );
             }
         } else if !pressed {
             INPUT_DEVICE_NEXT_DOWN.store(false, Ordering::Release);
@@ -1018,12 +1386,26 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             if !devices.is_empty() {
                 let step = OUTPUT_DEVICE_INDEX.fetch_add(1, Ordering::AcqRel);
                 let slot = step % (devices.len() + 1);
-                let selection = if slot == devices.len() { None } else { Some(devices[slot].clone()) };
-                audio_device_preferences().lock().expect("SVC audio preferences poisoned").1 = selection.clone();
-                if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                let selection = if slot == devices.len() {
+                    None
+                } else {
+                    Some(devices[slot].clone())
+                };
+                audio_device_preferences()
+                    .lock()
+                    .expect("SVC audio preferences poisoned")
+                    .1 = selection.clone();
+                if let Some(client) = voice_client()
+                    .lock()
+                    .expect("SVC client state poisoned")
+                    .as_ref()
+                {
                     client.set_output_device(selection.clone());
                 }
-                eprintln!("[svchorizon] Speaker: {}", selection.as_deref().unwrap_or("OS default"));
+                eprintln!(
+                    "[svchorizon] Speaker: {}",
+                    selection.as_deref().unwrap_or("OS default")
+                );
             }
         } else if !pressed {
             OUTPUT_DEVICE_NEXT_DOWN.store(false, Ordering::Release);
@@ -1031,19 +1413,19 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     }
 }
 
-pub fn on_hud(
-    game: &crate::game::Game<'_>,
-    batch: &mut horizon_client::hud::HudBatch,
-) {
-    if !game.native_playing() || !game.native_on("svchorizon") { return; }
+pub fn on_hud(game: &crate::game::Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
+    if !game.native_playing() || !game.native_on("svchorizon") {
+        return;
+    }
     let guard = voice_client().lock().expect("SVC client state poisoned");
     let (label, color) = if SELF_MUTED.load(Ordering::Relaxed) {
         ("SVC: Microphone muted", 0xFF5555)
     } else if let Some(client) = guard.as_ref() {
         if !client.is_connected() && client.unanswered_auth_attempts() >= 15 {
-            // Never mask an unreachable voice server behind "Transmitting":
-            // packets are being dropped before they can reach anyone.
-            ("SVC: Voice server unreachable (UDP blocked?)", 0xFF5555)
+            // Packets are going out but no authenticated datagram is coming
+            // back. This is neither proof of a blocked server nor of a
+            // blocked client: it means no UDP answer arrived yet.
+            ("SVC: Voice server not responding", 0xFF5555)
         } else if client.is_transmitting() && client.is_whispering() {
             ("SVC: Whispering", 0x55FF55)
         } else if client.is_transmitting() {
@@ -1059,7 +1441,11 @@ pub fn on_hud(
         ("SVC: Not on a server", 0xAAAAAA)
     } else if RECONNECTING.load(Ordering::Acquire) {
         ("SVC: Reconnecting", 0xFFCC55)
-    } else if last_server_info().lock().expect("SVC reconnect state poisoned").is_some() {
+    } else if last_server_info()
+        .lock()
+        .expect("SVC reconnect state poisoned")
+        .is_some()
+    {
         ("SVC: Connecting", 0xFFCC55)
     } else {
         ("SVC: No voice chat on this server", 0xAAAAAA)
@@ -1069,27 +1455,61 @@ pub fn on_hud(
     let group_label = if !GROUPS_ENABLED.load(Ordering::Acquire) {
         "SVC Group: disabled by server".to_owned()
     } else if let Some(active) = groups.active {
-        groups.groups.iter().find(|group| group.id == active)
+        groups
+            .groups
+            .iter()
+            .find(|group| group.id == active)
             .map(|group| format!("SVC Group: {}", group.name))
             .unwrap_or_else(|| "SVC Group: joined".to_owned())
     } else if groups.wrong_password {
         "SVC Group: password required | /svchorizon group join <password>".to_owned()
-    } else if let Some(group) = groups.groups.get(groups.selected).filter(|group| !group.hidden) {
+    } else if let Some(group) = groups
+        .groups
+        .get(groups.selected)
+        .filter(|group| !group.hidden)
+    {
         let lock = if group.has_password { " [locked]" } else { "" };
-        let persistent = if group.persistent { " [persistent]" } else { "" };
-        let kind = match group.group_type { 1 => "open", 2 => "isolated", _ => "normal" };
-        format!("SVC Group: {}{}{} | {} ({}/{})", group.name, lock, persistent, kind, groups.selected + 1, groups.groups.len())
+        let persistent = if group.persistent {
+            " [persistent]"
+        } else {
+            ""
+        };
+        let kind = match group.group_type {
+            1 => "open",
+            2 => "isolated",
+            _ => "normal",
+        };
+        format!(
+            "SVC Group: {}{}{} | {} ({}/{})",
+            group.name,
+            lock,
+            persistent,
+            kind,
+            groups.selected + 1,
+            groups.groups.len()
+        )
     } else {
         "SVC Group: no visible groups | G create, N select, J join, H leave".to_owned()
     };
     game.native_text(batch, &group_label, [8.0, 54.0], 0xFFFFFF, true);
     let player_label = if let Some(player) = groups.players.get(groups.selected_player) {
-        let status = if player.ignored { "ignored" }
-            else if player.force_muted || player.server_muted { "server-muted" }
-            else if player.force_disabled || player.disabled { "voice-disabled" }
-            else if player.disconnected { "disconnected" }
-            else { "active" };
-        format!("SVC Player: {} | {} | {:.0}%", player.name, status, player.volume * 100.0)
+        let status = if player.ignored {
+            "ignored"
+        } else if player.force_muted || player.server_muted {
+            "server-muted"
+        } else if player.force_disabled || player.disabled {
+            "voice-disabled"
+        } else if player.disconnected {
+            "disconnected"
+        } else {
+            "active"
+        };
+        format!(
+            "SVC Player: {} | {} | {:.0}%",
+            player.name,
+            status,
+            player.volume * 100.0
+        )
     } else {
         "SVC Player: none | P select, O ignore, PgUp/PgDn volume".to_owned()
     };
@@ -1097,27 +1517,48 @@ pub fn on_hud(
     let category_label = if groups.categories.is_empty() {
         "SVC Categories: none".to_owned()
     } else {
-        let names = groups.categories.iter().take(3).map(|category| {
-            let tab = category.tab_name.as_deref().or(category.tab.as_deref());
-            let description = category.description.as_deref()
-                .map(|value| value.chars().take(36).collect::<String>());
-            match (tab, description) {
-                (Some(tab), Some(description)) => format!("{} [{}: {}]", category.name, tab, description),
-                (Some(tab), None) => format!("{} [{}]", category.name, tab),
-                (None, Some(description)) => format!("{}: {}", category.name, description),
-                (None, None) => category.name.clone(),
-            }
-        }).collect::<Vec<_>>().join(", ");
+        let names = groups
+            .categories
+            .iter()
+            .take(3)
+            .map(|category| {
+                let tab = category.tab_name.as_deref().or(category.tab.as_deref());
+                let description = category
+                    .description
+                    .as_deref()
+                    .map(|value| value.chars().take(36).collect::<String>());
+                match (tab, description) {
+                    (Some(tab), Some(description)) => {
+                        format!("{} [{}: {}]", category.name, tab, description)
+                    }
+                    (Some(tab), None) => format!("{} [{}]", category.name, tab),
+                    (None, Some(description)) => format!("{}: {}", category.name, description),
+                    (None, None) => category.name.clone(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let extra = groups.categories.len().saturating_sub(3);
-        if extra > 0 { format!("SVC Categories: {names} +{extra}") }
-        else { format!("SVC Categories: {names}") }
+        if extra > 0 {
+            format!("SVC Categories: {names} +{extra}")
+        } else {
+            format!("SVC Categories: {names}")
+        }
     };
     game.native_text(batch, &category_label, [8.0, 78.0], 0xAAAAFF, true);
     if let Some(client) = guard.as_ref() {
         let (input, output) = client.selected_audio_devices();
-        game.native_text(batch, &format!("SVC Audio: Mic {} | Out {}",
-            input.as_deref().unwrap_or("OS default"),
-            output.as_deref().unwrap_or("OS default")), [8.0, 90.0], 0xAAAAAA, true);
+        game.native_text(
+            batch,
+            &format!(
+                "SVC Audio: Mic {} | Out {}",
+                input.as_deref().unwrap_or("OS default"),
+                output.as_deref().unwrap_or("OS default")
+            ),
+            [8.0, 90.0],
+            0xAAAAAA,
+            true,
+        );
     }
 }
 
@@ -1133,78 +1574,116 @@ pub fn on_packet(
             // A new play session must never inherit the previous server's key.
             REMOTE_ACTIVE.store(true, Ordering::Release);
             SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
-            voice_client().lock().expect("SVC client state poisoned").take();
+            voice_client()
+                .lock()
+                .expect("SVC client state poisoned")
+                .take();
             *group_state().lock().expect("SVC group state poisoned") = GroupState::default();
-            *local_player_uuid().lock().expect("SVC local player state poisoned") = None;
-            *last_server_info().lock().expect("SVC reconnect state poisoned") = None;
+            *local_player_uuid()
+                .lock()
+                .expect("SVC local player state poisoned") = None;
+            *last_server_info()
+                .lock()
+                .expect("SVC reconnect state poisoned") = None;
             RECONNECTING.store(false, Ordering::Release);
             GROUPS_ENABLED.store(false, Ordering::Release);
             PTT_DOWN.store(false, Ordering::Relaxed);
             WHISPER_DOWN.store(false, Ordering::Relaxed);
             if game.native_on("svchorizon") {
                 // Bukkit/Paper only deliver payloads the client registered.
+                // The known-generation cache is per server: a different
+                // server may run the other SVC generation, so probe both
+                // again on every join.
+                KNOWN_COMPAT.store(0, Ordering::Release);
                 send_channel_registration(game);
                 send_secret_request(game);
             }
         }
-        Clientbound::CustomPayload(payload) if payload.channel == SECRET && game.native_on("svchorizon") => {
+        Clientbound::CustomPayload(payload)
+            if payload.channel == SECRET && game.native_on("svchorizon") =>
+        {
             match decode_secret(&payload.data) {
                 Some(info) => {
-                    *local_player_uuid().lock().expect("SVC local player state poisoned") = Some(info.player);
+                    KNOWN_COMPAT.store(info.profile.compatibility_version(), Ordering::Release);
+                    eprintln!(
+                        "[svchorizon] Secret received ({}): voice host '{}' port {} keepalive {}ms groups {}",
+                        info.profile.label(),
+                        if info.host.is_empty() {
+                            "<same as game server>"
+                        } else {
+                            info.host.as_str()
+                        },
+                        info.port,
+                        info.keep_alive_ms,
+                        info.groups
+                    );
+                    *local_player_uuid()
+                        .lock()
+                        .expect("SVC local player state poisoned") = Some(info.player);
                     GROUPS_ENABLED.store(info.groups, Ordering::Release);
                     send_client_state(game, SELF_MUTED.load(Ordering::Relaxed), false);
                     {
                         let mut state = group_state().lock().expect("SVC player state poisoned");
                         state.players.retain(|player| player.id != info.player);
-                        if state.players.is_empty() { state.selected_player = 0; }
-                        else { state.selected_player %= state.players.len(); }
+                        if state.players.is_empty() {
+                            state.selected_player = 0;
+                        } else {
+                            state.selected_player %= state.players.len();
+                        }
                     }
-                    let fallback_host = game.remote.as_ref()
+                    let fallback_host = game
+                        .remote
+                        .as_ref()
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
-                    eprintln!(
-                        "[svchorizon] Secret received: voice host '{}' port {} keepalive {}ms groups {} (game address: '{fallback_host}')",
-                        if info.host.is_empty() { "<same as game server>" } else { info.host.as_str() },
-                        info.port,
-                        info.keep_alive_ms,
-                        info.groups
-                    );
-                    *last_server_info().lock().expect("SVC reconnect state poisoned") =
+                    eprintln!("[svchorizon] Game address: '{fallback_host}'");
+                    *last_server_info()
+                        .lock()
+                        .expect("SVC reconnect state poisoned") =
                         Some((info.clone(), fallback_host.clone()));
                     let generation = SESSION_GENERATION.load(Ordering::Acquire);
-                    let _ = thread::Builder::new().name("svchorizon-connect".into()).spawn(move || {
-                        match VoiceClient::connect(info, &fallback_host) {
+                    let _ = thread::Builder::new()
+                        .name("svchorizon-connect".into())
+                        .spawn(move || match VoiceClient::connect(info, &fallback_host) {
                             Ok(client) => {
                                 apply_player_controls(&client);
                                 apply_audio_device_preferences(&client);
                                 if SESSION_GENERATION.load(Ordering::Acquire) == generation {
-                                    *voice_client().lock().expect("SVC client state poisoned") = Some(client);
+                                    *voice_client().lock().expect("SVC client state poisoned") =
+                                        Some(client);
                                     eprintln!("[svchorizon] Voice UDP/audio workers started.");
                                 }
                             }
-                            Err(error) => eprintln!("[svchorizon] Could not start voice connection: {error}"),
-                        }
-                    });
+                            Err(error) => {
+                                eprintln!("[svchorizon] Could not start voice connection: {error}")
+                            }
+                        });
                 }
                 None => eprintln!("[svchorizon] Rejected malformed voicechat:secret payload."),
             }
         }
-        Clientbound::CustomPayload(payload) if matches!(
-            payload.channel.as_str(),
-            "voicechat:joined_group" | "voicechat:add_group" | "voicechat:remove_group"
-        ) && game.native_on("svchorizon") => {
+        Clientbound::CustomPayload(payload)
+            if matches!(
+                payload.channel.as_str(),
+                "voicechat:joined_group" | "voicechat:add_group" | "voicechat:remove_group"
+            ) && game.native_on("svchorizon") =>
+        {
             on_group_payload(&payload.channel, &payload.data);
         }
-        Clientbound::CustomPayload(payload) if matches!(
-            payload.channel.as_str(),
-            "voicechat:states" | "voicechat:state" | "voicechat:remove_state"
-        ) && game.native_on("svchorizon") => {
+        Clientbound::CustomPayload(payload)
+            if matches!(
+                payload.channel.as_str(),
+                "voicechat:states" | "voicechat:state" | "voicechat:remove_state"
+            ) && game.native_on("svchorizon") =>
+        {
             on_player_payload(&payload.channel, &payload.data);
         }
-        Clientbound::CustomPayload(payload) if matches!(
-            payload.channel.as_str(),
-            "voicechat:add_category" | "voicechat:remove_category"
-        ) && game.native_on("svchorizon") => {
+        Clientbound::CustomPayload(payload)
+            if matches!(
+                payload.channel.as_str(),
+                "voicechat:add_category" | "voicechat:remove_category"
+            ) && game.native_on("svchorizon") =>
+        {
             on_category_payload(&payload.channel, &payload.data);
         }
         _ => {}
@@ -1221,11 +1700,14 @@ mod tests {
         write_utf(&mut bytes, "music");
         write_utf(&mut bytes, "Music");
         bytes.push(0); // no name translation key
-        bytes.push(1); write_utf(&mut bytes, "Background music");
+        bytes.push(1);
+        write_utf(&mut bytes, "Background music");
         bytes.push(0); // no description translation key
         bytes.push(0); // no icon
-        bytes.push(1); write_utf(&mut bytes, "media");
-        bytes.push(1); write_utf(&mut bytes, "Media");
+        bytes.push(1);
+        write_utf(&mut bytes, "media");
+        bytes.push(1);
+        write_utf(&mut bytes, "Media");
         bytes.push(0); // no tab translation key
         let mut cursor = Cursor::new(&bytes);
         let category = decode_category(&mut cursor).unwrap();
@@ -1272,8 +1754,19 @@ mod tests {
 
     #[test]
     fn parses_quoted_group_names_and_passwords() {
-        let words = command_words(r#"svchorizon group create "Friends Group" "a password" open"#).unwrap();
-        assert_eq!(words, vec!["svchorizon", "group", "create", "Friends Group", "a password", "open"]);
+        let words =
+            command_words(r#"svchorizon group create "Friends Group" "a password" open"#).unwrap();
+        assert_eq!(
+            words,
+            vec![
+                "svchorizon",
+                "group",
+                "create",
+                "Friends Group",
+                "a password",
+                "open"
+            ]
+        );
         assert!(command_words(r#"svchorizon group create "unfinished"#).is_none());
     }
 
@@ -1308,8 +1801,10 @@ mod tests {
     #[test]
     fn registers_every_official_channel_before_requesting_the_secret() {
         let data = register_channels_payload();
-        let channels: Vec<&str> = data.split(|byte| *byte == 0)
-            .map(|channel| std::str::from_utf8(channel).unwrap()).collect();
+        let channels: Vec<&str> = data
+            .split(|byte| *byte == 0)
+            .map(|channel| std::str::from_utf8(channel).unwrap())
+            .collect();
         assert_eq!(channels.first().copied(), Some("voicechat:request_secret"));
         assert!(channels.contains(&"voicechat:secret"));
         assert!(channels.contains(&"voicechat:client_state"));
@@ -1321,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_secret_payload_in_2_6_27_field_order() {
+    fn decodes_secret_payload_in_2_6_x_field_order() {
         let mut bytes = vec![0x42; 16];
         bytes.extend_from_slice(&24454i32.to_be_bytes());
         bytes.extend_from_slice(&[0x11; 16]);
@@ -1334,11 +1829,40 @@ mod tests {
         bytes.extend_from_slice(b"voice.example.test");
         bytes.push(0);
         let info = decode_secret(&bytes).unwrap();
+        assert_eq!(info.profile, SvcProfile::Compat20);
+        assert_eq!(info.profile.compatibility_version(), 20);
+        assert_eq!(info.player, [0x11; 16]);
+        assert_eq!(info.connection_id, [0; 16]);
         assert_eq!(info.port, 24454);
         assert_eq!(info.mtu, 1200);
         assert_eq!(info.distance, 48.0);
         assert_eq!(info.host, "voice.example.test");
         assert!(info.groups);
+    }
+
+    #[test]
+    fn decodes_secret_payload_in_2_7_x_field_order() {
+        // Compat-21 (Simple Voice Chat 2.7.x) inserts the server-assigned
+        // connection UUID right after the secret; everything after the port
+        // matches the 2.6.x layout.
+        let mut bytes = vec![0x42; 16];
+        bytes.extend_from_slice(&[0x77; 16]); // connectionId
+        bytes.extend_from_slice(&24454i32.to_be_bytes());
+        bytes.extend_from_slice(&[0x11; 16]);
+        bytes.push(1);
+        bytes.extend_from_slice(&1200i32.to_be_bytes());
+        bytes.extend_from_slice(&48.0f64.to_bits().to_be_bytes());
+        bytes.extend_from_slice(&1000i32.to_be_bytes());
+        bytes.push(1);
+        bytes.push(0); // empty voice host
+        bytes.push(0);
+        let info = decode_secret(&bytes).unwrap();
+        assert_eq!(info.profile, SvcProfile::Compat21);
+        assert_eq!(info.profile.compatibility_version(), 21);
+        assert_eq!(info.connection_id, [0x77; 16]);
+        assert_eq!(info.player, [0x11; 16]);
+        assert_eq!(info.port, 24454);
+        assert_eq!(info.host, "");
     }
 
     #[test]
@@ -1351,8 +1875,39 @@ mod tests {
         bytes.extend_from_slice(&1200i32.to_be_bytes());
         bytes.extend_from_slice(&48.0f64.to_bits().to_be_bytes());
         bytes.extend_from_slice(&1000i32.to_be_bytes());
-        bytes.push(0); bytes.push(0); bytes.push(0);
+        bytes.push(0);
+        bytes.push(0);
+        bytes.push(0);
         bytes.push(99);
         assert!(decode_secret(&bytes).is_none());
+        // The same trailing-garbage rejection for the 2.7.x layout.
+        let mut bytes21 = vec![0x42; 16];
+        bytes21.extend_from_slice(&[0x77; 16]);
+        bytes21.extend_from_slice(&24454i32.to_be_bytes());
+        bytes21.extend_from_slice(&[0x11; 16]);
+        bytes21.push(0);
+        bytes21.extend_from_slice(&1200i32.to_be_bytes());
+        bytes21.extend_from_slice(&48.0f64.to_bits().to_be_bytes());
+        bytes21.extend_from_slice(&1000i32.to_be_bytes());
+        bytes21.push(0);
+        bytes21.push(0);
+        bytes21.push(0);
+        bytes21.push(99);
+        assert!(decode_secret(&bytes21).is_none());
+    }
+
+    #[test]
+    fn probes_every_supported_compatibility_generation() {
+        // The request payload is exactly the 4-byte big-endian compatibility
+        // number, and an unknown server gets both generations probed.
+        assert_eq!(20i32.to_be_bytes(), [0, 0, 0, 20]);
+        assert_eq!(21i32.to_be_bytes(), [0, 0, 0, 21]);
+        assert_eq!(
+            SVC_PROFILES
+                .iter()
+                .map(|p| p.compatibility_version())
+                .collect::<Vec<_>>(),
+            vec![20, 21]
+        );
     }
 }

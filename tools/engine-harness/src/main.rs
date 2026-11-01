@@ -25,7 +25,7 @@ use std::{
 };
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo as EngineVoiceServerInfo};
+use svchorizon_engine::voice::{SvcProfile, VoiceClient, VoiceEvent, VoiceServerInfo as EngineVoiceServerInfo};
 use svchorizon_protocol::{
     handshake::{self, VoiceServerInfo},
     wire::{Reader, Writer},
@@ -494,6 +494,11 @@ fn engine_voice_session(info: &VoiceServerInfo, game_host: &str) -> Result<()> {
         secret: *info.secret.as_bytes(),
         port: info.server_port,
         player: *info.player_uuid.as_bytes(),
+        // The harness drives a compat-20 (SVC 2.6.x) test server; the
+        // connection-id-carrying compat-21 generation is decoded by the
+        // game's runtime mixin instead.
+        profile: SvcProfile::Compat20,
+        connection_id: [0u8; 16],
         codec: info.codec as u8,
         mtu: i32::from(info.mtu_size),
         distance: info.voice_chat_distance,

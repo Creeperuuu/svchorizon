@@ -1,12 +1,22 @@
 name: Build SVC Horizon hnmod
 on:
   workflow_dispatch:
+  # Every push runs the Linux native-mixin-check job so compile errors in the
+  # mixin surface immediately instead of at the next manual run. The other
+  # jobs (full test matrix, Windows engine check, packaging) stay manual: on
+  # a private repository they would otherwise burn Windows runner minutes on
+  # every push.
+  push:
+    branches:
+      - "**"
 
 permissions:
   contents: read
 
 jobs:
   protocol-tests:
+    # Manual runs only - full fmt/clippy/test matrix across two operating systems.
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +38,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   native-mixin-check:
+    # Runs on every push: this is the job that compiles the real mixin against
+    # the pinned Horizon, so it catches compile errors before any manual build.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +88,8 @@ jobs:
         run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- check --workspace horizon --mods mixins --out target/mixins/modded --trust-native-mods
 
   engine-windows-check:
+    # Manual runs only - Windows runner minutes are reserved for game builds.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,6 +111,7 @@ jobs:
         run: cargo test --manifest-path mixins/svchorizon/engine/Cargo.toml
 
   package:
+    if: github.event_name == 'workflow_dispatch'
     needs: [protocol-tests, native-mixin-check, engine-windows-check]
     runs-on: ubuntu-latest
     steps:

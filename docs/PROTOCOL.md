@@ -1,13 +1,17 @@
 # Simple Voice Chat protocol notes
 
-These notes track the implementation against the **shipped** official Simple Voice
-Chat bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27` (compatibility version
-20). Every detail below was verified twice: first against the plugin jar's
+These notes track the implementation against the two deployed official Simple
+Voice Chat wire generations. Compat 20 is the **shipped** release line (e.g.
+`voicechat-bukkit-2.6.27`); compat 21 is upstream's 2.7.x generation. Every
+compat-20 detail below was verified twice: first against the plugin jar's
 bytecode (javap), then by a live end-to-end run against a real Paper 26.3
-server running that unmodified plugin. Upstream's unreleased `2.7.0-pre1`
-branch already changes the wire (compatibility version 21, an extra connection
-UUID in the secret payload); when that generation ships, the version constant
-and the secret decoder must move together.
+server running that unmodified plugin. The compat-21 differences were
+verified against the upstream `2.7.0` source (branches `1.21.11`, `26.x`):
+an extra connection UUID in the secret payload and the UDP envelopes, an
+empty Authenticate packet, and a nonce challenge echoed through the
+connection check. The client probes both compatibility numbers on every join
+and switches its wire format to whichever the server answers with, so older
+and newer servers are supported without any single-version workaround.
 
 The Rust protocol and audio engine are isolated from Horizon's game hooks so
 their wire behavior can be tested independently.
@@ -19,18 +23,18 @@ Bukkit/Paper deliver a custom payload only for channels the client registered, s
 
 1. Channel: `minecraft:register`, body: every `voicechat:*` channel the official plugin
    registers (NetManager.init), NUL-separated, mirroring the official client.
-2. Channel: `voicechat:request_secret`, body: 32-bit big-endian compatibility version `20`
-   (the shipped 2.6.27 plugin logs `Compatibility version 20` and rejects every other
-   number without sending a secret).
-   The plugin compares the client version exactly and sends an incompatibility notice instead
-   of a secret on any mismatch.
+2. Channel: `voicechat:request_secret`, body: 32-bit big-endian compatibility
+   version, `20` and `21` probed together until the server answers (the server
+   compares the client version exactly and silently ignores any other number
+   without sending a secret; a session remembers which number worked).
 
 The server replies on `voicechat:secret` with (SecretPacket.toBytes order,
 verified from the 2.6.27 jar):
 
 1. 16-byte AES secret (random bytes; there is **no** connection UUID in the
-   2.6.27 payload — upstream 2.7.0-pre1 inserts one here, which is what
-   compatibility version 21 guards)
+   2.6.27 payload — the 2.7.x generation inserts a server-assigned connection
+   UUID here, which is what compatibility version 21 signals; the client
+   decodes both layouts strictly and picks the one that parses)
 2. UDP port (32-bit integer)
 3. Player UUID (16 bytes)
 4. Codec ordinal (byte)
@@ -47,7 +51,7 @@ The decoder rejects invalid ports, unsupported codec ordinals, invalid limits, t
 
 | Channel | Direction | Current behavior |
 |---|---|---|
-| `voicechat:request_secret` | Client → server | Requests the voice session using compatibility version 20 |
+| `voicechat:request_secret` | Client → server | Probes compatibility 20 and 21; remembers the generation the server accepted |
 | `voicechat:secret` | Server → client | Decodes session secret and UDP metadata; starts voice workers |
 | `voicechat:client_state` | Client → server | Synchronizes local microphone mute/disabled flags |
 | `voicechat:states` | Server → client | Parses bounded player-state snapshots |

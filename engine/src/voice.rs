@@ -40,11 +40,62 @@ const KEEP_ALIVE: u8 = 0x08;
 const CONNECTION_CHECK: u8 = 0x09;
 const CONNECTION_CHECK_ACK: u8 = 0x0a;
 
+/// Which wire generation the server speaks. The plugin-channel handshake is
+/// gated by a compatibility number (the server silently ignores a request
+/// carrying a different one), and the UDP layer differs between the two
+/// generations that are deployed in the wild:
+///
+/// * `Compat20` - Simple Voice Chat 2.6.x (compatibility version 20, the
+///   release line published for Minecraft 1.12.2 up to the current versions).
+///   UDP envelopes carry the player's profile UUID, `Authenticate` packets
+///   carry player UUID plus secret, and both ack packets are empty.
+/// * `Compat21` - Simple Voice Chat 2.7.x (compatibility version 21). The
+///   secret response assigns a per-connection UUID, UDP envelopes carry that
+///   connection UUID instead of the player, `Authenticate` is empty, and the
+///   `AuthenticateAck` carries a 16-byte HMAC nonce that the client must echo
+///   in `ConnectionCheck` from the same source address.
+///
+/// Neither is a special case for one Minecraft version: the generation is a
+/// property of the server's Simple Voice Chat build and the client supports
+/// both, which covers older and newer game servers alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvcProfile {
+    Compat20,
+    Compat21,
+}
+
+impl SvcProfile {
+    /// The compatibility number the official client sends in the
+    /// `voicechat:request_secret` payload for this generation.
+    pub fn compatibility_version(self) -> i32 {
+        match self {
+            Self::Compat20 => 20,
+            Self::Compat21 => 21,
+        }
+    }
+
+    /// Human-readable generation label for diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compat20 => "compat-20 (Simple Voice Chat 2.6.x)",
+            Self::Compat21 => "compat-21 (Simple Voice Chat 2.7.x)",
+        }
+    }
+}
+
+/// Every UDP generation supported by this client, in probe order.
+pub const SVC_PROFILES: &[SvcProfile] = &[SvcProfile::Compat20, SvcProfile::Compat21];
+
 #[derive(Clone, Debug)]
 pub struct VoiceServerInfo {
     pub secret: [u8; 16],
     pub port: u16,
     pub player: [u8; 16],
+    /// Wire generation the server announced through the secret payload.
+    pub profile: SvcProfile,
+    /// Server-assigned connection UUID (compat-21 only; zeroed for compat-20,
+    /// where the player UUID keys every datagram instead).
+    pub connection_id: [u8; 16],
     /// 0 = VOIP, 1 = AUDIO, 2 = RESTRICTED_LOWDELAY.
     pub codec: u8,
     pub mtu: i32,
@@ -79,7 +130,12 @@ struct PlayerAudioSettings {
 }
 
 impl Default for PlayerAudioSettings {
-    fn default() -> Self { Self { volume: 1.0, muted: false } }
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            muted: false,
+        }
+    }
 }
 
 struct PendingAudio {
@@ -112,20 +168,24 @@ impl AudioJitterBuffer {
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn push(&mut self, packet: PendingAudio, now: Instant) -> Vec<PendingAudio> {
-        self.senders.retain(|_, state| now.duration_since(state.last_seen) < Self::IDLE_TIMEOUT);
+        self.senders
+            .retain(|_, state| now.duration_since(state.last_seen) < Self::IDLE_TIMEOUT);
         if !self.senders.contains_key(&packet.sender) && self.senders.len() >= Self::MAX_SENDERS {
             return Vec::new();
         }
 
-        let state = self.senders.entry(packet.sender).or_insert_with(|| SenderJitter {
-            sender: packet.sender,
-            expected: Some(packet.sequence),
-            pending: BTreeMap::new(),
-            gap_since: None,
-            last_seen: now,
-            last_position: packet.position,
-            last_distance: packet.max_distance,
-        });
+        let state = self
+            .senders
+            .entry(packet.sender)
+            .or_insert_with(|| SenderJitter {
+                sender: packet.sender,
+                expected: Some(packet.sequence),
+                pending: BTreeMap::new(),
+                gap_since: None,
+                last_seen: now,
+                last_position: packet.position,
+                last_distance: packet.max_distance,
+            });
         state.last_seen = now;
         state.last_position = packet.position;
         state.last_distance = packet.max_distance;
@@ -157,7 +217,9 @@ impl AudioJitterBuffer {
     fn drain_ready(state: &mut SenderJitter, now: Instant) -> Vec<PendingAudio> {
         let mut ready = Vec::new();
         loop {
-            let Some(expected) = state.expected else { break; };
+            let Some(expected) = state.expected else {
+                break;
+            };
             if let Some(packet) = state.pending.remove(&expected) {
                 state.expected = Some(expected.wrapping_add(1));
                 state.gap_since = None;
@@ -216,14 +278,18 @@ impl fmt::Display for VoiceError {
             Self::Io(e) => write!(f, "voice UDP I/O error: {e}"),
             Self::Resolve(s) => write!(f, "could not resolve voice server: {s}"),
             Self::InvalidServerInfo(s) => write!(f, "invalid voice server metadata: {s}"),
-            Self::UnsupportedCodec(c) => write!(f, "unsupported Simple Voice Chat codec ordinal {c}"),
+            Self::UnsupportedCodec(c) => {
+                write!(f, "unsupported Simple Voice Chat codec ordinal {c}")
+            }
             Self::WorkerStopped => write!(f, "voice worker has stopped"),
         }
     }
 }
 impl Error for VoiceError {}
 impl From<std::io::Error> for VoiceError {
-    fn from(value: std::io::Error) -> Self { Self::Io(value) }
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
 }
 
 impl VoiceError {
@@ -244,7 +310,10 @@ enum Command {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct AudioDeviceSelection { input: Option<String>, output: Option<String> }
+struct AudioDeviceSelection {
+    input: Option<String>,
+    output: Option<String>,
+}
 
 pub struct VoiceClient {
     command_tx: SyncSender<Command>,
@@ -267,8 +336,14 @@ pub struct VoiceClient {
 
 impl VoiceClient {
     pub fn connect(info: VoiceServerInfo, fallback_host: &str) -> Result<Self, VoiceError> {
-        if info.port == 0 { return Err(VoiceError::InvalidServerInfo("UDP port is zero")); }
-        if info.keep_alive_ms <= 0 { return Err(VoiceError::InvalidServerInfo("keepalive interval is not positive")); }
+        if info.port == 0 {
+            return Err(VoiceError::InvalidServerInfo("UDP port is zero"));
+        }
+        if info.keep_alive_ms <= 0 {
+            return Err(VoiceError::InvalidServerInfo(
+                "keepalive interval is not positive",
+            ));
+        }
         let application = match info.codec {
             0 => Application::Voip,
             1 => Application::Audio,
@@ -284,17 +359,35 @@ impl VoiceClient {
         // override by itself, a hostname, or hostname:port. In particular,
         // treating "24454" as a hostname breaks servers that configure only
         // a custom UDP port.
-        let address = resolve_voice_address(&info.host, fallback_host, info.port)?;
-        eprintln!("[svchorizon] Voice endpoint: {address}");
+        let endpoints = resolve_voice_addresses(&info.host, fallback_host, info.port)?;
+        eprintln!(
+            "[svchorizon] Voice endpoint(s): {} | server protocol generation: {}",
+            endpoints
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            info.profile.label()
+        );
         match udp_self_test() {
-            Ok(()) => eprintln!("[svchorizon] UDP self-test: ok (the game process can receive UDP)"),
+            Ok(()) => {
+                eprintln!("[svchorizon] UDP self-test: ok (the game process can receive UDP)")
+            }
             Err(error) => eprintln!(
                 "[svchorizon] UDP self-test FAILED: {error} - the game process cannot receive UDP at all; a sandbox/antivirus is blocking it"
             ),
         }
-        let bind_address = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let mixed_family =
+            endpoints.iter().any(|a| a.is_ipv4()) && endpoints.iter().any(|a| a.is_ipv6());
+        // A dual-stack bind keeps one socket usable for both address
+        // families; IPv4 targets are sent as v4-mapped IPv6 addresses then.
+        let dual_stack = mixed_family || endpoints.iter().all(|a| a.is_ipv6());
+        let bind_address = if dual_stack { "[::]:0" } else { "0.0.0.0:0" };
         let socket = UdpSocket::bind(bind_address)?;
-        socket.connect(address)?;
+        // Deliberately not connect()ed: the worker rotates through the
+        // resolved endpoints (and needs replies from whichever it last
+        // used), and connectionless UDP avoids Windows surfacing stale
+        // ICMP responses as WSAECONNRESET on later operations.
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
 
         let (command_tx, command_rx) = mpsc::sync_channel(8);
@@ -325,11 +418,21 @@ impl VoiceClient {
         let worker_audio_devices = Arc::clone(&audio_devices);
         let audio_worker = thread::Builder::new()
             .name("svchorizon-audio".into())
-            .spawn(move || run_audio_io(
-                audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
-                audio_settings, audio_voice_activation, audio_voice_threshold, audio_microphone_gain,
-                worker_audio_devices,
-            ))
+            .spawn(move || {
+                run_audio_io(
+                    audio_command_tx,
+                    audio_rx,
+                    audio_running,
+                    audio_transmitting,
+                    audio_events,
+                    audio_listener,
+                    audio_settings,
+                    audio_voice_activation,
+                    audio_voice_threshold,
+                    audio_microphone_gain,
+                    worker_audio_devices,
+                )
+            })
             .map_err(VoiceError::Io)?;
 
         let worker_running = Arc::clone(&running);
@@ -343,9 +446,21 @@ impl VoiceClient {
             .name("svchorizon-udp".into())
             .spawn(move || {
                 run_worker(
-                    socket, info, application, command_rx, event_tx, audio_tx,
-                    worker_running, worker_transmitting, worker_whispering, worker_voice_activation,
-                    worker_connected, worker_auth_attempts, worker_positions,
+                    socket,
+                    info,
+                    endpoints,
+                    dual_stack,
+                    application,
+                    command_rx,
+                    event_tx,
+                    audio_tx,
+                    worker_running,
+                    worker_transmitting,
+                    worker_whispering,
+                    worker_voice_activation,
+                    worker_connected,
+                    worker_auth_attempts,
+                    worker_positions,
                 );
             }) {
             Ok(worker) => worker,
@@ -357,9 +472,21 @@ impl VoiceClient {
         };
 
         Ok(Self {
-            command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts,
-            worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
+            command_tx,
+            event_rx,
+            running,
+            transmitting,
+            whispering,
+            voice_activation,
+            voice_activation_threshold,
+            microphone_gain,
+            connected,
+            auth_attempts,
+            worker: Some(worker),
+            audio_worker: Some(audio_worker),
+            listener,
+            player_positions,
+            player_audio_settings,
             audio_devices,
         })
     }
@@ -367,27 +494,40 @@ impl VoiceClient {
     /// Enumerate available local microphone devices.
     pub fn input_devices() -> Vec<String> {
         use cpal::traits::{DeviceTrait, HostTrait};
-        cpal::default_host().input_devices().map(|devices| devices.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+        cpal::default_host()
+            .input_devices()
+            .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default()
     }
 
     /// Enumerate available local speaker devices.
     pub fn output_devices() -> Vec<String> {
         use cpal::traits::{DeviceTrait, HostTrait};
-        cpal::default_host().output_devices().map(|devices| devices.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+        cpal::default_host()
+            .output_devices()
+            .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default()
     }
 
     /// Select a local microphone by CPAL device name; None restores the OS default.
     pub fn set_input_device(&self, name: Option<String>) {
-        if let Ok(mut selected) = self.audio_devices.write() { selected.input = name; }
+        if let Ok(mut selected) = self.audio_devices.write() {
+            selected.input = name;
+        }
     }
 
     /// Select a local speaker by CPAL device name; None restores the OS default.
     pub fn set_output_device(&self, name: Option<String>) {
-        if let Ok(mut selected) = self.audio_devices.write() { selected.output = name; }
+        if let Ok(mut selected) = self.audio_devices.write() {
+            selected.output = name;
+        }
     }
 
     pub fn selected_audio_devices(&self) -> (Option<String>, Option<String>) {
-        self.audio_devices.read().map(|s| (s.input.clone(), s.output.clone())).unwrap_or_default()
+        self.audio_devices
+            .read()
+            .map(|s| (s.input.clone(), s.output.clone()))
+            .unwrap_or_default()
     }
 
     /// Enable only while push-to-talk is held or voice activation is active.
@@ -421,8 +561,13 @@ impl VoiceClient {
 
     /// Enable voice activation and set its normalized RMS threshold (0.0..=1.0).
     pub fn set_voice_activation(&self, enabled: bool, threshold: f32) {
-        let threshold = if threshold.is_finite() { threshold.clamp(0.0, 1.0) } else { 0.025 };
-        self.voice_activation_threshold.store(threshold.to_bits(), Ordering::Relaxed);
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            0.025
+        };
+        self.voice_activation_threshold
+            .store(threshold.to_bits(), Ordering::Relaxed);
         self.voice_activation.store(enabled, Ordering::Relaxed);
     }
 
@@ -432,44 +577,69 @@ impl VoiceClient {
 
     /// Set microphone amplification from 0.0 (silent) through 4.0.
     pub fn set_microphone_gain(&self, gain: f32) {
-        let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 1.0 };
-        self.microphone_gain.store(gain.to_bits(), Ordering::Relaxed);
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        self.microphone_gain
+            .store(gain.to_bits(), Ordering::Relaxed);
     }
 
     /// Set a speaker's playback level. Values are clamped to 0.0..=2.0.
     pub fn set_player_volume(&self, player: [u8; 16], volume: f32) {
         if let Ok(mut settings) = self.player_audio_settings.write() {
-            if !settings.contains_key(&player) && settings.len() >= 128 { return; }
+            if !settings.contains_key(&player) && settings.len() >= 128 {
+                return;
+            }
             let remove = {
                 let entry = settings.entry(player).or_default();
-                entry.volume = if volume.is_finite() { volume.clamp(0.0, 2.0) } else { 1.0 };
+                entry.volume = if volume.is_finite() {
+                    volume.clamp(0.0, 2.0)
+                } else {
+                    1.0
+                };
                 entry.volume == 1.0 && !entry.muted
             };
-            if remove { settings.remove(&player); }
+            if remove {
+                settings.remove(&player);
+            }
         }
     }
 
     /// Mute or unmute one remote speaker without affecting other players.
     pub fn set_player_muted(&self, player: [u8; 16], muted: bool) {
         if let Ok(mut settings) = self.player_audio_settings.write() {
-            if !settings.contains_key(&player) && settings.len() >= 128 { return; }
+            if !settings.contains_key(&player) && settings.len() >= 128 {
+                return;
+            }
             let remove = {
                 let entry = settings.entry(player).or_default();
                 entry.muted = muted;
                 entry.volume == 1.0 && !entry.muted
             };
-            if remove { settings.remove(&player); }
+            if remove {
+                settings.remove(&player);
+            }
         }
     }
 
     pub fn set_listener(&self, x: f64, y: f64, z: f64, yaw_degrees: f32) {
         if let Ok(mut pose) = self.listener.lock() {
-            *pose = ListenerPose { x, y, z, yaw: f64::from(yaw_degrees).to_radians(), active: true };
+            *pose = ListenerPose {
+                x,
+                y,
+                z,
+                yaw: f64::from(yaw_degrees).to_radians(),
+                active: true,
+            };
         }
     }
 
     pub fn clear_listener(&self) {
-        if let Ok(mut pose) = self.listener.lock() { pose.active = false; }
+        if let Ok(mut pose) = self.listener.lock() {
+            pose.active = false;
+        }
     }
 
     pub fn set_player_positions(&self, positions: Vec<([u8; 16], [f64; 3])>) {
@@ -501,20 +671,35 @@ impl VoiceClient {
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::Release);
         let _ = self.command_tx.try_send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
-        if let Some(worker) = self.audio_worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.audio_worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 impl Drop for VoiceClient {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
-fn resolve_voice_address(
+/// Cap on how many resolved endpoints the UDP worker rotates through while
+/// the voice server stays silent.
+const MAX_VOICE_ENDPOINTS: usize = 8;
+
+/// Resolve every candidate address for the voice endpoint. DNS names can
+/// legitimately resolve to several records (dual-stack A+AAAA, or multiple
+/// front ends); the official client only ever uses the first one, but when
+/// the first is unreachable there is no way to learn that from the official
+/// behavior, so the worker rotates through the full list while unanswered.
+fn resolve_voice_addresses(
     voice_host: &str,
     game_server_host: &str,
     default_port: u16,
-) -> Result<SocketAddr, VoiceError> {
+) -> Result<Vec<SocketAddr>, VoiceError> {
     let fallback_host = split_host_port(game_server_host.trim())?.0;
     let (host, port) = if voice_host.trim().is_empty() {
         (fallback_host, default_port)
@@ -533,41 +718,61 @@ fn resolve_voice_address(
     }
     let host = normalize_host(host)?;
     if host == "rtc-local" || host == "rtc-remote" {
-        return Ok(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port));
+        return Ok(vec![SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        )]);
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    (host.as_str(), port)
+    let mut candidates = Vec::new();
+    for address in (host.as_str(), port)
         .to_socket_addrs()
         .map_err(VoiceError::Io)?
-        .next()
-        .ok_or_else(|| VoiceError::Resolve(format!("{host}:{port}")))
+    {
+        if candidates.len() >= MAX_VOICE_ENDPOINTS {
+            break;
+        }
+        if !candidates.contains(&address) {
+            candidates.push(address);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(VoiceError::Resolve(format!("{host}:{port}")));
+    }
+    Ok(candidates)
 }
 
 /// Split a Minecraft-style host authority without accidentally treating the
 /// port of the game server as the voice UDP port.
 fn split_host_port(value: &str) -> Result<(&str, Option<u16>), VoiceError> {
     if let Some(rest) = value.strip_prefix('[') {
-        let close = rest.find(']')
+        let close = rest
+            .find(']')
             .ok_or_else(|| VoiceError::Resolve(format!("invalid IPv6 authority: {value}")))?;
         let host = &rest[..close];
         let suffix = &rest[close + 1..];
         if suffix.is_empty() {
             return Ok((host, None));
         }
-        let port_text = suffix.strip_prefix(':')
+        let port_text = suffix
+            .strip_prefix(':')
             .ok_or_else(|| VoiceError::Resolve(format!("invalid host authority: {value}")))?;
-        let port = port_text.parse::<u16>()
-            .ok().filter(|port| *port != 0)
+        let port = port_text
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
             .ok_or_else(|| VoiceError::Resolve(format!("invalid port in authority: {value}")))?;
         return Ok((host, Some(port)));
     }
 
     if value.matches(':').count() == 1 {
         let (host, port_text) = value.split_once(':').expect("one colon was counted");
-        let port = port_text.parse::<u16>()
-            .ok().filter(|port| *port != 0)
+        let port = port_text
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
             .ok_or_else(|| VoiceError::Resolve(format!("invalid port in authority: {value}")))?;
         return Ok((host, Some(port)));
     }
@@ -582,14 +787,51 @@ fn normalize_host(value: &str) -> Result<String, VoiceError> {
         return Err(VoiceError::Resolve("empty voice server host".into()));
     }
     if value.chars().any(char::is_whitespace) {
-        return Err(VoiceError::Resolve("voice server host contains whitespace".into()));
+        return Err(VoiceError::Resolve(
+            "voice server host contains whitespace".into(),
+        ));
     }
     Ok(value.to_owned())
+}
+
+/// Unanswered authentication attempts after which the worker moves on to the
+/// next resolved endpoint. 5s per endpoint keeps the first candidate - the
+/// same address the official client would use - active for long enough,
+/// while still cycling through all candidates within reasonable time.
+const ENDPOINT_RETRY_THRESHOLD: u32 = 5;
+
+/// IPv4 targets on a dual-stack (IPv6-bound) socket must be sent as
+/// v4-mapped IPv6 addresses.
+fn mapped_target(dual_stack: bool, target: SocketAddr) -> SocketAddr {
+    if dual_stack && target.is_ipv4() {
+        let mapped = match target.ip() {
+            IpAddr::V4(v4) => {
+                // ::ffff:0:0/96 followed by the four IPv4 octets.
+                let [a, b, c, d] = v4.octets();
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xffff,
+                    u16::from_be_bytes([a, b]),
+                    u16::from_be_bytes([c, d]),
+                ))
+            }
+            IpAddr::V6(v6) => IpAddr::V6(v6),
+        };
+        SocketAddr::new(mapped, target.port())
+    } else {
+        target
+    }
 }
 
 fn run_worker(
     socket: UdpSocket,
     info: VoiceServerInfo,
+    endpoints: Vec<SocketAddr>,
+    dual_stack: bool,
     application: Application,
     commands: Receiver<Command>,
     events: SyncSender<VoiceEvent>,
@@ -605,7 +847,9 @@ fn run_worker(
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
         Ok(value) => value,
         Err(_) => {
-            let _ = events.try_send(VoiceEvent::Disconnected("Opus encoder initialization failed".into()));
+            let _ = events.try_send(VoiceEvent::Disconnected(
+                "Opus encoder initialization failed".into(),
+            ));
             return;
         }
     };
@@ -622,24 +866,34 @@ fn run_worker(
     let mut last_keepalive = Instant::now();
     let keepalive_timeout = Duration::from_millis((info.keep_alive_ms as u64).saturating_mul(10));
     let mut receive = [0u8; MAX_DATAGRAM];
+    // The official client talks to exactly one resolved address. This client
+    // starts there too, but keeps rotating through every resolved endpoint
+    // while authentication goes unanswered, so dual-stack or multi-record
+    // hosts still work when the first address is a dead end.
+    let mut endpoint_index = 0usize;
+    let mut attempts_on_endpoint: u32 = 0;
+    let mut auth_nonce: [u8; 16] = [0u8; 16];
+    let mut endpoint = endpoints[endpoint_index];
 
     while running.load(Ordering::Acquire) {
         loop {
             match commands.try_recv() {
                 Ok(Command::Pcm(pcm)) => {
-                    if validated && (
-                        transmitting.load(Ordering::Relaxed)
-                            || voice_activation.load(Ordering::Relaxed)
-                    ) {
+                    if validated
+                        && (transmitting.load(Ordering::Relaxed)
+                            || voice_activation.load(Ordering::Relaxed))
+                    {
                         let mut opus = [0u8; 1276];
-                        if let Ok(length) = encoder.encode_i16(&pcm, FRAME_SAMPLES, &mut opus[..payload_limit]) {
+                        if let Ok(length) =
+                            encoder.encode_i16(&pcm, FRAME_SAMPLES, &mut opus[..payload_limit])
+                        {
                             let packet = Packet::Mic {
                                 opus: opus[..length].to_vec(),
                                 sequence,
                                 whispering: whispering.load(Ordering::Relaxed),
                             };
                             sequence = sequence.wrapping_add(1);
-                            let _ = send_packet(&socket, &info, &packet);
+                            let _ = send_packet(&socket, &info, endpoint, dual_stack, &packet);
                         }
                     }
                 }
@@ -654,38 +908,73 @@ fn run_worker(
                 }
             }
         }
-        if !running.load(Ordering::Acquire) { break; }
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
 
         if !authenticated && last_auth.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
-            if let Err(error) = send_packet(&socket, &info, &Packet::Authenticate {
-                player: info.player,
-                secret: info.secret,
-            }) {
-                // Windows reports an ICMP port-unreachable from a previous
-                // datagram as WSAECONNRESET on the next send; that is a
-                // reachability signal, not a socket failure - it is counted
-                // by the unanswered-attempts warning below instead.
+            // Compat-20 servers identify the player inside the Authenticate
+            // payload; compat-21 servers identify the datagram by the
+            // connection UUID in the envelope and the payload is empty.
+            let authenticate = match info.profile {
+                SvcProfile::Compat20 => Packet::Authenticate {
+                    player: info.player,
+                    secret: info.secret,
+                },
+                SvcProfile::Compat21 => Packet::Authenticate {
+                    player: [0u8; 16],
+                    secret: [0u8; 16],
+                },
+            };
+            if let Err(error) = send_packet(&socket, &info, endpoint, dual_stack, &authenticate) {
+                // A connectionless socket should not surface stale ICMP
+                // failures; if one still appears it is a reachability
+                // signal, not a socket failure - the unanswered-attempts
+                // warning below tracks that instead.
                 if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending authentication failed: {error}");
                 }
             }
             let attempts = auth_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+            attempts_on_endpoint += 1;
             if attempts % 5 == 0 {
                 eprintln!(
-                    "[svchorizon] Voice server has not answered {attempts} authentication attempts yet (voice UDP port blocked or wrong endpoint?)"
+                    "[svchorizon] Voice server has not answered {attempts} authentication attempts yet (endpoint {endpoint})"
+                );
+            }
+            if attempts_on_endpoint >= ENDPOINT_RETRY_THRESHOLD && endpoints.len() > 1 {
+                endpoint_index = (endpoint_index + 1) % endpoints.len();
+                endpoint = endpoints[endpoint_index];
+                attempts_on_endpoint = 0;
+                eprintln!(
+                    "[svchorizon] No answer yet - switching voice endpoint candidate to {endpoint}"
                 );
             }
             if attempts == 15 {
-                let peer = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".into());
                 eprintln!(
-                    "[svchorizon] The voice server at {peer} never answered authentication for 15s. If official voice chat works on this server from this PC, the UDP replies are being filtered locally - check that horizon-client.exe is allowed in Windows Firewall (inbound UDP) and in any antivirus with network protection. Otherwise the server's voice UDP port is likely not opened/forwarded (hosting panels need a second UDP port for voice chat)."
+                    "[svchorizon] No voice UDP answer for 15s. This client speaks Simple Voice Chat protocol generations {} - if the server runs something else it will stay silent. Otherwise check that horizon-client.exe is allowed in Windows Firewall (inbound UDP) and any antivirus, and that the server's voice UDP port {} is open/forwarded.",
+                    SVC_PROFILES
+                        .iter()
+                        .map(|p| p.compatibility_version().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    info.port
                 );
             }
             last_auth = Some(Instant::now());
-        } else if authenticated && !validated
+        } else if authenticated
+            && !validated
             && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
-            if let Err(error) = send_packet(&socket, &info, &Packet::ConnectionCheck) {
+            // Compat-21 validation echoes the nonce the server handed out in
+            // the AuthenticateAck; compat-20 servers expect an empty packet.
+            let check = match info.profile {
+                SvcProfile::Compat20 => Packet::ConnectionCheck { nonce: None },
+                SvcProfile::Compat21 => Packet::ConnectionCheck {
+                    nonce: Some(auth_nonce),
+                },
+            };
+            if let Err(error) = send_packet(&socket, &info, endpoint, dual_stack, &check) {
                 if !error.is_connection_reset() {
                     eprintln!("[svchorizon] sending connection check failed: {error}");
                 }
@@ -695,7 +984,9 @@ fn run_worker(
 
         if validated && last_keepalive.elapsed() > keepalive_timeout {
             connected.store(false, Ordering::Release);
-            let _ = events.try_send(VoiceEvent::Disconnected("voice server keepalive timed out".into()));
+            let _ = events.try_send(VoiceEvent::Disconnected(
+                "voice server keepalive timed out".into(),
+            ));
             break;
         }
 
@@ -705,10 +996,14 @@ fn run_worker(
                     continue;
                 };
                 match packet {
-                    Packet::AuthenticateAck => {
+                    Packet::AuthenticateAck { nonce } => {
                         authenticated = true;
                         auth_attempts.store(0, Ordering::Relaxed);
+                        attempts_on_endpoint = 0;
                         last_check = None;
+                        if let Some(nonce) = nonce {
+                            auth_nonce = nonce;
+                        }
                     }
                     Packet::ConnectionCheckAck => {
                         if !validated {
@@ -720,43 +1015,91 @@ fn run_worker(
                     }
                     Packet::KeepAlive => {
                         last_keepalive = Instant::now();
-                        if let Err(error) = send_packet(&socket, &info, &Packet::KeepAlive) {
+                        if let Err(error) =
+                            send_packet(&socket, &info, endpoint, dual_stack, &Packet::KeepAlive)
+                        {
                             if !error.is_connection_reset() {
                                 eprintln!("[svchorizon] sending keepalive failed: {error}");
                             }
                         }
                     }
                     Packet::Ping { id, timestamp } => {
-                        let _ = send_packet(&socket, &info, &Packet::Ping { id, timestamp });
+                        let _ = send_packet(
+                            &socket,
+                            &info,
+                            endpoint,
+                            dual_stack,
+                            &Packet::Ping { id, timestamp },
+                        );
                     }
-                    Packet::PlayerSound { sender, opus, sequence, distance, .. } => {
+                    Packet::PlayerSound {
+                        sender,
+                        opus,
+                        sequence,
+                        distance,
+                        ..
+                    } => {
                         if validated {
-                            let position = player_positions.read().ok()
+                            let position = player_positions
+                                .read()
+                                .ok()
                                 .and_then(|positions| positions.get(&sender).copied());
-                            let ready = jitter.push(PendingAudio {
-                                sender, sequence, opus, position, max_distance: Some(distance),
-                            }, Instant::now());
+                            let ready = jitter.push(
+                                PendingAudio {
+                                    sender,
+                                    sequence,
+                                    opus,
+                                    position,
+                                    max_distance: Some(distance),
+                                },
+                                Instant::now(),
+                            );
                             for frame in ready {
                                 emit_audio(&mut decoders, &audio, frame);
                             }
                         }
                     }
-                    Packet::GroupSound { sender, opus, sequence, .. } => {
+                    Packet::GroupSound {
+                        sender,
+                        opus,
+                        sequence,
+                        ..
+                    } => {
                         if validated {
-                            let ready = jitter.push(PendingAudio {
-                                sender, sequence, opus, position: None, max_distance: None,
-                            }, Instant::now());
+                            let ready = jitter.push(
+                                PendingAudio {
+                                    sender,
+                                    sequence,
+                                    opus,
+                                    position: None,
+                                    max_distance: None,
+                                },
+                                Instant::now(),
+                            );
                             for frame in ready {
                                 emit_audio(&mut decoders, &audio, frame);
                             }
                         }
                     }
-                    Packet::LocationSound { sender, location, opus, sequence, distance, .. } => {
+                    Packet::LocationSound {
+                        sender,
+                        location,
+                        opus,
+                        sequence,
+                        distance,
+                        ..
+                    } => {
                         if validated {
-                            let ready = jitter.push(PendingAudio {
-                                sender, sequence, opus, position: Some(location),
-                                max_distance: Some(distance),
-                            }, Instant::now());
+                            let ready = jitter.push(
+                                PendingAudio {
+                                    sender,
+                                    sequence,
+                                    opus,
+                                    position: Some(location),
+                                    max_distance: Some(distance),
+                                },
+                                Instant::now(),
+                            );
                             for frame in ready {
                                 emit_audio(&mut decoders, &audio, frame);
                             }
@@ -765,17 +1108,20 @@ fn run_worker(
                     _ => {}
                 }
             }
-            Err(error) if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
                 // Windows surfaces a stray ICMP port-unreachable as
                 // WSAECONNRESET on a connected UDP socket; keep running and
                 // let the unanswered-authentication counter report it.
                 | std::io::ErrorKind::ConnectionReset
-            ) => {}
+                ) => {}
             Err(error) => {
                 connected.store(false, Ordering::Release);
-                let _ = events.try_send(VoiceEvent::Disconnected(format!("UDP socket failed: {error}")));
+                let _ = events.try_send(VoiceEvent::Disconnected(format!(
+                    "UDP socket failed: {error}"
+                )));
                 break;
             }
         }
@@ -793,16 +1139,28 @@ fn emit_audio(
     audio: &SyncSender<AudioFrame>,
     pending: PendingAudio,
 ) {
-    if pending.opus.len() > MAX_OPUS { return; }
+    if pending.opus.len() > MAX_OPUS {
+        return;
+    }
     if !decoders.contains_key(&pending.sender) {
-        let Ok(decoder) = OpusDecoder::new(SAMPLE_RATE, 1) else { return; };
+        let Ok(decoder) = OpusDecoder::new(SAMPLE_RATE, 1) else {
+            return;
+        };
         decoders.insert(pending.sender, decoder);
     }
-    let Some(decoder) = decoders.get_mut(&pending.sender) else { return; };
+    let Some(decoder) = decoders.get_mut(&pending.sender) else {
+        return;
+    };
     let mut float_pcm = [0.0f32; FRAME_SAMPLES];
-    let Ok(samples) = decoder.decode(&pending.opus, FRAME_SAMPLES, &mut float_pcm) else { return; };
+    let Ok(samples) = decoder.decode(&pending.opus, FRAME_SAMPLES, &mut float_pcm) else {
+        return;
+    };
     let mut pcm = [0i16; FRAME_SAMPLES];
-    for (out, input) in pcm.iter_mut().zip(float_pcm.iter()).take(samples.min(FRAME_SAMPLES)) {
+    for (out, input) in pcm
+        .iter_mut()
+        .zip(float_pcm.iter())
+        .take(samples.min(FRAME_SAMPLES))
+    {
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
     let _ = audio.try_send(AudioFrame {
@@ -836,49 +1194,90 @@ fn run_audio_io(
         if active_selection.as_ref() != Some(&selected) {
             streams.clear();
             let input = match selected.input.as_deref() {
-                Some(name) => host.input_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next())
+                Some(name) => host
+                    .input_devices()
+                    .ok()
+                    .and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next())
                     .or_else(|| host.default_input_device()),
                 None => host.default_input_device(),
             };
             match input {
                 Some(device) => {
                     let name = device.name().unwrap_or_else(|_| "<unknown>".into());
-                    match build_input_stream(&device, command_tx.clone(), Arc::clone(&transmitting),
-                        Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
-                        Arc::clone(&microphone_gain), events.clone()) {
+                    match build_input_stream(
+                        &device,
+                        command_tx.clone(),
+                        Arc::clone(&transmitting),
+                        Arc::clone(&voice_activation),
+                        Arc::clone(&voice_activation_threshold),
+                        Arc::clone(&microphone_gain),
+                        events.clone(),
+                    ) {
                         Ok(stream) => match stream.play() {
                             Ok(()) => {
                                 eprintln!("[svchorizon] Microphone opened: {name}");
                                 streams.push(stream);
                             }
-                            Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start microphone: {err}"))); }
+                            Err(err) => {
+                                let _ = events.try_send(VoiceEvent::AudioUnavailable(format!(
+                                    "could not start microphone: {err}"
+                                )));
+                            }
                         },
-                        Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("microphone unavailable: {err}"))); }
+                        Err(err) => {
+                            let _ = events.try_send(VoiceEvent::AudioUnavailable(format!(
+                                "microphone unavailable: {err}"
+                            )));
+                        }
                     }
                 }
-                None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default microphone device".into())); }
+                None => {
+                    let _ = events.try_send(VoiceEvent::AudioUnavailable(
+                        "no selected/default microphone device".into(),
+                    ));
+                }
             }
             let output = match selected.output.as_deref() {
-                Some(name) => host.output_devices().ok().and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next())
+                Some(name) => host
+                    .output_devices()
+                    .ok()
+                    .and_then(|ds| ds.filter(|d| d.name().ok().as_deref() == Some(name)).next())
                     .or_else(|| host.default_output_device()),
                 None => host.default_output_device(),
             };
             match output {
                 Some(device) => {
                     let name = device.name().unwrap_or_else(|_| "<unknown>".into());
-                    match build_output_stream(&device, Arc::clone(&shared_rx), events.clone(),
-                        Arc::clone(&listener), Arc::clone(&player_audio_settings)) {
+                    match build_output_stream(
+                        &device,
+                        Arc::clone(&shared_rx),
+                        events.clone(),
+                        Arc::clone(&listener),
+                        Arc::clone(&player_audio_settings),
+                    ) {
                         Ok(stream) => match stream.play() {
                             Ok(()) => {
                                 eprintln!("[svchorizon] Speaker opened: {name}");
                                 streams.push(stream);
                             }
-                            Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("could not start speaker: {err}"))); }
+                            Err(err) => {
+                                let _ = events.try_send(VoiceEvent::AudioUnavailable(format!(
+                                    "could not start speaker: {err}"
+                                )));
+                            }
                         },
-                        Err(err) => { let _ = events.try_send(VoiceEvent::AudioUnavailable(format!("speaker unavailable: {err}"))); }
+                        Err(err) => {
+                            let _ = events.try_send(VoiceEvent::AudioUnavailable(format!(
+                                "speaker unavailable: {err}"
+                            )));
+                        }
                     }
                 }
-                None => { let _ = events.try_send(VoiceEvent::AudioUnavailable("no selected/default speaker device".into())); }
+                None => {
+                    let _ = events.try_send(VoiceEvent::AudioUnavailable(
+                        "no selected/default speaker device".into(),
+                    ));
+                }
             }
             active_selection = Some(selected);
         }
@@ -926,7 +1325,11 @@ impl InputAssembler {
     fn push(&mut self, sample: f32) {
         let gain = f32::from_bits(self.microphone_gain.load(Ordering::Relaxed));
         let sample = (sample * gain).clamp(-1.0, 1.0);
-        if !self.has_previous { self.previous = sample; self.has_previous = true; return; }
+        if !self.has_previous {
+            self.previous = sample;
+            self.has_previous = true;
+            return;
+        }
         self.phase += SAMPLE_RATE as u64;
         while self.phase >= u64::from(self.input_rate) {
             self.phase -= u64::from(self.input_rate);
@@ -940,14 +1343,18 @@ impl InputAssembler {
                 let should_send = if ptt {
                     true
                 } else if voice_activation {
-                    let energy = self.frame.iter()
+                    let energy = self
+                        .frame
+                        .iter()
                         .map(|sample| {
                             let normalized = *sample as f32 / 32768.0;
                             normalized * normalized
                         })
-                        .sum::<f32>() / FRAME_SAMPLES as f32;
+                        .sum::<f32>()
+                        / FRAME_SAMPLES as f32;
                     let rms = energy.sqrt();
-                    let threshold = f32::from_bits(self.voice_activation_threshold.load(Ordering::Relaxed));
+                    let threshold =
+                        f32::from_bits(self.voice_activation_threshold.load(Ordering::Relaxed));
                     rms >= threshold
                 } else {
                     false
@@ -981,46 +1388,93 @@ fn build_input_stream(
     match format {
         cpal::SampleFormat::F32 => {
             let mut input = InputAssembler::new(
-                rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+                rate,
+                tx,
+                transmitting,
+                Arc::clone(&voice_activation),
+                Arc::clone(&voice_activation_threshold),
                 Arc::clone(&microphone_gain),
             );
             let errors = events;
-            device.build_input_stream(&config, move |data: &[f32], _| {
-                for frame in data.chunks(channels) {
-                    input.push(frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32);
-                }
-            }, move |error| {
-                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("microphone stream error: {error}")));
-            }, None).map_err(|e| e.to_string())
+            device
+                .build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        for frame in data.chunks(channels) {
+                            input.push(
+                                frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32,
+                            );
+                        }
+                    },
+                    move |error| {
+                        let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!(
+                            "microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())
         }
         cpal::SampleFormat::I16 => {
             let mut input = InputAssembler::new(
-                rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
+                rate,
+                tx,
+                transmitting,
+                Arc::clone(&voice_activation),
+                Arc::clone(&voice_activation_threshold),
                 Arc::clone(&microphone_gain),
             );
             let errors = events;
-            device.build_input_stream(&config, move |data: &[i16], _| {
-                for frame in data.chunks(channels) {
-                    let mono = frame.iter().map(|s| *s as f32 / 32768.0).sum::<f32>()
-                        / frame.len().max(1) as f32;
-                    input.push(mono);
-                }
-            }, move |error| {
-                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("microphone stream error: {error}")));
-            }, None).map_err(|e| e.to_string())
+            device
+                .build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        for frame in data.chunks(channels) {
+                            let mono = frame.iter().map(|s| *s as f32 / 32768.0).sum::<f32>()
+                                / frame.len().max(1) as f32;
+                            input.push(mono);
+                        }
+                    },
+                    move |error| {
+                        let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!(
+                            "microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut input = InputAssembler::new(rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold), Arc::clone(&microphone_gain));
+            let mut input = InputAssembler::new(
+                rate,
+                tx,
+                transmitting,
+                Arc::clone(&voice_activation),
+                Arc::clone(&voice_activation_threshold),
+                Arc::clone(&microphone_gain),
+            );
             let errors = events;
-            device.build_input_stream(&config, move |data: &[u16], _| {
-                for frame in data.chunks(channels) {
-                    let mono = frame.iter().map(|s| (*s as f32 - 32768.0) / 32768.0).sum::<f32>()
-                        / frame.len().max(1) as f32;
-                    input.push(mono);
-                }
-            }, move |error| {
-                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("microphone stream error: {error}")));
-            }, None).map_err(|e| e.to_string())
+            device
+                .build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        for frame in data.chunks(channels) {
+                            let mono = frame
+                                .iter()
+                                .map(|s| (*s as f32 - 32768.0) / 32768.0)
+                                .sum::<f32>()
+                                / frame.len().max(1) as f32;
+                            input.push(mono);
+                        }
+                    },
+                    move |error| {
+                        let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!(
+                            "microphone stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())
         }
         other => Err(format!("unsupported microphone sample format {other:?}")),
     }
@@ -1061,9 +1515,15 @@ impl OutputAssembler {
     }
 
     fn gains_for(&self, frame: &AudioFrame) -> (f32, f32) {
-        let Some(source) = frame.position else { return (1.0, 1.0); };
-        let Ok(listener) = self.listener.lock() else { return (1.0, 1.0); };
-        if !listener.active { return (1.0, 1.0); }
+        let Some(source) = frame.position else {
+            return (1.0, 1.0);
+        };
+        let Ok(listener) = self.listener.lock() else {
+            return (1.0, 1.0);
+        };
+        if !listener.active {
+            return (1.0, 1.0);
+        }
         let dx = source[0] - listener.x;
         let dy = source[1] - listener.y;
         let dz = source[2] - listener.z;
@@ -1071,10 +1531,14 @@ impl OutputAssembler {
         let max_distance = f64::from(frame.max_distance.unwrap_or(0.0));
         let attenuation = if max_distance > 0.0 {
             ((max_distance - distance) / max_distance).clamp(0.0, 1.0) as f32
-        } else { 1.0 };
+        } else {
+            1.0
+        };
         let pan: f32 = if distance > 0.001 {
             ((dx * listener.yaw.cos() - dz * listener.yaw.sin()) / distance).clamp(-1.0, 1.0) as f32
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         (
             attenuation * (1.0f32 - pan).clamp(0.0, 1.0),
             attenuation * (1.0f32 + pan).clamp(0.0, 1.0),
@@ -1089,14 +1553,19 @@ impl OutputAssembler {
                 Ok(rx) => rx.try_recv().ok(),
                 Err(_) => None,
             };
-            let Some(frame) = frame else { break; };
+            let Some(frame) = frame else {
+                break;
+            };
             if !self.speakers.contains_key(&frame.sender)
                 && self.speakers.len() >= Self::MAX_SPEAKERS
             {
                 continue;
             }
             let (mut left_gain, mut right_gain) = self.gains_for(&frame);
-            let settings = self.player_audio_settings.read().ok()
+            let settings = self
+                .player_audio_settings
+                .read()
+                .ok()
                 .and_then(|all| all.get(&frame.sender).copied())
                 .unwrap_or_default();
             if settings.muted {
@@ -1128,8 +1597,8 @@ impl OutputAssembler {
                     let next = (index + 1).min(FRAME_SAMPLES - 1);
                     let fraction = (voice.position - index as f64) as f32;
                     let pcm = &voice.frame.pcm;
-                    let sample = pcm[index] as f32
-                        + (pcm[next] as f32 - pcm[index] as f32) * fraction;
+                    let sample =
+                        pcm[index] as f32 + (pcm[next] as f32 - pcm[index] as f32) * fraction;
                     left += sample * voice.left_gain;
                     right += sample * voice.right_gain;
                     voice.position += step;
@@ -1166,56 +1635,104 @@ fn build_output_stream(
     let rate = config.sample_rate.0;
     match format {
         cpal::SampleFormat::F32 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings));
+            let mut output = OutputAssembler::new(
+                rx,
+                rate,
+                Arc::clone(&listener),
+                Arc::clone(&player_audio_settings),
+            );
             let errors = events;
-            device.build_output_stream(&config, move |data: &mut [f32], _| {
-                for frame in data.chunks_mut(channels) {
-                    let stereo = output.next_stereo();
-                    if frame.len() == 1 {
-                        frame[0] = (i32::from(stereo[0]) + i32::from(stereo[1])) as f32 / 65536.0;
-                    } else {
-                        frame[0] = stereo[0] as f32 / 32768.0;
-                        frame[1] = stereo[1] as f32 / 32768.0;
-                        for sample in frame.iter_mut().skip(2) { *sample = 0.0; }
-                    }
-                }
-            }, move |error| {
-                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
-            }, None).map_err(|e| e.to_string())
+            device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [f32], _| {
+                        for frame in data.chunks_mut(channels) {
+                            let stereo = output.next_stereo();
+                            if frame.len() == 1 {
+                                frame[0] =
+                                    (i32::from(stereo[0]) + i32::from(stereo[1])) as f32 / 65536.0;
+                            } else {
+                                frame[0] = stereo[0] as f32 / 32768.0;
+                                frame[1] = stereo[1] as f32 / 32768.0;
+                                for sample in frame.iter_mut().skip(2) {
+                                    *sample = 0.0;
+                                }
+                            }
+                        }
+                    },
+                    move |error| {
+                        let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!(
+                            "speaker stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())
         }
         cpal::SampleFormat::I16 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings));
+            let mut output = OutputAssembler::new(
+                rx,
+                rate,
+                Arc::clone(&listener),
+                Arc::clone(&player_audio_settings),
+            );
             let errors = events;
-            device.build_output_stream(&config, move |data: &mut [i16], _| {
-                for frame in data.chunks_mut(channels) {
-                    let stereo = output.next_stereo();
-                    if frame.len() == 1 { frame[0] = ((i32::from(stereo[0]) + i32::from(stereo[1])) / 2) as i16; }
-                    else {
-                        frame[0] = stereo[0]; frame[1] = stereo[1];
-                        for sample in frame.iter_mut().skip(2) { *sample = 0; }
-                    }
-                }
-            }, move |error| {
-                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
-            }, None).map_err(|e| e.to_string())
+            device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _| {
+                        for frame in data.chunks_mut(channels) {
+                            let stereo = output.next_stereo();
+                            if frame.len() == 1 {
+                                frame[0] =
+                                    ((i32::from(stereo[0]) + i32::from(stereo[1])) / 2) as i16;
+                            } else {
+                                frame[0] = stereo[0];
+                                frame[1] = stereo[1];
+                                for sample in frame.iter_mut().skip(2) {
+                                    *sample = 0;
+                                }
+                            }
+                        }
+                    },
+                    move |error| {
+                        let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!(
+                            "speaker stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
             let mut output = OutputAssembler::new(rx, rate, listener, player_audio_settings);
             let errors = events;
-            device.build_output_stream(&config, move |data: &mut [u16], _| {
-                for frame in data.chunks_mut(channels) {
-                    let stereo = output.next_stereo();
-                    if frame.len() == 1 {
-                        frame[0] = ((i32::from(stereo[0]) + i32::from(stereo[1])) / 2 + 32768) as u16;
-                    } else {
-                        frame[0] = (i32::from(stereo[0]) + 32768) as u16;
-                        frame[1] = (i32::from(stereo[1]) + 32768) as u16;
-                        for sample in frame.iter_mut().skip(2) { *sample = 32768; }
-                    }
-                }
-            }, move |error| {
-                let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!("speaker stream error: {error}")));
-            }, None).map_err(|e| e.to_string())
+            device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [u16], _| {
+                        for frame in data.chunks_mut(channels) {
+                            let stereo = output.next_stereo();
+                            if frame.len() == 1 {
+                                frame[0] = ((i32::from(stereo[0]) + i32::from(stereo[1])) / 2
+                                    + 32768) as u16;
+                            } else {
+                                frame[0] = (i32::from(stereo[0]) + 32768) as u16;
+                                frame[1] = (i32::from(stereo[1]) + 32768) as u16;
+                                for sample in frame.iter_mut().skip(2) {
+                                    *sample = 32768;
+                                }
+                            }
+                        }
+                    },
+                    move |error| {
+                        let _ = errors.try_send(VoiceEvent::AudioUnavailable(format!(
+                            "speaker stream error: {error}"
+                        )));
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())
         }
         other => Err(format!("unsupported speaker sample format {other:?}")),
     }
@@ -1223,26 +1740,59 @@ fn build_output_stream(
 
 #[derive(Debug)]
 enum Packet {
-    Mic { opus: Vec<u8>, sequence: i64, whispering: bool },
-    /// SVC 2.6.27 authentication: player UUID followed by the raw 16-byte
-    /// secret issued in the SecretPacket (AuthenticatePacket.toBytes order).
-    Authenticate { player: [u8; 16], secret: [u8; 16] },
-    ConnectionCheck,
+    Mic {
+        opus: Vec<u8>,
+        sequence: i64,
+        whispering: bool,
+    },
+    /// Compat-20 (SVC 2.6.x) authentication: player UUID followed by the raw
+    /// 16-byte secret issued in the SecretPacket (AuthenticatePacket.toBytes
+    /// order). Compat-21 (SVC 2.7.x) encodes this packet empty; the fields
+    /// are only filled for the compat-20 generation.
+    Authenticate {
+        player: [u8; 16],
+        secret: [u8; 16],
+    },
     KeepAlive,
-    AuthenticateAck,
+    /// Compat-20: empty. Compat-21: carries the 16-byte nonce that the
+    /// client must echo back in ConnectionCheck.
+    AuthenticateAck {
+        nonce: Option<[u8; 16]>,
+    },
+    /// Compat-20: empty. Compat-21: echoes the AuthenticateAck nonce; the
+    /// server binds it to the client's source address.
+    ConnectionCheck {
+        nonce: Option<[u8; 16]>,
+    },
     ConnectionCheckAck,
-    Ping { id: [u8; 16], timestamp: i64 },
+    Ping {
+        id: [u8; 16],
+        timestamp: i64,
+    },
     PlayerSound {
-        channel: [u8; 16], sender: [u8; 16], opus: Vec<u8>,
-        sequence: i64, distance: f32, whispering: bool, category: Option<String>,
+        channel: [u8; 16],
+        sender: [u8; 16],
+        opus: Vec<u8>,
+        sequence: i64,
+        distance: f32,
+        whispering: bool,
+        category: Option<String>,
     },
     GroupSound {
-        channel: [u8; 16], sender: [u8; 16], opus: Vec<u8>,
-        sequence: i64, category: Option<String>,
+        channel: [u8; 16],
+        sender: [u8; 16],
+        opus: Vec<u8>,
+        sequence: i64,
+        category: Option<String>,
     },
     LocationSound {
-        channel: [u8; 16], sender: [u8; 16], location: [f64; 3],
-        opus: Vec<u8>, sequence: i64, distance: f32, category: Option<String>,
+        channel: [u8; 16],
+        sender: [u8; 16],
+        location: [f64; 3],
+        opus: Vec<u8>,
+        sequence: i64,
+        distance: f32,
+        category: Option<String>,
     },
 }
 
@@ -1264,59 +1814,108 @@ fn udp_self_test() -> Result<(), std::io::Error> {
     }
 }
 
-fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> Result<(), VoiceError> {
-    let plain = encode_packet(packet).ok_or(VoiceError::InvalidServerInfo("invalid outbound packet"))?;
+fn send_packet(
+    socket: &UdpSocket,
+    info: &VoiceServerInfo,
+    endpoint: SocketAddr,
+    dual_stack: bool,
+    packet: &Packet,
+) -> Result<(), VoiceError> {
+    let plain = encode_packet(packet, info.profile)
+        .ok_or(VoiceError::InvalidServerInfo("invalid outbound packet"))?;
     let mut nonce = [0u8; NONCE_BYTES];
-    SystemRandom::new().fill(&mut nonce)
+    SystemRandom::new()
+        .fill(&mut nonce)
         .map_err(|_| VoiceError::InvalidServerInfo("secure random generator failed"))?;
     let key = LessSafeKey::new(
         UnboundKey::new(&aead::AES_128_GCM, &info.secret)
             .map_err(|_| VoiceError::InvalidServerInfo("invalid AES-128 key"))?,
     );
     let mut encrypted = plain;
-    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut encrypted)
-        .map_err(|_| VoiceError::InvalidServerInfo("AES-GCM encryption failed"))?;
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::empty(),
+        &mut encrypted,
+    )
+    .map_err(|_| VoiceError::InvalidServerInfo("AES-GCM encryption failed"))?;
     let mut datagram = Vec::with_capacity(1 + 16 + 3 + NONCE_BYTES + encrypted.len());
     datagram.push(MAGIC);
-    // SVC 2.6.27 (compatibility 20): the server's secret map is keyed by the
-    // player's profile UUID, so every client datagram carries that UUID and
-    // the server resolves the AES key with Server.getSecret(playerUUID).
-    datagram.extend_from_slice(&info.player);
+    // The envelope UUID keys the server-side secret lookup and changes with
+    // the wire generation: compat-20 servers map it from the player's profile
+    // UUID, compat-21 servers from the per-connection UUID issued in the
+    // secret response (upstream ClientNetworkMessage.writeClient).
+    let envelope_id = match info.profile {
+        SvcProfile::Compat20 => info.player,
+        SvcProfile::Compat21 => info.connection_id,
+    };
+    datagram.extend_from_slice(&envelope_id);
     let mut body = Vec::with_capacity(NONCE_BYTES + encrypted.len());
     body.extend_from_slice(&nonce);
     body.extend_from_slice(&encrypted);
     write_byte_array(&mut datagram, &body);
-    socket.send(&datagram)?;
+    socket.send_to(&datagram, mapped_target(dual_stack, endpoint))?;
     Ok(())
 }
 
 fn decode_server_datagram(datagram: &[u8], secret: &[u8; 16]) -> Option<Packet> {
     let mut reader = Reader::new(datagram);
-    if reader.u8()? != MAGIC { return None; }
+    if reader.u8()? != MAGIC {
+        return None;
+    }
     let encrypted = reader.byte_array(MAX_DATAGRAM)?;
-    if !reader.done() || encrypted.len() < NONCE_BYTES + TAG_BYTES { return None; }
+    if !reader.done() || encrypted.len() < NONCE_BYTES + TAG_BYTES {
+        return None;
+    }
     let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES].try_into().ok()?;
     let mut plaintext = encrypted[NONCE_BYTES..].to_vec();
     let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, secret).ok()?);
-    let opened = key.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut plaintext).ok()?;
+    let opened = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::empty(),
+            &mut plaintext,
+        )
+        .ok()?;
     decode_packet(opened)
 }
 
-fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
+fn encode_packet(packet: &Packet, profile: SvcProfile) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match packet {
-        Packet::Mic { opus, sequence, whispering } => {
-            if opus.len() > MAX_OPUS { return None; }
-            out.push(MIC); write_byte_array(&mut out, opus); out.extend_from_slice(&sequence.to_be_bytes());
+        Packet::Mic {
+            opus,
+            sequence,
+            whispering,
+        } => {
+            if opus.len() > MAX_OPUS {
+                return None;
+            }
+            out.push(MIC);
+            write_byte_array(&mut out, opus);
+            out.extend_from_slice(&sequence.to_be_bytes());
             out.push(u8::from(*whispering));
         }
         Packet::Authenticate { player, secret } => {
-            out.push(AUTHENTICATE); out.extend_from_slice(player); out.extend_from_slice(secret);
+            out.push(AUTHENTICATE);
+            if profile == SvcProfile::Compat20 {
+                // Upstream 2.6.x AuthenticatePacket.toBytes: UUID, then the
+                // raw secret. The 2.7.x AuthenticatePacket is empty; the
+                // server identifies the connection from the envelope UUID.
+                out.extend_from_slice(player);
+                out.extend_from_slice(secret);
+            }
         }
-        Packet::ConnectionCheck => out.push(CONNECTION_CHECK),
+        Packet::ConnectionCheck { nonce } => {
+            out.push(CONNECTION_CHECK);
+            if let Some(nonce) = nonce {
+                out.extend_from_slice(nonce);
+            }
+        }
         Packet::KeepAlive => out.push(KEEP_ALIVE),
         Packet::Ping { id, timestamp } => {
-            out.push(PING); out.extend_from_slice(id); out.extend_from_slice(&timestamp.to_be_bytes());
+            out.push(PING);
+            out.extend_from_slice(id);
+            out.extend_from_slice(&timestamp.to_be_bytes());
         }
         _ => return None,
     }
@@ -1326,36 +1925,90 @@ fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
 fn decode_packet(bytes: &[u8]) -> Option<Packet> {
     let mut r = Reader::new(bytes);
     let packet = match r.u8()? {
-        MIC => Packet::Mic { opus: r.byte_array(MAX_OPUS)?, sequence: r.i64()?, whispering: r.boolean()? },
+        MIC => Packet::Mic {
+            opus: r.byte_array(MAX_OPUS)?,
+            sequence: r.i64()?,
+            whispering: r.boolean()?,
+        },
         AUTHENTICATE => Packet::Authenticate {
             player: r.array16()?,
             secret: r.array16()?,
         },
-        CONNECTION_CHECK => Packet::ConnectionCheck,
+        CONNECTION_CHECK => Packet::ConnectionCheck {
+            nonce: r.opt_array16()?,
+        },
         KEEP_ALIVE => Packet::KeepAlive,
-        AUTHENTICATE_ACK => Packet::AuthenticateAck,
+        AUTHENTICATE_ACK => Packet::AuthenticateAck {
+            nonce: r.opt_array16()?,
+        },
         CONNECTION_CHECK_ACK => Packet::ConnectionCheckAck,
-        PING => Packet::Ping { id: r.array16()?, timestamp: r.i64()? },
+        PING => Packet::Ping {
+            id: r.array16()?,
+            timestamp: r.i64()?,
+        },
         PLAYER_SOUND => {
-            let channel = r.array16()?; let sender = r.array16()?;
-            let opus = r.byte_array(MAX_OPUS)?; let sequence = r.i64()?;
-            let distance = r.f32()?; let flags = r.u8()?;
-            let category = if flags & 2 != 0 { Some(r.string(16)?) } else { None };
-            Packet::PlayerSound { channel, sender, opus, sequence, distance, whispering: flags & 1 != 0, category }
+            let channel = r.array16()?;
+            let sender = r.array16()?;
+            let opus = r.byte_array(MAX_OPUS)?;
+            let sequence = r.i64()?;
+            let distance = r.f32()?;
+            let flags = r.u8()?;
+            let category = if flags & 2 != 0 {
+                Some(r.string(16)?)
+            } else {
+                None
+            };
+            Packet::PlayerSound {
+                channel,
+                sender,
+                opus,
+                sequence,
+                distance,
+                whispering: flags & 1 != 0,
+                category,
+            }
         }
         GROUP_SOUND => {
-            let channel = r.array16()?; let sender = r.array16()?;
-            let opus = r.byte_array(MAX_OPUS)?; let sequence = r.i64()?;
-            let flags = r.u8()?; let category = if flags & 2 != 0 { Some(r.string(16)?) } else { None };
-            Packet::GroupSound { channel, sender, opus, sequence, category }
+            let channel = r.array16()?;
+            let sender = r.array16()?;
+            let opus = r.byte_array(MAX_OPUS)?;
+            let sequence = r.i64()?;
+            let flags = r.u8()?;
+            let category = if flags & 2 != 0 {
+                Some(r.string(16)?)
+            } else {
+                None
+            };
+            Packet::GroupSound {
+                channel,
+                sender,
+                opus,
+                sequence,
+                category,
+            }
         }
         LOCATION_SOUND => {
-            let channel = r.array16()?; let sender = r.array16()?;
+            let channel = r.array16()?;
+            let sender = r.array16()?;
             let location = [r.f64()?, r.f64()?, r.f64()?];
-            let opus = r.byte_array(MAX_OPUS)?; let sequence = r.i64()?;
-            let distance = r.f32()?; let flags = r.u8()?;
-            let category = if flags & 2 != 0 { Some(r.string(16)?) } else { None };
-            Packet::LocationSound { channel, sender, location, opus, sequence, distance, category }
+            let opus = r.byte_array(MAX_OPUS)?;
+            let sequence = r.i64()?;
+            let distance = r.f32()?;
+            let flags = r.u8()?;
+            let category = if flags & 2 != 0 {
+                Some(r.string(16)?)
+            } else {
+                None
+            };
+            Packet::LocationSound {
+                channel,
+                sender,
+                location,
+                opus,
+                sequence,
+                distance,
+                category,
+            }
         }
         _ => return None,
     };
@@ -1363,48 +2016,100 @@ fn decode_packet(bytes: &[u8]) -> Option<Packet> {
 }
 
 fn write_varint(out: &mut Vec<u8>, mut value: usize) {
-    while value > 0x7f { out.push((value as u8 & 0x7f) | 0x80); value >>= 7; }
+    while value > 0x7f {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
     out.push(value as u8);
 }
 fn write_byte_array(out: &mut Vec<u8>, bytes: &[u8]) {
-    write_varint(out, bytes.len()); out.extend_from_slice(bytes);
+    write_varint(out, bytes.len());
+    out.extend_from_slice(bytes);
 }
 
-struct Reader<'a> { bytes: &'a [u8], pos: usize }
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self { Self { bytes, pos: 0 } }
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
-        let result = self.bytes.get(self.pos..end)?; self.pos = end; Some(result)
+        let result = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(result)
     }
-    fn u8(&mut self) -> Option<u8> { Some(*self.take(1)?.first()?) }
-    fn boolean(&mut self) -> Option<bool> { match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None } }
-    fn array16(&mut self) -> Option<[u8; 16]> { self.take(16)?.try_into().ok() }
-    fn i64(&mut self) -> Option<i64> { Some(i64::from_be_bytes(self.take(8)?.try_into().ok()?)) }
-    fn f32(&mut self) -> Option<f32> { Some(f32::from_bits(u32::from_be_bytes(self.take(4)?.try_into().ok()?))) }
-    fn f64(&mut self) -> Option<f64> { Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?))) }
+    fn u8(&mut self) -> Option<u8> {
+        Some(*self.take(1)?.first()?)
+    }
+    fn boolean(&mut self) -> Option<bool> {
+        match self.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    fn array16(&mut self) -> Option<[u8; 16]> {
+        self.take(16)?.try_into().ok()
+    }
+    /// Reads a trailing 16-byte field that older generations omit entirely:
+    /// None when the packet already ended, Some(value) when 16 bytes remain.
+    fn opt_array16(&mut self) -> Option<Option<[u8; 16]>> {
+        if self.done() {
+            Some(None)
+        } else if self.bytes.len() - self.pos >= 16 {
+            Some(Some(self.array16()?))
+        } else {
+            None
+        }
+    }
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_bits(u32::from_be_bytes(
+            self.take(4)?.try_into().ok()?,
+        )))
+    }
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_bits(u64::from_be_bytes(
+            self.take(8)?.try_into().ok()?,
+        )))
+    }
     fn varint(&mut self) -> Option<usize> {
         let mut value = 0usize;
         for i in 0..5 {
             let b = self.u8()?;
-            if i == 4 && b & 0xf0 != 0 { return None; }
+            if i == 4 && b & 0xf0 != 0 {
+                return None;
+            }
             value |= usize::from(b & 0x7f) << (7 * i);
-            if b & 0x80 == 0 { return Some(value); }
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
         }
         None
     }
     fn byte_array(&mut self, max: usize) -> Option<Vec<u8>> {
         let len = self.varint()?;
-        if len > max { return None; }
+        if len > max {
+            return None;
+        }
         Some(self.take(len)?.to_vec())
     }
     fn string(&mut self, max_chars: usize) -> Option<String> {
         let bytes = self.byte_array(max_chars.checked_mul(4)?)?;
         let value = String::from_utf8(bytes).ok()?;
-        if value.chars().count() > max_chars { return None; }
+        if value.chars().count() > max_chars {
+            return None;
+        }
         Some(value)
     }
-    fn done(&self) -> bool { self.pos == self.bytes.len() }
+    fn done(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
 }
 
 #[cfg(test)]
@@ -1416,63 +2121,176 @@ mod tests {
         // An empty voice_host uses the game server hostname but the separate
         // voice UDP port, never the Minecraft TCP port.
         assert_eq!(
-            resolve_voice_address("", "127.0.0.1:25565", 24454).unwrap(),
-            "127.0.0.1:24454".parse::<SocketAddr>().unwrap()
+            resolve_voice_addresses("", "127.0.0.1:25565", 24454).unwrap(),
+            vec!["127.0.0.1:24454".parse::<SocketAddr>().unwrap()]
         );
 
         // A numeric voice_host overrides only the UDP port.
         assert_eq!(
-            resolve_voice_address("25566", "127.0.0.1:25565", 24454).unwrap(),
-            "127.0.0.1:25566".parse::<SocketAddr>().unwrap()
+            resolve_voice_addresses("25566", "127.0.0.1:25565", 24454).unwrap(),
+            vec!["127.0.0.1:25566".parse::<SocketAddr>().unwrap()]
         );
 
         // A host:port voice_host overrides both host and UDP port.
         assert_eq!(
-            resolve_voice_address("127.0.0.1:25567", "192.0.2.1:25565", 24454).unwrap(),
-            "127.0.0.1:25567".parse::<SocketAddr>().unwrap()
+            resolve_voice_addresses("127.0.0.1:25567", "192.0.2.1:25565", 24454).unwrap(),
+            vec!["127.0.0.1:25567".parse::<SocketAddr>().unwrap()]
         );
 
         // A host-only override keeps the packet's UDP port.
         assert_eq!(
-            resolve_voice_address("127.0.0.1", "192.0.2.1:25565", 24454).unwrap(),
-            "127.0.0.1:24454".parse::<SocketAddr>().unwrap()
+            resolve_voice_addresses("127.0.0.1", "192.0.2.1:25565", 24454).unwrap(),
+            vec!["127.0.0.1:24454".parse::<SocketAddr>().unwrap()]
         );
     }
 
     #[test]
     fn resolves_bracketed_ipv6_voice_host() {
         assert_eq!(
-            resolve_voice_address("[::1]:24455", "127.0.0.1:25565", 24454).unwrap(),
-            "[::1]:24455".parse::<SocketAddr>().unwrap()
+            resolve_voice_addresses("[::1]:24455", "127.0.0.1:25565", 24454).unwrap(),
+            vec!["[::1]:24455".parse::<SocketAddr>().unwrap()]
         );
     }
 
     #[test]
     fn rejects_invalid_voice_host_port() {
-        assert!(resolve_voice_address("127.0.0.1:0", "127.0.0.1:25565", 24454).is_err());
-        assert!(resolve_voice_address("127.0.0.1:not-a-port", "127.0.0.1:25565", 24454).is_err());
+        assert!(resolve_voice_addresses("127.0.0.1:0", "127.0.0.1:25565", 24454).is_err());
+        assert!(resolve_voice_addresses("127.0.0.1:not-a-port", "127.0.0.1:25565", 24454).is_err());
     }
 
     #[test]
-    fn outbound_auth_packet_carries_player_and_secret() {
-        // SVC 2.6.27 AuthenticatePacket.toBytes: playerUUID, then the raw secret.
-        let encoded = encode_packet(&Packet::Authenticate {
-            player: [0x11; 16],
-            secret: [0x42; 16],
-        }).unwrap();
+    fn compat20_outbound_auth_packet_carries_player_and_secret() {
+        // Upstream 2.6.x AuthenticatePacket.toBytes: playerUUID, then the raw
+        // secret; the 2.7.x generation encodes the packet empty instead.
+        let encoded = encode_packet(
+            &Packet::Authenticate {
+                player: [0x11; 16],
+                secret: [0x42; 16],
+            },
+            SvcProfile::Compat20,
+        )
+        .unwrap();
         let mut expected = vec![AUTHENTICATE];
         expected.extend_from_slice(&[0x11; 16]);
         expected.extend_from_slice(&[0x42; 16]);
         assert_eq!(encoded, expected);
-        assert!(matches!(decode_packet(&encoded), Some(Packet::Authenticate { player, secret })
-            if player == [0x11; 16] && secret == [0x42; 16]));
+        assert!(
+            matches!(decode_packet(&encoded), Some(Packet::Authenticate { player, secret })
+            if player == [0x11; 16] && secret == [0x42; 16])
+        );
+    }
+
+    #[test]
+    fn compat21_outbound_auth_packet_is_empty() {
+        let encoded = encode_packet(
+            &Packet::Authenticate {
+                player: [0x11; 16],
+                secret: [0x42; 16],
+            },
+            SvcProfile::Compat21,
+        )
+        .unwrap();
+        assert_eq!(encoded, vec![AUTHENTICATE]);
+    }
+
+    #[test]
+    fn authenticate_ack_decodes_with_and_without_nonce() {
+        // Compat-20 servers answer with an empty packet...
+        let empty = vec![AUTHENTICATE_ACK];
+        assert!(matches!(
+            decode_packet(&empty),
+            Some(Packet::AuthenticateAck { nonce: None })
+        ));
+        // ...compat-21 servers append the 16-byte HMAC challenge nonce.
+        let mut challenge = vec![AUTHENTICATE_ACK];
+        challenge.extend_from_slice(&[0x77; 16]);
+        assert!(matches!(
+            decode_packet(&challenge),
+            Some(Packet::AuthenticateAck { nonce: Some(n) }) if n == [0x77; 16]
+        ));
+        // A truncated nonce is rejected outright.
+        challenge.truncate(8);
+        assert!(decode_packet(&challenge).is_none());
+    }
+
+    #[test]
+    fn envelope_uses_player_uuid_for_compat20_and_connection_uuid_for_compat21() {
+        let info = VoiceServerInfo {
+            secret: [0x42; 16],
+            port: 24454,
+            player: [0x11; 16],
+            profile: SvcProfile::Compat20,
+            connection_id: [0x22; 16],
+            codec: 0,
+            mtu: 1024,
+            distance: 48.0,
+            keep_alive_ms: 1000,
+            groups: true,
+            host: String::new(),
+            allow_recording: true,
+        };
+        let (socket_a, _keep_a) = bound_loopback_pair();
+        let (socket_b, _keep_b) = bound_loopback_pair();
+        let target = socket_b.local_addr().unwrap();
+        let dual_stack = false;
+
+        send_packet(
+            &socket_a,
+            &info,
+            target,
+            dual_stack,
+            &Packet::Authenticate {
+                player: [0; 16],
+                secret: [0; 16],
+            },
+        )
+        .unwrap();
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        socket_b.recv(&mut buffer).unwrap();
+        assert_eq!(buffer[0], MAGIC);
+        assert_eq!(&buffer[1..17], &[0x11; 16]);
+
+        let info21 = VoiceServerInfo {
+            profile: SvcProfile::Compat21,
+            ..info
+        };
+        send_packet(
+            &socket_a,
+            &info21,
+            target,
+            dual_stack,
+            &Packet::Authenticate {
+                player: [0; 16],
+                secret: [0; 16],
+            },
+        )
+        .unwrap();
+        let length = socket_b.recv(&mut buffer).unwrap();
+        assert_eq!(buffer[0], MAGIC);
+        assert_eq!(&buffer[1..17], &[0x22; 16]);
+        // Same envelope payload shape either way (varint-prefixed body).
+        assert!(length > 17);
+    }
+
+    /// Two UDP sockets bound on the loopback, kept alive for the test body.
+    fn bound_loopback_pair() -> (UdpSocket, UdpSocket) {
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        (a, b)
     }
 
     #[test]
     fn mixes_speakers_but_keeps_each_speakers_packets_sequential() {
         let (tx, rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
-        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())));
+        let mut output = OutputAssembler::new(
+            Arc::new(Mutex::new(rx)),
+            SAMPLE_RATE as u32,
+            listener,
+            Arc::new(RwLock::new(HashMap::new())),
+        );
 
         let make_frame = |sender, sample| AudioFrame {
             sender,
@@ -1515,7 +2333,10 @@ mod tests {
         assert_eq!(jitter.push(make(10), now).len(), 1);
         assert!(jitter.push(make(12), now).is_empty());
         let ready = jitter.push(make(11), now + Duration::from_millis(10));
-        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![11, 12]);
+        assert_eq!(
+            ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+            vec![11, 12]
+        );
     }
 
     #[test]
@@ -1533,7 +2354,10 @@ mod tests {
         assert_eq!(jitter.push(make(20), now).len(), 1);
         assert!(jitter.push(make(22), now).is_empty());
         let ready = jitter.poll(now + Duration::from_millis(41));
-        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![21, 22]);
+        assert_eq!(
+            ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+            vec![21, 22]
+        );
         assert!(ready[0].opus.is_empty());
     }
 
