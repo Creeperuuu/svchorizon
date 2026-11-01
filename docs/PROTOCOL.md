@@ -9,9 +9,12 @@ server running that unmodified plugin. The compat-21 differences were
 verified against the upstream `2.7.0` source (branches `1.21.11`, `26.x`):
 an extra connection UUID in the secret payload and the UDP envelopes, an
 empty Authenticate packet, and a nonce challenge echoed through the
-connection check. The client probes both compatibility numbers on every join
-and switches its wire format to whichever the server answers with, so older
-and newer servers are supported without any single-version workaround.
+connection check. The client probes compatibility 21 first (the current
+upstream SVC 2.7.0-pre1 build for Minecraft 26.3), then probes 20 after a
+short timeout for older 2.6.x servers. Probes are sequential because the
+official server sends a visible incompatibility chat message for a mismatched
+request. Once a secret arrives, probing stops and the matching UDP wire
+generation is used.
 
 The Rust protocol and audio engine are isolated from Horizon's game hooks so
 their wire behavior can be tested independently.
