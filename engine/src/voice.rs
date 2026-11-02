@@ -679,6 +679,7 @@ fn run_worker(
     let mut validated = false;
     let mut sequence = 0i64;
     let mut last_auth: Option<Instant> = None;
+    let mut noted_padding = false;
     let mut last_check: Option<Instant> = None;
     let mut last_keepalive = Instant::now();
     let keepalive_timeout = Duration::from_millis((info.keep_alive_ms as u64).saturating_mul(10));
@@ -780,7 +781,15 @@ fn run_worker(
             Ok(length) => {
                 let received = received_datagrams.fetch_add(1, Ordering::Relaxed) + 1;
                 let packet = match decode_server_datagram_checked(&receive[..length], &info.secret) {
-                    Ok(packet) => packet,
+                    Ok((packet, trailing)) => {
+                        if trailing > 0 && !noted_padding {
+                            noted_padding = true;
+                            eprintln!(
+                                "[svchorizon] The voice server pads its packets ({trailing} trailing byte(s) after a {length}-byte datagram's packet); ignoring the padding like the official client does."
+                            );
+                        }
+                        packet
+                    }
                     Err(reason) => {
                         let rejected = rejected_replies.fetch_add(1, Ordering::Relaxed) + 1;
                         if rejected <= 3 {
@@ -1390,24 +1399,32 @@ fn send_packet(socket: &UdpSocket, info: &VoiceServerInfo, packet: &Packet) -> R
 /// Decode a server datagram, or say why it cannot be used. The reason is only
 /// for diagnostics: a server that answers but whose reply we reject looks
 /// exactly like a silent network from the outside.
-fn decode_server_datagram_checked(datagram: &[u8], secret: &[u8; 16]) -> Result<Packet, &'static str> {
+fn decode_server_datagram_checked(datagram: &[u8], secret: &[u8; 16]) -> Result<(Packet, usize), String> {
     let mut reader = Reader::new(datagram);
-    if reader.u8() != Some(MAGIC) { return Err("bad magic byte"); }
-    let Some(encrypted) = reader.byte_array(MAX_DATAGRAM) else { return Err("bad length prefix"); };
-    if !reader.done() { return Err("trailing bytes after the payload"); }
-    if encrypted.len() < NONCE_BYTES + TAG_BYTES { return Err("payload shorter than IV + GCM tag"); }
-    let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES].try_into().map_err(|_| "bad IV")?;
+    if reader.u8() != Some(MAGIC) { return Err("bad magic byte".into()); }
+    let Some(encrypted) = reader.byte_array(MAX_DATAGRAM) else { return Err("bad length prefix".into()); };
+    if !reader.done() { return Err("trailing bytes after the payload".into()); }
+    if encrypted.len() < NONCE_BYTES + TAG_BYTES { return Err("payload shorter than IV + GCM tag".into()); }
+    let nonce: [u8; NONCE_BYTES] = encrypted[..NONCE_BYTES].try_into().map_err(|_| "bad IV".to_owned())?;
     let mut plaintext = encrypted[NONCE_BYTES..].to_vec();
-    let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, secret).map_err(|_| "bad key")?);
+    let key = LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, secret).map_err(|_| "bad key".to_owned())?);
     let opened = key
         .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut plaintext)
-        .map_err(|_| "AES-GCM authentication failed (the reply was not encrypted with our secret)")?;
-    decode_packet(opened).ok_or("decrypted, but the packet body is malformed or unknown")
+        .map_err(|_| "AES-GCM authentication failed (the reply was not encrypted with our secret)".to_owned())?;
+    decode_packet_prefix(opened).ok_or_else(|| {
+        let head: Vec<String> = opened.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        format!(
+            "decrypted, but the {}-byte packet is unknown or malformed (type byte {}, first plaintext bytes {})",
+            opened.len(),
+            opened.first().map_or("<none>".to_owned(), |b| format!("0x{b:02x}")),
+            head.join(" ")
+        )
+    })
 }
 
 #[cfg(test)]
 fn decode_server_datagram(datagram: &[u8], secret: &[u8; 16]) -> Option<Packet> {
-    decode_server_datagram_checked(datagram, secret).ok()
+    decode_server_datagram_checked(datagram, secret).ok().map(|(packet, _)| packet)
 }
 
 fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
@@ -1431,7 +1448,20 @@ fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Strict decode: the whole buffer must be consumed. Used for our own encodings.
 fn decode_packet(bytes: &[u8]) -> Option<Packet> {
+    match decode_packet_prefix(bytes) {
+        Some((packet, 0)) => Some(packet),
+        _ => None,
+    }
+}
+
+/// Decode one packet from the start of `bytes` and return how many bytes follow
+/// it. The reference Java client reads the type byte and the fields it expects
+/// and never looks at what remains (`NetworkMessage.readFromBytes`), so a server
+/// or proxy that pads its packets is fully valid for it; we must tolerate that
+/// too instead of treating padding as corruption.
+fn decode_packet_prefix(bytes: &[u8]) -> Option<(Packet, usize)> {
     let mut r = Reader::new(bytes);
     let packet = match r.u8()? {
         MIC => Packet::Mic { opus: r.byte_array(MAX_OPUS)?, sequence: r.i64()?, whispering: r.boolean()? },
@@ -1467,7 +1497,7 @@ fn decode_packet(bytes: &[u8]) -> Option<Packet> {
         }
         _ => return None,
     };
-    if r.done() { Some(packet) } else { None }
+    Some((packet, bytes.len() - r.pos))
 }
 
 fn write_varint(out: &mut Vec<u8>, mut value: usize) {
@@ -1537,7 +1567,7 @@ mod tests {
     fn server_replies_are_decoded_or_rejected_with_a_reason() {
         let secret = [3u8; 16];
         let ack = server_datagram(&secret, &[AUTHENTICATE_ACK]);
-        assert!(matches!(decode_server_datagram_checked(&ack, &secret), Ok(Packet::AuthenticateAck)));
+        assert!(matches!(decode_server_datagram_checked(&ack, &secret), Ok((Packet::AuthenticateAck, 0))));
 
         let mut wrong_magic = ack.clone();
         wrong_magic[0] = 0x00;
@@ -1553,8 +1583,30 @@ mod tests {
         assert_eq!(decode_server_datagram_checked(&trailing, &secret).unwrap_err(), "trailing bytes after the payload");
         assert!(decode_server_datagram_checked(&[MAGIC], &secret).is_err());
 
-        let unknown = server_datagram(&secret, &[0x7e]);
-        assert!(decode_server_datagram_checked(&unknown, &secret).unwrap_err().starts_with("decrypted, but"));
+        let unknown = server_datagram(&secret, &[0x7e, 1, 2, 3]);
+        let reason = decode_server_datagram_checked(&unknown, &secret).unwrap_err();
+        assert!(reason.starts_with("decrypted, but the 4-byte packet"), "{reason}");
+        assert!(reason.contains("type byte 0x7e") && reason.contains("7e 01 02 03"), "{reason}");
+    }
+
+    #[test]
+    fn a_padded_server_reply_is_accepted_like_the_official_client_does() {
+        // The 287-byte replies seen from a live server: an AuthenticateAck whose
+        // plaintext is padded out to 256 bytes. The Java reader ignores whatever
+        // follows the fields it expects, so we must too.
+        let secret = [5u8; 16];
+        let mut plain = vec![AUTHENTICATE_ACK];
+        plain.extend((0..255u16).map(|i| (i * 7) as u8));
+        assert_eq!(plain.len(), 256);
+        let datagram = server_datagram(&secret, &plain);
+        assert_eq!(datagram.len(), 287);
+        assert!(matches!(
+            decode_server_datagram_checked(&datagram, &secret),
+            Ok((Packet::AuthenticateAck, 255))
+        ));
+        // Our own strict decoder (used for round trips) is unchanged.
+        assert!(decode_packet(&plain).is_none());
+        assert!(decode_packet(&[AUTHENTICATE_ACK]).is_some());
     }
 
     #[test]

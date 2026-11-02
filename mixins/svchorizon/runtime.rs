@@ -1206,17 +1206,22 @@ pub fn on_packet(
                         .map(|remote| remote.session.address.clone())
                         .unwrap_or_default();
                     let peer_address = game.remote.as_ref()
-                        .and_then(|remote| horizon_client::net::svchorizon_net::peer_address(&remote.session));
+                        .map(|remote| horizon_client::net::svchorizon_net::peer_address(&remote.session))
+                        .unwrap_or_else(|| Err("no remote session".to_owned()));
                     let fallback_host = peer_address
+                        .as_ref()
                         .map(|peer| peer.to_string())
-                        .unwrap_or_else(|| typed_address.clone());
+                        .unwrap_or_else(|_| typed_address.clone());
                     eprintln!(
                         "[svchorizon] Secret received: voice host '{}' port {} keepalive {}ms groups {} (typed address: '{typed_address}', connected peer: {})",
                         if info.host.is_empty() { "<same as game server>" } else { info.host.as_str() },
                         info.port,
                         info.keep_alive_ms,
                         info.groups,
-                        peer_address.map_or_else(|| "<unknown>".to_owned(), |peer| peer.to_string())
+                        match &peer_address {
+                            Ok(peer) => peer.to_string(),
+                            Err(reason) => format!("<unavailable: {reason}; using the typed address>"),
+                        }
                     );
                     *last_server_info().lock().expect("SVC reconnect state poisoned") =
                         Some((info.clone(), fallback_host.clone()));

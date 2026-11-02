@@ -152,6 +152,26 @@ packet). HUD states after 15 unanswered attempts: "Server replies but the reply
 was rejected", "Voice port closed on server", "Voice server unreachable (UDP
 dropped)".
 
+## lunamoonsmp.com: server answers, replies were rejected (2026-11-02)
+
+Second live server (voice port 12004, `<same as game server>` host). With the
+duplicate-socket fix in place there is one `Voice endpoint` line, and the server
+answers every authentication attempt (14 datagrams in 15s) - so the network path
+and the secret are fine: each reply passed AES-GCM authentication with our key.
+The replies are 287 bytes: magic, a 2-byte VarInt length (284), IV, then a
+256-byte plaintext, where an AuthenticateAck is normally 1 byte.
+
+The engine rejected them because `decode_packet` required the plaintext to be
+consumed exactly. The reference client does not: `NetworkMessage.readFromBytes`
+reads the type byte and the fields it expects and ignores what follows, so a
+server or proxy that pads its packets is valid for it. The engine now decodes the
+prefix and ignores trailing bytes (logging once that the server pads). The strict
+decoder remains for our own encodings. A test builds a 287-byte padded ack.
+
+If a reply is still rejected, the log now prints the plaintext length, type byte
+and first 16 plaintext bytes. The `connected peer` log now says why it is
+unavailable (it was `<unknown>` on this server).
+
 ## Compatibility pin
 
 The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.
