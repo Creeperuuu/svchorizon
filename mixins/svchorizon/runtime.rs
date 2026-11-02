@@ -44,6 +44,12 @@ static PENDING_PROBE: AtomicI32 = AtomicI32::new(0);
 static LAST_PROBED: AtomicI32 = AtomicI32::new(0);
 /// Unix millis the outstanding request was sent at (also the send pacemaker).
 static PENDING_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// Unix millis of the last secret request of any kind (probe or refresh);
+/// paces the periodic secret refresh while voice stays unauthenticated.
+static LAST_SECRET_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
+/// How long to wait before re-asking the server for a fresh secret while a
+/// secret is in hand but voice never authenticated.
+const SECRET_REFRESH_AFTER_MS: u64 = 20_000;
 /// Unix millis of the first probe of this login.
 static FIRST_PROBE_MS: AtomicU64 = AtomicU64::new(0);
 /// Bitmask of generations the server actively rejected (one bit per index in
@@ -437,6 +443,7 @@ fn reset_probe_state() {
     LAST_PROBED.store(0, Ordering::Release);
     PENDING_AT_MS.store(0, Ordering::Release);
     FIRST_PROBE_MS.store(0, Ordering::Release);
+    LAST_SECRET_REQUEST_MS.store(0, Ordering::Release);
     REJECTED_MASK.store(0, Ordering::Release);
 }
 
@@ -484,6 +491,7 @@ fn send_secret_request(game: &mut crate::game::Game<'_>) {
     if FIRST_PROBE_MS.load(Ordering::Acquire) == 0 {
         FIRST_PROBE_MS.store(now, Ordering::Release);
     }
+    LAST_SECRET_REQUEST_MS.store(now, Ordering::Release);
     PENDING_PROBE.store(generation, Ordering::Release);
     LAST_PROBED.store(generation, Ordering::Release);
     PENDING_AT_MS.store(now, Ordering::Release);
@@ -516,6 +524,34 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Re-asks the server for a secret of the generation that last answered,
+/// while voice stays unauthenticated. Upstream ignores a repeated request
+/// while the secret is still valid ("Player already requested secret"), so
+/// this costs nothing on stock builds; but a server that reloaded its voice
+/// chat or changed the voice port wiped every secret (Server.changePort
+/// "removes every existing connection and all secrets"), and the secret we
+/// hold is dead from that moment on even though unauthenticated pings keep
+/// answering. A fresh request then issues a new secret and the session
+/// recovers without a rejoin.
+fn refresh_secret_request(game: &mut crate::game::Game<'_>) {
+    let Some((info, _)) = last_server_info()
+        .lock()
+        .expect("SVC reconnect state poisoned")
+        .clone()
+    else {
+        return;
+    };
+    let generation = info.profile.compatibility_version();
+    game.send(Serverbound::CustomPayload(CustomPayload {
+        channel: REQUEST_SECRET.to_owned(),
+        data: generation.to_be_bytes().to_vec(),
+    }));
+    LAST_SECRET_REQUEST_MS.store(now_millis(), Ordering::Release);
+    eprintln!(
+        "[svchorizon] Voice authentication still unanswered - requesting a fresh secret (compatibility version {generation})"
+    );
 }
 
 fn write_varint(out: &mut Vec<u8>, mut value: usize) {
@@ -1239,6 +1275,33 @@ pub fn on_tick(game: &mut crate::game::Game<'_>) {
             .is_some()
     {
         start_reconnect();
+    }
+
+    // While a secret is in hand but voice never authenticated, re-ask for a
+    // fresh secret periodically: the server may have wiped its secrets (voice
+    // reload, port change, restart) after issuing ours, which leaves pings
+    // answering and authentication ignored forever. Upstream answers a
+    // repeated request with nothing while our secret is still valid, so this
+    // is free on stock builds and self-heals the wiped case.
+    if game.native_on("svchorizon")
+        && last_server_info()
+            .lock()
+            .expect("SVC reconnect state poisoned")
+            .is_some()
+    {
+        let connected = voice_client()
+            .lock()
+            .expect("SVC client state poisoned")
+            .as_ref()
+            .map(|client| client.is_connected())
+            .unwrap_or(false);
+        let last = LAST_SECRET_REQUEST_MS.load(Ordering::Acquire);
+        if !connected
+            && last != 0
+            && now_millis().saturating_sub(last) >= SECRET_REFRESH_AFTER_MS
+        {
+            refresh_secret_request(game);
+        }
     }
 
     let playing = game.native_playing();
