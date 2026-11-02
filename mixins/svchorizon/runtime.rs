@@ -536,6 +536,7 @@ fn now_millis() -> u64 {
 /// answering. A fresh request then issues a new secret and the session
 /// recovers without a rejoin.
 fn refresh_secret_request(game: &mut crate::game::Game<'_>) {
+    use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound};
     let Some((info, _)) = last_server_info()
         .lock()
         .expect("SVC reconnect state poisoned")
