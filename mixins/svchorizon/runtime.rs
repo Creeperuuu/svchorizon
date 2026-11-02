@@ -2408,7 +2408,8 @@ fn batch_height(batch: &mut horizon_client::hud::HudBatch) -> f32 {
 }
 
 /// The group HUD (upstream's GroupChatManager): while in a group, its
-/// members with a talking indicator next to whoever is speaking.
+/// members' heads above the hotbar with a talking indicator, like the
+/// official mod.
 fn draw_group_hud(
     game: &crate::game::Game<'_>,
     batch: &mut horizon_client::hud::HudBatch,
@@ -2424,9 +2425,10 @@ fn draw_group_hud(
         .iter()
         .filter(|player| player.group == Some(active))
         .collect();
-    let line_height = 12.0f32;
-    let width = 120.0f32.max(
-        game.native_text_width(&format!("Group: {}", group.name)) + 12.0,
+    let line_height = 14.0f32;
+    let head_size = 8.0f32;
+    let width = 132.0f32.max(
+        game.native_text_width(&format!("Group: {}", group.name)) + 24.0,
     );
     let height = 16.0 + line_height * (members.len() + 1) as f32;
     game.native_fill(batch, [4.0, 108.0, width, height], 0x90000000);
@@ -2437,6 +2439,16 @@ fn draw_group_hud(
             .lock()
             .map(|client| client.as_ref().is_some_and(|client| client.is_talking(member.id)))
             .unwrap_or(false);
+        // The member's head with a green frame while they talk, the way
+        // the official group HUD highlights the speaker.
+        draw_player_head(game, batch, member.id, &member.name, 10.0, y);
+        if talking {
+            let frame = 0xFF55FF55;
+            game.native_fill(batch, [9.0, y - 1.0, head_size + 2.0, 1.0], frame);
+            game.native_fill(batch, [9.0, y + head_size, head_size + 2.0, 1.0], frame);
+            game.native_fill(batch, [9.0, y, 1.0, head_size], frame);
+            game.native_fill(batch, [9.0 + head_size + 1.0, y, 1.0, head_size], frame);
+        }
         let color = if member.ignored {
             0x777777
         } else if talking {
@@ -2444,9 +2456,47 @@ fn draw_group_hud(
         } else {
             0xFFFFFF
         };
-        let marker = if talking { ">" } else { " " };
-        game.native_text(batch, &format!("{marker} {}", member.name), [10.0, y], color, true);
+        game.native_text(batch, &member.name, [10.0 + head_size + 3.0, y], color, true);
     }
+}
+
+/// Draws a player's 8x8 face (base layer plus hat layer) at GUI-pixel
+/// `(x, y)`, resolving the skin the way the tab list does: the game uploads
+/// every known player's skin into the GUI atlas under `id:<uuid>` and
+/// `name:<lowercase name>`, falling back to the UUID-parity default skin
+/// (Steve/Alex and friends) while no real skin has arrived.
+fn draw_player_head(
+    game: &crate::game::Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+    id: [u8; 16],
+    name: &str,
+    x: f32,
+    y: f32,
+) {
+    let atlas = &game.gui.atlas;
+    let id128 = u128::from_be_bytes(id);
+    let skin = atlas
+        .object_skins
+        .get(&format!("id:{id128:032x}"))
+        .or_else(|| atlas.object_skins.get(&format!("name:{}", name.to_ascii_lowercase())))
+        .filter(|path| atlas.sprites.contains_key(*path))
+        .map_or(horizon_client::tab_list::default_skin(id128), String::as_str);
+    let Some(rect) = atlas.sprites.get(skin).copied() else {
+        return;
+    };
+    // A skin is a 64x64 texture: the face sits at (8, 8) and its hat
+    // overlay at (40, 8), both 8x8 (the tab list's PlayerFaceExtractor).
+    let (du, dv) = (rect.u1 - rect.u0, rect.v1 - rect.v0);
+    let region = |u: f32, v: f32| horizon_client::hud::Rect {
+        u0: rect.u0 + du * u / 64.0,
+        v0: rect.v0 + dv * v / 64.0,
+        u1: rect.u0 + du * (u + 8.0) / 64.0,
+        v1: rect.v0 + dv * (v + 8.0) / 64.0,
+        w: 8,
+        h: 8,
+    };
+    batch.rect_uv(x, y, 8.0, 8.0, region(8.0, 8.0), 0xFFFF_FFFF);
+    batch.rect_uv(x, y, 8.0, 8.0, region(40.0, 8.0), 0xFFFF_FFFF);
 }
 
 /// The voice chat menu overlay, a replica of the official client's
