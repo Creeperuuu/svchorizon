@@ -2356,6 +2356,13 @@ pub fn on_hud(
     }
 
     draw_status_icons(game, batch, guard.as_ref());
+    // Release the client lock before drawing anything else: `draw_group_hud`,
+    // `draw_menu` and its row builders (`main_menu_rows`, `player_page_rows`)
+    // lock `voice_client()` again, and a std Mutex is not reentrant. Holding
+    // `guard` across them deadlocked the render thread: the game froze on the
+    // first frame after the voice menu key (Z) opened the menu, and whenever
+    // the player was in a group.
+    drop(guard);
     draw_group_hud(game, batch, &groups);
     drop(groups);
     if menu_open() {
