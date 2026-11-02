@@ -11,6 +11,17 @@ name: Build game (Windows)
 # rebuild only what changed instead of the whole hour.
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: >-
+          Cargo profile. "fast" (Horizon's iteration profile: no LTO, 16 codegen units,
+          incremental) is several times quicker to build and is right for testing.
+          "release" is the slow thin-LTO build for a version you want to keep.
+        type: choice
+        options:
+          - fast
+          - release
+        default: fast
 
 permissions:
   contents: read
@@ -20,6 +31,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  PROFILE: ${{ inputs.profile || 'fast' }}
   HORIZON_REVISION: ba6344a59cb9e755b730dcf02285fc0d33b97d3c
   HORIZON_MIXINS_REVISION: d9c83d7096b7ea5b83678da2efdfd6161f74997e
 
@@ -87,18 +99,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache cargo registry and the game's target directory
-        uses: actions/cache@v4
+      - name: Restore cargo registry and the build caches
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/index
             ~/.cargo/git
             game-target
-          # The game target directory is keyed on the pinned Horizon lockfile, not the
-          # mod sources: cargo's own fingerprints rebuild only the crates the mod touched.
-          key: horizon-game-win-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}
-          restore-keys: horizon-game-win-1.95.0-${{ env.HORIZON_REVISION }}-
+            horizon-mixins/target
+          # A fresh key per run, restored by prefix: a saved cache is immutable, so a
+          # fixed key would freeze the first (possibly partial) result forever. The
+          # profile is part of the key because each profile has its own artifacts.
+          key: horizon-game-win-${{ env.PROFILE }}-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            horizon-game-win-${{ env.PROFILE }}-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}-
+            horizon-game-win-${{ env.PROFILE }}-1.95.0-${{ env.HORIZON_REVISION }}-
 
       - name: Fetch dependencies
         run: |
@@ -113,15 +130,29 @@ jobs:
           cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- \
             apply --workspace horizon --mods mixins --out game-stage
 
-      - name: Build horizon-client.exe (release)
+      - name: Build horizon-client.exe (${{ env.PROFILE }})
         run: |
-          cargo build --release --locked -p horizon-client --bin horizon-client \
+          cargo build --profile "$PROFILE" --locked -p horizon-client --bin horizon-client \
             --manifest-path game-stage/Cargo.toml --target-dir game-target
+
+      - name: Save build caches
+        # Also when the build above failed: the dependencies compiled before the
+        # failure are the expensive part, and a failed run used to discard them all.
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/index
+            ~/.cargo/git
+            game-target
+            horizon-mixins/target
+          key: horizon-game-win-${{ env.PROFILE }}-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}-${{ github.run_id }}
 
       - name: The game starts
         run: |
-          test -f game-target/release/horizon-client.exe
-          game-target/release/horizon-client.exe --help | grep -q -- '--resources'
+          test -f "game-target/$PROFILE/horizon-client.exe"
+          "game-target/$PROFILE/horizon-client.exe" --help | grep -q -- '--resources'
 
       - name: Job summary
         if: always()
@@ -131,6 +162,7 @@ jobs:
             echo
             echo "- Horizon: \`${{ env.HORIZON_REVISION }}\`"
             echo "- Mod commit: \`${{ github.sha }}\`"
+            echo "- Profile: \`${{ env.PROFILE }}\`"
             echo
             echo "Download the \`horizon-client-windows-x64-svchorizon\` artifact and replace"
             echo "\`horizon-client.exe\` in your Horizon game folder (keep a backup of the original)."
@@ -139,6 +171,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-client-windows-x64-svchorizon
-          path: game-target/release/horizon-client.exe
+          path: game-target/${{ env.PROFILE }}/horizon-client.exe
           if-no-files-found: error
           compression-level: 0

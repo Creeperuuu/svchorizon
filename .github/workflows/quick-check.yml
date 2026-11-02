@@ -1,0 +1,107 @@
+name: Quick check (Linux)
+# Compile-checks the whole game with the SVC mod applied, and runs the engine's tests,
+# on every push. It catches errors like a missing method or a bad mixin target in a few
+# minutes, long before the Windows game build would reach them. Nothing is linked or
+# optimised (cargo check), so it is far cheaper than a build.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quick-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HORIZON_REVISION: ba6344a59cb9e755b730dcf02285fc0d33b97d3c
+  HORIZON_MIXINS_REVISION: d9c83d7096b7ea5b83678da2efdfd6161f74997e
+
+jobs:
+  check:
+    name: apply mixins + cargo check (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned Horizon
+        uses: actions/checkout@v4
+        with:
+          repository: horizon-rust/horizon
+          ref: ${{ env.HORIZON_REVISION }}
+          path: horizon
+          persist-credentials: false
+
+      - name: Materialize tracked symlinks in pinned Horizon
+        run: |
+          cd horizon
+          git ls-files -s | awk '$1 == 120000 {print $4}' | while IFS= read -r link; do
+            [ -n "$link" ] || continue
+            target=$(git cat-file blob "HEAD:$link")
+            rm -f "$link"
+            cp -L "$target" "$link"
+          done
+
+      - name: Checkout pinned horizon-mixins
+        uses: actions/checkout@v4
+        with:
+          repository: horizon-rust/horizon-mixins
+          ref: ${{ env.HORIZON_MIXINS_REVISION }}
+          path: horizon-mixins
+          persist-credentials: false
+
+      - name: Install Linux audio build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore caches
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/index
+            ~/.cargo/git
+            check-target
+            horizon-mixins/target
+          key: quick-check-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            quick-check-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}-
+            quick-check-1.95.0-${{ env.HORIZON_REVISION }}-
+
+      - name: Stage vendored Opus engine into the native bundle
+        run: python tools/prepare_bundle.py
+
+      - name: Engine tests
+        run: cargo test --manifest-path mixins/svchorizon/engine/Cargo.toml
+
+      - name: Apply the SVC mod into a staged Horizon workspace
+        run: |
+          cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- \
+            apply --workspace horizon --mods mixins --out game-stage
+
+      - name: Compile-check the game with the mod
+        run: |
+          cargo check --locked -p horizon-client --bin horizon-client \
+            --manifest-path game-stage/Cargo.toml --target-dir check-target
+
+      - name: Save caches
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/index
+            ~/.cargo/git
+            check-target
+            horizon-mixins/target
+          key: quick-check-1.95.0-${{ env.HORIZON_REVISION }}-${{ hashFiles('horizon/Cargo.lock') }}-${{ github.run_id }}
