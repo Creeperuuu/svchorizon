@@ -94,8 +94,15 @@ struct PendingAudio {
 struct SenderJitter {
     sender: [u8; 16],
     expected: Option<i64>,
-    pending: BTreeMap<i64, PendingAudio>,
+    /// Frames held for this sender, each with its arrival time (the
+    /// playout-priming hold deadline is measured against the oldest).
+    pending: BTreeMap<i64, (PendingAudio, Instant)>,
     gap_since: Option<Instant>,
+    /// Adaptive playout depth in 20 ms frames, the equivalent of the
+    /// official client's jitter queue: it grows when losses starve
+    /// playback and decays again during sustained clean playback.
+    target: usize,
+    clean_streak: usize,
     last_seen: Instant,
     last_position: Option<[f64; 3]>,
     last_distance: Option<f32>,
@@ -108,9 +115,22 @@ struct AudioJitterBuffer {
 
 impl AudioJitterBuffer {
     const MAX_SENDERS: usize = 128;
-    const MAX_PENDING_PER_SENDER: usize = 8;
+    const MAX_PENDING_PER_SENDER: usize = 12;
     const REORDER_DELAY: Duration = Duration::from_millis(40);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Playout priming: hold frames back until this much cushion (in
+    /// 20 ms frames) is buffered for the speaker before it starts (or
+    /// resumes) playing, so one late packet cannot starve the mixer.
+    const MIN_PLAYOUT_FRAMES: usize = 2;
+    /// Deepest cushion the loss adaptation grows to (100 ms).
+    const MAX_PLAYOUT_FRAMES: usize = 5;
+    /// A held frame is never delayed longer than this, so short
+    /// utterances and end-of-speech tails still come out promptly.
+    const MAX_HOLD: Duration = Duration::from_millis(80);
+    /// Clean in-order frames after which the cushion decays by one.
+    const CLEAN_STREAK_RESET: usize = 25;
+    /// After this much silence a speaker's cushion starts fresh.
+    const TARGET_RESET_AFTER_IDLE: Duration = Duration::from_secs(5);
 
     fn push(&mut self, packet: PendingAudio, now: Instant) -> Vec<PendingAudio> {
         self.senders.retain(|_, state| now.duration_since(state.last_seen) < Self::IDLE_TIMEOUT);
@@ -123,10 +143,18 @@ impl AudioJitterBuffer {
             expected: Some(packet.sequence),
             pending: BTreeMap::new(),
             gap_since: None,
+            target: Self::MIN_PLAYOUT_FRAMES,
+            clean_streak: 0,
             last_seen: now,
             last_position: packet.position,
             last_distance: packet.max_distance,
         });
+        if now.duration_since(state.last_seen) >= Self::TARGET_RESET_AFTER_IDLE {
+            // New utterance after a long pause: drop the cushion back to
+            // its baseline so speech is not delayed by stale adaptation.
+            state.target = Self::MIN_PLAYOUT_FRAMES;
+            state.clean_streak = 0;
+        }
         state.last_seen = now;
         state.last_position = packet.position;
         state.last_distance = packet.max_distance;
@@ -140,7 +168,7 @@ impl AudioJitterBuffer {
         {
             return Vec::new();
         }
-        state.pending.entry(packet.sequence).or_insert(packet);
+        state.pending.entry(packet.sequence).or_insert((packet, now));
         Self::drain_ready(state, now)
     }
 
@@ -159,11 +187,36 @@ impl AudioJitterBuffer {
         let mut ready = Vec::new();
         loop {
             let Some(expected) = state.expected else { break; };
-            if let Some(packet) = state.pending.remove(&expected) {
-                state.expected = Some(expected.wrapping_add(1));
-                state.gap_since = None;
-                ready.push(packet);
-                continue;
+            if state.pending.contains_key(&expected) {
+                // Playout priming, like the official client's adaptive
+                // jitter queue: while only a thin cushion is buffered for
+                // this speaker, hold the next in-order frame back so a
+                // late follower cannot starve playback mid-word. A lone
+                // frame is never held beyond MAX_HOLD, so short
+                // utterances and end-of-speech tails still come out.
+                let held_long_enough = state
+                    .pending
+                    .values()
+                    .next()
+                    .is_some_and(|(_, arrived)| now.duration_since(*arrived) >= Self::MAX_HOLD);
+                if state.pending.len() < state.target && !held_long_enough {
+                    break;
+                }
+                if let Some((packet, _)) = state.pending.remove(&expected) {
+                    state.expected = Some(expected.wrapping_add(1));
+                    state.gap_since = None;
+                    state.clean_streak += 1;
+                    if state.clean_streak >= Self::CLEAN_STREAK_RESET {
+                        // Sustained clean playback: ease the cushion down.
+                        state.clean_streak = 0;
+                        state.target = state
+                            .target
+                            .saturating_sub(1)
+                            .max(Self::MIN_PLAYOUT_FRAMES);
+                    }
+                    ready.push(packet);
+                    continue;
+                }
             }
             let Some(next_sequence) = state.pending.keys().next().copied() else {
                 state.gap_since = None;
@@ -175,6 +228,11 @@ impl AudioJitterBuffer {
             }
             // A sequence gap lasted beyond the reorder window. Ask Opus
             // to conceal a short loss burst, then skip any larger outage.
+            // Loss also means playback is about to run dry, so deepen
+            // the cushion for the next burst the same way the official
+            // client's jitter queue adapts to jitter spikes.
+            state.target = (state.target + 1).min(Self::MAX_PLAYOUT_FRAMES);
+            state.clean_streak = 0;
             let missing = next_sequence.saturating_sub(expected).clamp(0, 3) as usize;
             for _ in 0..missing {
                 ready.push(PendingAudio {
@@ -321,7 +379,11 @@ impl VoiceClient {
 
         let (command_tx, command_rx) = mpsc::sync_channel(8);
         let (event_tx, event_rx) = mpsc::sync_channel(32);
-        let (audio_tx, audio_rx) = mpsc::sync_channel(8);
+        // 32 decoded 20 ms frames (640 ms) of handoff headroom between the
+        // UDP worker and the audio callback. The jitter buffer's playout
+        // priming keeps the steady-state depth low; the slack absorbs
+        // bursts instead of silently dropping them on the floor.
+        let (audio_tx, audio_rx) = mpsc::sync_channel(32);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
         let player_positions = Arc::new(RwLock::new(HashMap::new()));
         let player_audio_settings = Arc::new(RwLock::new(HashMap::new()));
@@ -739,6 +801,7 @@ fn run_worker(
     let mut sequence = 0i64;
     let mut last_auth: Option<Instant> = None;
     let mut noted_padding = false;
+    let mut audio_overflow = false;
     let mut last_check: Option<Instant> = None;
     let mut last_keepalive = Instant::now();
     let keepalive_timeout = Duration::from_millis((info.keep_alive_ms as u64).saturating_mul(10));
@@ -896,7 +959,7 @@ fn run_worker(
                                 sender, sequence, opus, position, max_distance: Some(distance),
                             }, Instant::now());
                             for frame in ready {
-                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
+                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps, &mut audio_overflow);
                             }
                         }
                     }
@@ -906,7 +969,7 @@ fn run_worker(
                                 sender, sequence, opus, position: None, max_distance: None,
                             }, Instant::now());
                             for frame in ready {
-                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
+                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps, &mut audio_overflow);
                             }
                         }
                     }
@@ -917,7 +980,7 @@ fn run_worker(
                                 max_distance: Some(distance),
                             }, Instant::now());
                             for frame in ready {
-                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
+                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps, &mut audio_overflow);
                             }
                         }
                     }
@@ -945,7 +1008,7 @@ fn run_worker(
             }
         }
         for frame in jitter.poll(Instant::now()) {
-            emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
+            emit_audio(&mut decoders, &audio, frame, &talk_timestamps, &mut audio_overflow);
         }
         decoders.retain(|sender, _| jitter.senders.contains_key(sender));
     }
@@ -958,6 +1021,7 @@ fn emit_audio(
     audio: &SyncSender<AudioFrame>,
     pending: PendingAudio,
     talk_timestamps: &Arc<Mutex<HashMap<[u8; 16], Instant>>>,
+    audio_overflow: &mut bool,
 ) {
     if pending.opus.len() > MAX_OPUS { return; }
     if let Ok(mut timestamps) = talk_timestamps.lock() {
@@ -975,12 +1039,23 @@ fn emit_audio(
     for (out, input) in pcm.iter_mut().zip(float_pcm.iter()).take(samples.min(FRAME_SAMPLES)) {
         *out = (input.clamp(-1.0, 1.0) * 32767.0) as i16;
     }
-    let _ = audio.try_send(AudioFrame {
+    let frame = AudioFrame {
         sender: pending.sender,
         pcm,
         position: pending.position,
         max_distance: pending.max_distance,
-    });
+    };
+    if let Err(TrySendError::Full(_)) = audio.try_send(frame) {
+        // A dropped frame here is an audible gap that no amount of
+        // jitter buffering downstream can hide; surface it once so
+        // cutout reports can be told apart from network loss.
+        if !*audio_overflow {
+            *audio_overflow = true;
+            eprintln!(
+                "[svchorizon] Decoded audio handoff is full; dropping frames. If voices still cut out while this line never appears, the cause is network loss, not playback."
+            );
+        }
+    }
 }
 
 fn run_audio_io(
@@ -1251,7 +1326,9 @@ struct OutputAssembler {
 
 impl OutputAssembler {
     const MAX_SPEAKERS: usize = 32;
-    const MAX_QUEUED_FRAMES_PER_SPEAKER: usize = 6;
+    /// Hard runaway guard only: steady-state depth is one or two frames
+    /// because the jitter buffer primes playback before releasing frames.
+    const MAX_QUEUED_FRAMES_PER_SPEAKER: usize = 10;
     /// Recording chunks of about 20 ms at 48 kHz stereo.
     const RECORDING_CHUNK_SAMPLES: usize = 960 * 2;
 
@@ -1299,12 +1376,16 @@ impl OutputAssembler {
     /// Mix one current frame per speaker. Consecutive packets from one
     /// speaker remain sequential, while different speakers overlap.
     fn next_stereo(&mut self) -> [i16; 2] {
-        loop {
-            let frame = match self.rx.lock() {
-                Ok(rx) => rx.try_recv().ok(),
-                Err(_) => None,
-            };
-            let Some(frame) = frame else { break; };
+        // Pull everything currently decoded in one lock acquisition; a
+        // lock/unlock per frame here used to sit on the audio callback's
+        // critical path.
+        let mut incoming: Vec<AudioFrame> = Vec::new();
+        if let Ok(rx) = self.rx.lock() {
+            while let Ok(frame) = rx.try_recv() {
+                incoming.push(frame);
+            }
+        }
+        for frame in incoming {
             if !self.speakers.contains_key(&frame.sender)
                 && self.speakers.len() >= Self::MAX_SPEAKERS
             {
@@ -1954,10 +2035,17 @@ mod tests {
         };
         let mut jitter = AudioJitterBuffer::default();
 
-        assert_eq!(jitter.push(make(10), now).len(), 1);
-        assert!(jitter.push(make(12), now).is_empty());
+        // Playout priming: the first in-order frame is held until a
+        // cushion exists for the speaker.
+        assert!(jitter.push(make(10), now).is_empty());
+        let ready = jitter.push(make(12), now);
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![10]);
+        // The tail frame stays held for its cushion; a completing packet
+        // releases what it can, the rest follows at the hold deadline.
         let ready = jitter.push(make(11), now + Duration::from_millis(10));
-        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![11, 12]);
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![11]);
+        let ready = jitter.poll(now + Duration::from_millis(90));
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![12]);
     }
 
     #[test]
@@ -1972,11 +2060,77 @@ mod tests {
         };
         let mut jitter = AudioJitterBuffer::default();
 
-        assert_eq!(jitter.push(make(20), now).len(), 1);
-        assert!(jitter.push(make(22), now).is_empty());
+        assert!(jitter.push(make(20), now).is_empty());
+        let ready = jitter.push(make(22), now);
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![20]);
+        // After the reorder window the missing frame is concealed; the
+        // frame behind the loss stays held for the deepened cushion
+        // until its hold deadline.
         let ready = jitter.poll(now + Duration::from_millis(41));
-        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![21, 22]);
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![21]);
         assert!(ready[0].opus.is_empty());
+        let ready = jitter.poll(now + Duration::from_millis(90));
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![22]);
+    }
+
+    #[test]
+    fn jitter_buffer_releases_a_lone_frame_at_its_hold_deadline() {
+        let now = Instant::now();
+        let make = |sequence| PendingAudio {
+            sender: [6; 16],
+            sequence,
+            opus: vec![sequence as u8],
+            position: None,
+            max_distance: None,
+        };
+        let mut jitter = AudioJitterBuffer::default();
+
+        assert!(jitter.push(make(30), now).is_empty());
+        assert!(jitter.poll(now + Duration::from_millis(79)).is_empty());
+        let ready = jitter.poll(now + Duration::from_millis(81));
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![30]);
+    }
+
+    #[test]
+    fn jitter_buffer_deepens_after_a_loss_and_recovers_during_clean_playback() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(45);
+        let make = |sender: [u8; 16], sequence| PendingAudio {
+            sender,
+            sequence,
+            opus: vec![0u8; 4],
+            position: None,
+            max_distance: None,
+        };
+        let mut jitter = AudioJitterBuffer::default();
+
+        // Speaker A loses one packet so the cushion deepens past the
+        // two-frame baseline; speaker B never loses anything.
+        let (a, b) = ([7u8; 16], [8u8; 16]);
+        assert!(jitter.push(make(a, 1), now).is_empty());
+        assert_eq!(jitter.push(make(a, 3), now).len(), 1);
+        // Conceal the loss; this deepens A's playout target.
+        let ready = jitter.poll(now + Duration::from_millis(41));
+        assert_eq!(ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), vec![2]);
+        assert!(ready[0].opus.is_empty());
+
+        // Right after the loss the deeper cushion keeps the following
+        // burst buffered instead of feeding it straight to the mixer.
+        assert!(jitter.push(make(a, 4), later).is_empty());
+        assert_eq!(jitter.push(make(a, 5), later).len(), 1);
+        // Speaker B, with no losses, still releases after two frames.
+        assert!(jitter.push(make(b, 1), now).is_empty());
+        assert_eq!(jitter.push(make(b, 2), now).len(), 1);
+
+        // 25 clean in-order releases later, the cushion decays back to
+        // the baseline and a two-frame burst releases immediately again.
+        for sequence in 6..=30 {
+            let _ = jitter.push(make(a, sequence), later);
+        }
+        assert!(!jitter.poll(later + Duration::from_millis(90)).is_empty());
+        let fresh = later + Duration::from_millis(200);
+        assert!(jitter.push(make(a, 31), fresh).is_empty());
+        assert_eq!(jitter.push(make(a, 32), fresh).len(), 1);
     }
 
     #[test]
