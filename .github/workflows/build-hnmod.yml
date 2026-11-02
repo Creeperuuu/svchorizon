@@ -78,7 +78,10 @@ jobs:
       - name: Build mixin CLI
         run: cargo build --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli
       - name: Prepare plan output directory
-        run: mkdir -p target/mixins
+        # rust-cache restores the cargo target dir including a previous run's
+        # target/mixins stage, which the mixin CLI refuses to replace
+        # (E_STAGE_OWNERSHIP); start the stage from scratch on every run.
+        run: rm -rf target/mixins && mkdir -p target/mixins
       - name: Plan native hooks
         run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- plan --workspace horizon --mods mixins --out target/mixins/plan.json
       - name: Apply native hooks
