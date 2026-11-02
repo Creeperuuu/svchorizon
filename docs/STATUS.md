@@ -172,6 +172,27 @@ If a reply is still rejected, the log now prints the plaintext length, type byte
 and first 16 plaintext bytes. The `connected peer` log now says why it is
 unavailable (it was `<unknown>` on this server).
 
+## Noise suppression, faster CI (2026-11-02)
+
+Noise suppression (Simple Voice Chat's "denoiser", RNNoise) is on by default. It runs
+on the microphone between resampling and the voice-activation check, so the threshold
+sees the cleaned audio, like the official client. `/svchorizon denoise [on|off]`
+toggles it and the choice is saved (`native_set_setting`).
+
+The denoiser is the core of the `nnnoiseless` crate (BSD-3-Clause, a Rust port of
+RNNoise) vendored in `engine/src/denoise`, with the FFT replaced by `denoise/fft.rs`
+(an exact-size 960-point mixed-radix FFT) because Horizon builds with `--locked` and
+its lockfile has neither `nnnoiseless` nor its FFT crate. The model weights are a Rust
+byte table (`weights.rs`): a native bundle may only contain `.rs`/`.toml` files.
+Checked against the original crate on a 4 s noisy-speech signal: relative error energy
+1.8e-13, speech probability within 1.3e-6. Tests also check the FFT against a naive
+DFT and that steady noise falls by more than 6 dB while a voiced sound keeps energy.
+
+CI: `game-build.yml` takes a `profile` input (default Horizon's `fast`), restores its
+cache with a per-run key and saves it with `if: always()` (a failed build no longer
+discards compiled dependencies), and caches the horizon-mixins CLI. New
+`quick-check.yml` applies the mixins and `cargo check`s the game on Linux on every push.
+
 ## Compatibility pin
 
 The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The TCP request advertises Simple Voice Chat compatibility version **20** — the number the shipped bukkit plugin for MC 26.3, `voicechat-bukkit-2.6.27`, reports and requires (upstream's unreleased 2.7.0-pre1 branch moved to 21 together with a wire change; both must be bumped together when that ships). This value is release-specific, not a universal protocol version.

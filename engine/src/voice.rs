@@ -25,6 +25,28 @@ const MAGIC: u8 = 0xff;
 const MAX_DATAGRAM: usize = 2048;
 const MAX_OPUS: usize = 1275;
 const FRAME_SAMPLES: usize = 960;
+
+/// RNNoise noise suppression on the microphone, like Simple Voice Chat's "denoiser" setting
+/// (on by default). Process-wide because there is one microphone and one client at a time.
+static NOISE_SUPPRESSION: AtomicBool = AtomicBool::new(true);
+/// RMS level (0.0..=1.0, as `f32` bits) of the last microphone frame the voice-activation check
+/// saw, i.e. after noise suppression. Feeds the level meter of the settings screen.
+static MICROPHONE_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// Turn microphone noise suppression on or off.
+pub fn set_noise_suppression(enabled: bool) {
+    NOISE_SUPPRESSION.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether microphone noise suppression is on.
+pub fn noise_suppression() -> bool {
+    NOISE_SUPPRESSION.load(Ordering::Relaxed)
+}
+
+/// The microphone level (RMS, 0.0..=1.0) of the most recent 20 ms frame.
+pub fn microphone_level() -> f32 {
+    f32::from_bits(MICROPHONE_LEVEL.load(Ordering::Relaxed))
+}
 const SAMPLE_RATE: i32 = 48_000;
 const NONCE_BYTES: usize = 12;
 const TAG_BYTES: usize = 16;
@@ -1005,6 +1027,9 @@ struct InputAssembler {
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    denoiser: Option<Box<crate::denoise::DenoiseState<'static>>>,
+    /// Overrides the process-wide switch (tests need a deterministic pipeline).
+    suppression_override: Option<bool>,
 }
 impl InputAssembler {
     fn new(
@@ -1027,8 +1052,33 @@ impl InputAssembler {
             voice_activation,
             voice_activation_threshold,
             microphone_gain,
+            denoiser: None,
+            suppression_override: None,
         }
     }
+
+    /// RNNoise works on 480-sample frames of `i16`-range samples, so a 20 ms frame is two of
+    /// them. A fresh state is made whenever suppression is switched on, so audio from before it
+    /// was off does not bleed into the first frames.
+    fn suppress_noise(&mut self) {
+        if !self.suppression_override.unwrap_or_else(noise_suppression) {
+            self.denoiser = None;
+            return;
+        }
+        let denoiser = self.denoiser.get_or_insert_with(crate::denoise::DenoiseState::new);
+        let mut input = [0.0f32; FRAME_SAMPLES / 2];
+        let mut output = [0.0f32; FRAME_SAMPLES / 2];
+        for half in self.frame.chunks_exact_mut(FRAME_SAMPLES / 2) {
+            for (x, &sample) in input.iter_mut().zip(half.iter()) {
+                *x = f32::from(sample);
+            }
+            denoiser.process_frame(&mut output, &input);
+            for (sample, &x) in half.iter_mut().zip(output.iter()) {
+                *sample = x.clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+    }
+
     fn push(&mut self, sample: f32) {
         let gain = f32::from_bits(self.microphone_gain.load(Ordering::Relaxed));
         let sample = (sample * gain).clamp(-1.0, 1.0);
@@ -1041,6 +1091,15 @@ impl InputAssembler {
             self.frame[self.frame_pos] = (value * 32767.0) as i16;
             self.frame_pos += 1;
             if self.frame_pos == FRAME_SAMPLES {
+                self.suppress_noise();
+                let level = (self.frame.iter()
+                    .map(|sample| {
+                        let normalized = f32::from(*sample) / 32768.0;
+                        normalized * normalized
+                    })
+                    .sum::<f32>() / FRAME_SAMPLES as f32)
+                    .sqrt();
+                MICROPHONE_LEVEL.store(level.to_bits(), Ordering::Relaxed);
                 let ptt = self.transmitting.load(Ordering::Relaxed);
                 let voice_activation = self.voice_activation.load(Ordering::Relaxed);
                 let should_send = if ptt {
@@ -1610,6 +1669,51 @@ mod tests {
     }
 
     #[test]
+    fn noise_suppression_removes_steady_noise_but_keeps_voiced_sound() {
+        use crate::denoise::DenoiseState;
+        let mut seed = 7u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 3000.0
+        };
+        let (mut out, mut inp) = ([0.0f32; 480], [0.0f32; 480]);
+
+        // Steady broadband noise alone: after the network settles, most of it is gone.
+        let mut state = DenoiseState::new();
+        let (mut e_in, mut e_out) = (0.0f64, 0.0f64);
+        for frame in 0..200 {
+            for x in inp.iter_mut() {
+                *x = noise();
+            }
+            state.process_frame(&mut out, &inp);
+            if frame >= 50 {
+                e_in += inp.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>();
+                e_out += out.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>();
+            }
+        }
+        assert!(e_out < e_in * 0.25, "noise energy only fell to {:.1}%", 100.0 * e_out / e_in);
+
+        // A voiced, pitched sound with the same noise on top keeps most of its energy.
+        let mut state = DenoiseState::new();
+        let (mut v_in, mut v_out) = (0.0f64, 0.0f64);
+        let mut t = 0usize;
+        for frame in 0..200 {
+            for x in inp.iter_mut() {
+                let phase = 2.0 * std::f64::consts::PI * 140.0 * t as f64 / 48_000.0;
+                let voiced: f64 = (1..=10).map(|h| (phase * f64::from(h)).sin() / f64::from(h)).sum();
+                *x = (8000.0 * voiced) as f32 + noise();
+                t += 1;
+            }
+            state.process_frame(&mut out, &inp);
+            if frame >= 50 {
+                v_in += inp.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>();
+                v_out += out.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>();
+            }
+        }
+        assert!(v_out > v_in * 0.4, "voiced energy fell to {:.1}%", 100.0 * v_out / v_in);
+    }
+
+    #[test]
     fn a_real_closed_udp_port_is_classified_as_an_icmp_rejection() {
         // Bind then drop to get a loopback port nothing listens on, then talk to
         // it over a connected UDP socket exactly like the voice worker does. The
@@ -1822,6 +1926,7 @@ mod tests {
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
             Arc::new(AtomicU32::new(1.0f32.to_bits())),
         );
+        input.suppression_override = Some(false);
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.1);
         }
@@ -1856,6 +1961,7 @@ mod tests {
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
             Arc::new(AtomicU32::new(2.0f32.to_bits())),
         );
+        input.suppression_override = Some(false);
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.1);
         }

@@ -1,5 +1,5 @@
 use std::{sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, thread};
-use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo};
+use svchorizon_engine::voice::{VoiceClient, VoiceEvent, VoiceServerInfo, noise_suppression, set_noise_suppression};
 
 // Compatibility number of the shipped Simple Voice Chat bukkit plugin for
 // MC 26.3 (2.6.27). Verified against the plugin jar: it logs "Compatibility
@@ -435,6 +435,24 @@ pub fn on_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut boo
     let Some(words) = command_words(command) else { return; };
     if words.first().map(String::as_str) != Some("svchorizon") { return; }
     *ran = true;
+    if matches!(words.get(1).map(String::as_str), Some("denoise" | "denoiser" | "noise")) {
+        let enabled = match words.get(2).map(String::as_str) {
+            Some("on" | "true" | "1") => true,
+            Some("off" | "false" | "0") => false,
+            None => !noise_suppression(),
+            Some(_) => {
+                game.native_chat("Usage: /svchorizon denoise [on|off]");
+                return;
+            }
+        };
+        save_noise_suppression(game, enabled);
+        game.native_chat(if enabled {
+            "SVC: Noise suppression on."
+        } else {
+            "SVC: Noise suppression off."
+        });
+        return;
+    }
     if !game.native_playing() || !GROUPS_ENABLED.load(Ordering::Acquire) {
         game.native_chat("SVC: Join a server with Simple Voice Chat enabled first.");
         return;
@@ -790,7 +808,26 @@ pub fn on_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
 
 /// Called by Horizon's stable native tick hook. All audio/network work stays
 /// on worker threads; this only copies the current game pose and PTT state.
+/// Persisted user settings are read once, on the first tick: the game's settings are not
+/// available when the mod is initialised.
+static SETTINGS_LOADED: AtomicBool = AtomicBool::new(false);
+
+fn load_saved_settings(game: &crate::game::Game<'_>) {
+    if SETTINGS_LOADED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(value) = game.native_setting("svchorizon", "denoiser") {
+        set_noise_suppression(value != "0");
+    }
+}
+
+fn save_noise_suppression(game: &crate::game::Game<'_>, enabled: bool) {
+    set_noise_suppression(enabled);
+    game.native_set_setting("svchorizon", "denoiser", if enabled { "1" } else { "0" });
+}
+
 pub fn on_tick(game: &mut crate::game::Game<'_>) {
+    load_saved_settings(game);
     poll_voice_events();
 
     // Game::leave_server clears Remote. Stop both workers when the Minecraft

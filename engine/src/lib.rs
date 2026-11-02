@@ -4,6 +4,7 @@
 #![allow(clippy::needless_range_loop)]
 
 mod compat;
+mod denoise;
 mod fixedvec;
 
 pub mod bands;
