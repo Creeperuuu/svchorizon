@@ -2,6 +2,7 @@
 //! UDP and audio workers are independent of Horizon's game thread. CPAL
 //! captures mono PCM and plays decoded Opus frames; callers control PTT.
 
+use crate::recording::Recorder;
 use crate::{Application, OpusDecoder, OpusEncoder};
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
@@ -21,24 +22,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAGIC: u8 = 0xff;
-const MAX_DATAGRAM: usize = 2048;
-const MAX_OPUS: usize = 1275;
+pub(crate) const MAGIC: u8 = 0xff;
+pub(crate) const MAX_DATAGRAM: usize = 2048;
+pub(crate) const MAX_OPUS: usize = 1275;
 const FRAME_SAMPLES: usize = 960;
 const SAMPLE_RATE: i32 = 48_000;
-const NONCE_BYTES: usize = 12;
-const TAG_BYTES: usize = 16;
+pub(crate) const NONCE_BYTES: usize = 12;
+pub(crate) const TAG_BYTES: usize = 16;
 
-const MIC: u8 = 0x01;
-const PLAYER_SOUND: u8 = 0x02;
-const GROUP_SOUND: u8 = 0x03;
-const LOCATION_SOUND: u8 = 0x04;
-const AUTHENTICATE: u8 = 0x05;
-const AUTHENTICATE_ACK: u8 = 0x06;
-const PING: u8 = 0x07;
-const KEEP_ALIVE: u8 = 0x08;
-const CONNECTION_CHECK: u8 = 0x09;
-const CONNECTION_CHECK_ACK: u8 = 0x0a;
+pub(crate) const MIC: u8 = 0x01;
+pub(crate) const PLAYER_SOUND: u8 = 0x02;
+pub(crate) const GROUP_SOUND: u8 = 0x03;
+pub(crate) const LOCATION_SOUND: u8 = 0x04;
+pub(crate) const AUTHENTICATE: u8 = 0x05;
+pub(crate) const AUTHENTICATE_ACK: u8 = 0x06;
+pub(crate) const PING: u8 = 0x07;
+pub(crate) const KEEP_ALIVE: u8 = 0x08;
+pub(crate) const CONNECTION_CHECK: u8 = 0x09;
+pub(crate) const CONNECTION_CHECK_ACK: u8 = 0x0a;
 
 #[derive(Clone, Debug)]
 pub struct VoiceServerInfo {
@@ -268,6 +269,9 @@ pub struct VoiceClient {
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    noise_suppression: Arc<AtomicBool>,
+    recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
+    talk_timestamps: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
     connected: Arc<AtomicBool>,
     auth_attempts: Arc<AtomicU32>,
     icmp_rejections: Arc<AtomicU32>,
@@ -326,6 +330,10 @@ impl VoiceClient {
         let voice_activation = Arc::new(AtomicBool::new(false));
         let voice_activation_threshold = Arc::new(AtomicU32::new(0.025f32.to_bits()));
         let microphone_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        // Simple Voice Chat enables its RNNoise denoiser by default.
+        let noise_suppression = Arc::new(AtomicBool::new(true));
+        let recorder: Arc<RwLock<Option<Arc<Recorder>>>> = Arc::new(RwLock::new(None));
+        let talk_timestamps: Arc<Mutex<HashMap<[u8; 16], Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(false));
         let auth_attempts = Arc::new(AtomicU32::new(0));
         let icmp_rejections = Arc::new(AtomicU32::new(0));
@@ -341,6 +349,8 @@ impl VoiceClient {
         let audio_voice_activation = Arc::clone(&voice_activation);
         let audio_voice_threshold = Arc::clone(&voice_activation_threshold);
         let audio_microphone_gain = Arc::clone(&microphone_gain);
+        let audio_noise_suppression = Arc::clone(&noise_suppression);
+        let audio_recorder = Arc::clone(&recorder);
         let audio_devices = Arc::new(RwLock::new(AudioDeviceSelection::default()));
         let worker_audio_devices = Arc::clone(&audio_devices);
         let audio_worker = thread::Builder::new()
@@ -348,7 +358,7 @@ impl VoiceClient {
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
                 audio_settings, audio_voice_activation, audio_voice_threshold, audio_microphone_gain,
-                worker_audio_devices,
+                audio_noise_suppression, audio_recorder, worker_audio_devices,
             ))
             .map_err(VoiceError::Io)?;
 
@@ -362,6 +372,7 @@ impl VoiceClient {
         let worker_received = Arc::clone(&received_datagrams);
         let worker_rejected = Arc::clone(&rejected_replies);
         let worker_positions = Arc::clone(&player_positions);
+        let worker_talk = Arc::clone(&talk_timestamps);
         let worker = match thread::Builder::new()
             .name("svchorizon-udp".into())
             .spawn(move || {
@@ -369,6 +380,7 @@ impl VoiceClient {
                     socket, info, application, command_rx, event_tx, audio_tx,
                     worker_running, worker_transmitting, worker_whispering, worker_voice_activation,
                     worker_connected, worker_auth_attempts, worker_icmp_rejections, worker_received, worker_rejected, worker_positions,
+                    worker_talk,
                 );
             }) {
             Ok(worker) => worker,
@@ -381,7 +393,9 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, microphone_gain, connected, auth_attempts, icmp_rejections, received_datagrams, rejected_replies,
+            voice_activation, voice_activation_threshold, microphone_gain,
+            noise_suppression, recorder, talk_timestamps,
+            connected, auth_attempts, icmp_rejections, received_datagrams, rejected_replies,
             worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
             audio_devices, endpoint: address,
         })
@@ -474,6 +488,37 @@ impl VoiceClient {
     pub fn set_microphone_gain(&self, gain: f32) {
         let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 1.0 };
         self.microphone_gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Toggles the RNNoise denoiser on the microphone path (Simple Voice
+    /// Chat's noise suppression, on by default like the official client).
+    pub fn set_noise_suppression(&self, enabled: bool) {
+        self.noise_suppression.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_noise_suppression_enabled(&self) -> bool {
+        self.noise_suppression.load(Ordering::Relaxed)
+    }
+
+    /// Attaches or detaches the recording sink. The output path captures
+    /// each speaker's post-volume stereo signal into it.
+    pub fn set_recorder(&self, recorder: Option<Arc<Recorder>>) {
+        if let Ok(mut slot) = self.recorder.write() {
+            *slot = recorder;
+        }
+    }
+
+    /// Whether a speaker was heard within the last 600 ms (the group HUD's
+    /// talking indicator, standing in for the official nameplate icons).
+    pub fn is_talking(&self, player: [u8; 16]) -> bool {
+        self.talk_timestamps
+            .lock()
+            .map(|timestamps| {
+                timestamps
+                    .get(&player)
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(600))
+            })
+            .unwrap_or(false)
     }
 
     /// Set a speaker's playback level. Values are clamped to 0.0..=2.0.
@@ -662,6 +707,7 @@ fn run_worker(
     received_datagrams: Arc<AtomicU32>,
     rejected_replies: Arc<AtomicU32>,
     player_positions: Arc<RwLock<HashMap<[u8; 16], [f64; 3]>>>,
+    talk_timestamps: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
 ) {
     let mut encoder = match OpusEncoder::new(SAMPLE_RATE, 1, application) {
         Ok(value) => value,
@@ -837,7 +883,7 @@ fn run_worker(
                                 sender, sequence, opus, position, max_distance: Some(distance),
                             }, Instant::now());
                             for frame in ready {
-                                emit_audio(&mut decoders, &audio, frame);
+                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
                             }
                         }
                     }
@@ -847,7 +893,7 @@ fn run_worker(
                                 sender, sequence, opus, position: None, max_distance: None,
                             }, Instant::now());
                             for frame in ready {
-                                emit_audio(&mut decoders, &audio, frame);
+                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
                             }
                         }
                     }
@@ -858,7 +904,7 @@ fn run_worker(
                                 max_distance: Some(distance),
                             }, Instant::now());
                             for frame in ready {
-                                emit_audio(&mut decoders, &audio, frame);
+                                emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
                             }
                         }
                     }
@@ -886,7 +932,7 @@ fn run_worker(
             }
         }
         for frame in jitter.poll(Instant::now()) {
-            emit_audio(&mut decoders, &audio, frame);
+            emit_audio(&mut decoders, &audio, frame, &talk_timestamps);
         }
         decoders.retain(|sender, _| jitter.senders.contains_key(sender));
     }
@@ -898,8 +944,13 @@ fn emit_audio(
     decoders: &mut HashMap<[u8; 16], OpusDecoder>,
     audio: &SyncSender<AudioFrame>,
     pending: PendingAudio,
+    talk_timestamps: &Arc<Mutex<HashMap<[u8; 16], Instant>>>,
 ) {
     if pending.opus.len() > MAX_OPUS { return; }
+    if let Ok(mut timestamps) = talk_timestamps.lock() {
+        timestamps.insert(pending.sender, Instant::now());
+        timestamps.retain(|_, at| at.elapsed() < Duration::from_secs(30));
+    }
     if !decoders.contains_key(&pending.sender) {
         let Ok(decoder) = OpusDecoder::new(SAMPLE_RATE, 1) else { return; };
         decoders.insert(pending.sender, decoder);
@@ -930,6 +981,8 @@ fn run_audio_io(
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    noise_suppression: Arc<AtomicBool>,
+    recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
     selection: Arc<RwLock<AudioDeviceSelection>>,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -951,7 +1004,7 @@ fn run_audio_io(
                     let name = device.name().unwrap_or_else(|_| "<unknown>".into());
                     match build_input_stream(&device, command_tx.clone(), Arc::clone(&transmitting),
                         Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
-                        Arc::clone(&microphone_gain), events.clone()) {
+                        Arc::clone(&microphone_gain), Arc::clone(&noise_suppression), events.clone()) {
                         Ok(stream) => match stream.play() {
                             Ok(()) => {
                                 eprintln!("[svchorizon] Microphone opened: {name}");
@@ -973,7 +1026,7 @@ fn run_audio_io(
                 Some(device) => {
                     let name = device.name().unwrap_or_else(|_| "<unknown>".into());
                     match build_output_stream(&device, Arc::clone(&shared_rx), events.clone(),
-                        Arc::clone(&listener), Arc::clone(&player_audio_settings)) {
+                        Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&recorder)) {
                         Ok(stream) => match stream.play() {
                             Ok(()) => {
                                 eprintln!("[svchorizon] Speaker opened: {name}");
@@ -1005,6 +1058,8 @@ struct InputAssembler {
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    noise_suppression: Arc<AtomicBool>,
+    denoiser: Option<crate::rnnoise::Denoiser>,
 }
 impl InputAssembler {
     fn new(
@@ -1014,7 +1069,17 @@ impl InputAssembler {
         voice_activation: Arc<AtomicBool>,
         voice_activation_threshold: Arc<AtomicU32>,
         microphone_gain: Arc<AtomicU32>,
+        noise_suppression: Arc<AtomicBool>,
     ) -> Self {
+        // The RNNoise denoiser is built lazily per stream rebuild; the model
+        // weights behind it are parsed once and shared.
+        let denoiser = match crate::rnnoise::Denoiser::new() {
+            Some(denoiser) => Some(denoiser),
+            None => {
+                eprintln!("[svchorizon] Noise suppression unavailable (denoiser init failed)");
+                None
+            }
+        };
         Self {
             input_rate: input_rate.max(1),
             phase: 0,
@@ -1027,6 +1092,8 @@ impl InputAssembler {
             voice_activation,
             voice_activation_threshold,
             microphone_gain,
+            noise_suppression,
+            denoiser,
         }
     }
     fn push(&mut self, sample: f32) {
@@ -1041,6 +1108,23 @@ impl InputAssembler {
             self.frame[self.frame_pos] = (value * 32767.0) as i16;
             self.frame_pos += 1;
             if self.frame_pos == FRAME_SAMPLES {
+                // Noise suppression runs on the denoiser's 480-sample frames
+                // before the activation decision, so voice activation also
+                // sees the cleaned signal (like upstream's mic processors).
+                if self.noise_suppression.load(Ordering::Relaxed)
+                    && let Some(denoiser) = self.denoiser.as_mut()
+                {
+                    for half in self.frame.chunks_exact_mut(crate::rnnoise::Denoiser::frame_size()) {
+                        let mut block = [0.0f32; crate::rnnoise::Denoiser::frame_size()];
+                        for (value, sample) in block.iter_mut().zip(half.iter()) {
+                            *value = f32::from(*sample) / 32768.0;
+                        }
+                        denoiser.process(&mut block);
+                        for (sample, value) in half.iter_mut().zip(block.iter()) {
+                            *sample = (value * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        }
+                    }
+                }
                 let ptt = self.transmitting.load(Ordering::Relaxed);
                 let voice_activation = self.voice_activation.load(Ordering::Relaxed);
                 let should_send = if ptt {
@@ -1076,6 +1160,7 @@ fn build_input_stream(
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    noise_suppression: Arc<AtomicBool>,
     events: SyncSender<VoiceEvent>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
@@ -1088,7 +1173,7 @@ fn build_input_stream(
         cpal::SampleFormat::F32 => {
             let mut input = InputAssembler::new(
                 rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
-                Arc::clone(&microphone_gain),
+                Arc::clone(&microphone_gain), Arc::clone(&noise_suppression),
             );
             let errors = events;
             device.build_input_stream(&config, move |data: &[f32], _| {
@@ -1102,7 +1187,7 @@ fn build_input_stream(
         cpal::SampleFormat::I16 => {
             let mut input = InputAssembler::new(
                 rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold),
-                Arc::clone(&microphone_gain),
+                Arc::clone(&microphone_gain), Arc::clone(&noise_suppression),
             );
             let errors = events;
             device.build_input_stream(&config, move |data: &[i16], _| {
@@ -1116,7 +1201,7 @@ fn build_input_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut input = InputAssembler::new(rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold), Arc::clone(&microphone_gain));
+            let mut input = InputAssembler::new(rate, tx, transmitting, Arc::clone(&voice_activation), Arc::clone(&voice_activation_threshold), Arc::clone(&microphone_gain), Arc::clone(&noise_suppression));
             let errors = events;
             device.build_input_stream(&config, move |data: &[u16], _| {
                 for frame in data.chunks(channels) {
@@ -1145,17 +1230,22 @@ struct OutputAssembler {
     step: f64,
     listener: Arc<Mutex<ListenerPose>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
+    recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
+    recording_buffers: HashMap<[u8; 16], Vec<i16>>,
 }
 
 impl OutputAssembler {
     const MAX_SPEAKERS: usize = 32;
     const MAX_QUEUED_FRAMES_PER_SPEAKER: usize = 6;
+    /// Recording chunks of about 20 ms at 48 kHz stereo.
+    const RECORDING_CHUNK_SAMPLES: usize = 960 * 2;
 
     fn new(
         rx: Arc<Mutex<Receiver<AudioFrame>>>,
         output_rate: u32,
         listener: Arc<Mutex<ListenerPose>>,
         player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
+        recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
     ) -> Self {
         Self {
             rx,
@@ -1163,6 +1253,8 @@ impl OutputAssembler {
             step: SAMPLE_RATE as f64 / f64::from(output_rate.max(1)),
             listener,
             player_audio_settings,
+            recorder,
+            recording_buffers: HashMap::new(),
         }
     }
 
@@ -1227,7 +1319,8 @@ impl OutputAssembler {
         let mut left = 0.0f32;
         let mut right = 0.0f32;
         let step = self.step;
-        self.speakers.retain(|_, queue| {
+        let mut recorded: Vec<([u8; 16], f32, f32)> = Vec::new();
+        self.speakers.retain(|speaker, queue| {
             let completed = if let Some(voice) = queue.front_mut() {
                 if voice.position < FRAME_SAMPLES as f64 {
                     let index = voice.position.floor() as usize;
@@ -1238,6 +1331,7 @@ impl OutputAssembler {
                         + (pcm[next] as f32 - pcm[index] as f32) * fraction;
                     left += sample * voice.left_gain;
                     right += sample * voice.right_gain;
+                    recorded.push((*speaker, sample * voice.left_gain, sample * voice.right_gain));
                     voice.position += step;
                 }
                 voice.position >= FRAME_SAMPLES as f64
@@ -1249,11 +1343,28 @@ impl OutputAssembler {
             }
             !queue.is_empty()
         });
+        for (speaker, left_sample, right_sample) in recorded {
+            self.record_sample(&speaker, left_sample, right_sample);
+        }
 
         [
             left.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
             right.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
         ]
+    }
+
+    /// Feeds one post-volume stereo sample of one speaker into the active
+    /// recording, flushing 20 ms chunks to the recorder thread.
+    fn record_sample(&mut self, speaker: &[u8; 16], left: f32, right: f32) {
+        let Ok(slot) = self.recorder.read() else { return };
+        let Some(recorder) = slot.as_ref() else { return };
+        let buffer = self.recording_buffers.entry(*speaker).or_default();
+        buffer.push((left.clamp(i16::MIN as f32, i16::MAX as f32)) as i16);
+        buffer.push((right.clamp(i16::MIN as f32, i16::MAX as f32)) as i16);
+        if buffer.len() >= Self::RECORDING_CHUNK_SAMPLES {
+            recorder.capture(*speaker, buffer);
+            buffer.clear();
+        }
     }
 }
 
@@ -1263,6 +1374,7 @@ fn build_output_stream(
     events: SyncSender<VoiceEvent>,
     listener: Arc<Mutex<ListenerPose>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
+    recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -1272,7 +1384,7 @@ fn build_output_stream(
     let rate = config.sample_rate.0;
     match format {
         cpal::SampleFormat::F32 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings));
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&recorder));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [f32], _| {
                 for frame in data.chunks_mut(channels) {
@@ -1290,7 +1402,7 @@ fn build_output_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::I16 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings));
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&recorder));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [i16], _| {
                 for frame in data.chunks_mut(channels) {
@@ -1306,7 +1418,7 @@ fn build_output_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut output = OutputAssembler::new(rx, rate, listener, player_audio_settings);
+            let mut output = OutputAssembler::new(rx, rate, listener, player_audio_settings, recorder);
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [u16], _| {
                 for frame in data.chunks_mut(channels) {
@@ -1328,7 +1440,7 @@ fn build_output_stream(
 }
 
 #[derive(Debug)]
-enum Packet {
+pub(crate) enum Packet {
     Mic { opus: Vec<u8>, sequence: i64, whispering: bool },
     /// SVC 2.6.27 authentication: player UUID followed by the raw 16-byte
     /// secret issued in the SecretPacket (AuthenticatePacket.toBytes order).
@@ -1427,7 +1539,7 @@ fn decode_server_datagram(datagram: &[u8], secret: &[u8; 16]) -> Option<Packet> 
     decode_server_datagram_checked(datagram, secret).ok().map(|(packet, _)| packet)
 }
 
-fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
+pub(crate) fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match packet {
         Packet::Mic { opus, sequence, whispering } => {
@@ -1443,7 +1555,39 @@ fn encode_packet(packet: &Packet) -> Option<Vec<u8>> {
         Packet::Ping { id, timestamp } => {
             out.push(PING); out.extend_from_slice(id); out.extend_from_slice(&timestamp.to_be_bytes());
         }
-        _ => return None,
+        // Server-side packets: the hosted-voice server encodes these.
+        Packet::AuthenticateAck => out.push(AUTHENTICATE_ACK),
+        Packet::ConnectionCheckAck => out.push(CONNECTION_CHECK_ACK),
+        Packet::PlayerSound { channel, sender, opus, sequence, distance, whispering, category } => {
+            if opus.len() > MAX_OPUS || category.is_some() { return None; }
+            out.push(PLAYER_SOUND);
+            out.extend_from_slice(channel);
+            out.extend_from_slice(sender);
+            write_byte_array(&mut out, opus);
+            out.extend_from_slice(&sequence.to_be_bytes());
+            out.extend_from_slice(&distance.to_bits().to_be_bytes());
+            out.push(u8::from(*whispering));
+        }
+        Packet::GroupSound { channel, sender, opus, sequence, category } => {
+            if opus.len() > MAX_OPUS || category.is_some() { return None; }
+            out.push(GROUP_SOUND);
+            out.extend_from_slice(channel);
+            out.extend_from_slice(sender);
+            write_byte_array(&mut out, opus);
+            out.extend_from_slice(&sequence.to_be_bytes());
+            out.push(0);
+        }
+        Packet::LocationSound { channel, sender, location, opus, sequence, distance, category } => {
+            if opus.len() > MAX_OPUS || category.is_some() { return None; }
+            out.push(LOCATION_SOUND);
+            out.extend_from_slice(channel);
+            out.extend_from_slice(sender);
+            for value in location { out.extend_from_slice(&value.to_bits().to_be_bytes()); }
+            write_byte_array(&mut out, opus);
+            out.extend_from_slice(&sequence.to_be_bytes());
+            out.extend_from_slice(&distance.to_bits().to_be_bytes());
+            out.push(0);
+        }
     }
     Some(out)
 }
@@ -1461,7 +1605,7 @@ fn decode_packet(bytes: &[u8]) -> Option<Packet> {
 /// and never looks at what remains (`NetworkMessage.readFromBytes`), so a server
 /// or proxy that pads its packets is fully valid for it; we must tolerate that
 /// too instead of treating padding as corruption.
-fn decode_packet_prefix(bytes: &[u8]) -> Option<(Packet, usize)> {
+pub(crate) fn decode_packet_prefix(bytes: &[u8]) -> Option<(Packet, usize)> {
     let mut r = Reader::new(bytes);
     let packet = match r.u8()? {
         MIC => Packet::Mic { opus: r.byte_array(MAX_OPUS)?, sequence: r.i64()?, whispering: r.boolean()? },
@@ -1500,27 +1644,29 @@ fn decode_packet_prefix(bytes: &[u8]) -> Option<(Packet, usize)> {
     Some((packet, bytes.len() - r.pos))
 }
 
-fn write_varint(out: &mut Vec<u8>, mut value: usize) {
+pub(crate) fn write_varint(out: &mut Vec<u8>, mut value: usize) {
     while value > 0x7f { out.push((value as u8 & 0x7f) | 0x80); value >>= 7; }
     out.push(value as u8);
 }
-fn write_byte_array(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn write_byte_array(out: &mut Vec<u8>, bytes: &[u8]) {
     write_varint(out, bytes.len()); out.extend_from_slice(bytes);
 }
 
-struct Reader<'a> { bytes: &'a [u8], pos: usize }
+pub(crate) struct Reader<'a> { bytes: &'a [u8], pos: usize }
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self { Self { bytes, pos: 0 } }
+    pub(crate) fn new(bytes: &'a [u8]) -> Self { Self { bytes, pos: 0 } }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         let result = self.bytes.get(self.pos..end)?; self.pos = end; Some(result)
     }
-    fn u8(&mut self) -> Option<u8> { Some(*self.take(1)?.first()?) }
-    fn boolean(&mut self) -> Option<bool> { match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None } }
-    fn array16(&mut self) -> Option<[u8; 16]> { self.take(16)?.try_into().ok() }
+    pub(crate) fn u8(&mut self) -> Option<u8> { Some(*self.take(1)?.first()?) }
+    pub(crate) fn boolean(&mut self) -> Option<bool> { match self.u8()? { 0 => Some(false), 1 => Some(true), _ => None } }
+    pub(crate) fn array16(&mut self) -> Option<[u8; 16]> { self.take(16)?.try_into().ok() }
+    pub(crate) fn i16(&mut self) -> Option<i16> { Some(i16::from_be_bytes(self.take(2)?.try_into().ok()?)) }
+    pub(crate) fn i32(&mut self) -> Option<i32> { Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?)) }
     fn i64(&mut self) -> Option<i64> { Some(i64::from_be_bytes(self.take(8)?.try_into().ok()?)) }
     fn f32(&mut self) -> Option<f32> { Some(f32::from_bits(u32::from_be_bytes(self.take(4)?.try_into().ok()?))) }
-    fn f64(&mut self) -> Option<f64> { Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?))) }
+    pub(crate) fn f64(&mut self) -> Option<f64> { Some(f64::from_bits(u64::from_be_bytes(self.take(8)?.try_into().ok()?))) }
     fn varint(&mut self) -> Option<usize> {
         let mut value = 0usize;
         for i in 0..5 {
@@ -1531,18 +1677,18 @@ impl<'a> Reader<'a> {
         }
         None
     }
-    fn byte_array(&mut self, max: usize) -> Option<Vec<u8>> {
+    pub(crate) fn byte_array(&mut self, max: usize) -> Option<Vec<u8>> {
         let len = self.varint()?;
         if len > max { return None; }
         Some(self.take(len)?.to_vec())
     }
-    fn string(&mut self, max_chars: usize) -> Option<String> {
+    pub(crate) fn string(&mut self, max_chars: usize) -> Option<String> {
         let bytes = self.byte_array(max_chars.checked_mul(4)?)?;
         let value = String::from_utf8(bytes).ok()?;
         if value.chars().count() > max_chars { return None; }
         Some(value)
     }
-    fn done(&self) -> bool { self.pos == self.bytes.len() }
+    pub(crate) fn done(&self) -> bool { self.pos == self.bytes.len() }
 }
 
 #[cfg(test)]
@@ -1746,7 +1892,7 @@ mod tests {
     fn mixes_speakers_but_keeps_each_speakers_packets_sequential() {
         let (tx, rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
-        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())));
+        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())), Arc::new(RwLock::new(None)));
 
         let make_frame = |sender, sample| AudioFrame {
             sender,
@@ -1821,6 +1967,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
             Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
         );
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.1);
@@ -1838,6 +1985,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
             Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
         );
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.01);
@@ -1855,6 +2003,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0.025f32.to_bits())),
             Arc::new(AtomicU32::new(2.0f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
         );
         for _ in 0..=FRAME_SAMPLES {
             input.push(0.1);
