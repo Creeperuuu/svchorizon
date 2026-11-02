@@ -327,6 +327,7 @@ pub struct VoiceClient {
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    speaker_gain: Arc<AtomicU32>,
     noise_suppression: Arc<AtomicBool>,
     disabled: Arc<AtomicBool>,
     recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
@@ -393,6 +394,7 @@ impl VoiceClient {
         let voice_activation = Arc::new(AtomicBool::new(false));
         let voice_activation_threshold = Arc::new(AtomicU32::new(0.025f32.to_bits()));
         let microphone_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let speaker_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         // Simple Voice Chat enables its RNNoise denoiser by default.
         let noise_suppression = Arc::new(AtomicBool::new(true));
         let disabled = Arc::new(AtomicBool::new(false));
@@ -413,6 +415,7 @@ impl VoiceClient {
         let audio_voice_activation = Arc::clone(&voice_activation);
         let audio_voice_threshold = Arc::clone(&voice_activation_threshold);
         let audio_microphone_gain = Arc::clone(&microphone_gain);
+        let audio_speaker_gain = Arc::clone(&speaker_gain);
         let audio_noise_suppression = Arc::clone(&noise_suppression);
         let audio_disabled = Arc::clone(&disabled);
         let audio_recorder = Arc::clone(&recorder);
@@ -423,7 +426,7 @@ impl VoiceClient {
             .spawn(move || run_audio_io(
                 audio_command_tx, audio_rx, audio_running, audio_transmitting, audio_events, audio_listener,
                 audio_settings, audio_voice_activation, audio_voice_threshold, audio_microphone_gain,
-                audio_noise_suppression, audio_disabled, audio_recorder, worker_audio_devices,
+                audio_speaker_gain, audio_noise_suppression, audio_disabled, audio_recorder, worker_audio_devices,
             ))
             .map_err(VoiceError::Io)?;
 
@@ -458,7 +461,7 @@ impl VoiceClient {
 
         Ok(Self {
             command_tx, event_rx, running, transmitting, whispering,
-            voice_activation, voice_activation_threshold, microphone_gain,
+            voice_activation, voice_activation_threshold, microphone_gain, speaker_gain,
             noise_suppression, disabled, recorder, talk_timestamps,
             connected, auth_attempts, icmp_rejections, received_datagrams, rejected_replies,
             worker: Some(worker), audio_worker: Some(audio_worker), listener, player_positions, player_audio_settings,
@@ -553,6 +556,13 @@ impl VoiceClient {
     pub fn set_microphone_gain(&self, gain: f32) {
         let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 1.0 };
         self.microphone_gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Set speaker amplification from 0.0 (silent) through 4.0; the
+    /// official client's speaker amplification slider.
+    pub fn set_speaker_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 1.0 };
+        self.speaker_gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
     /// Toggles the RNNoise denoiser on the microphone path (Simple Voice
@@ -1069,6 +1079,7 @@ fn run_audio_io(
     voice_activation: Arc<AtomicBool>,
     voice_activation_threshold: Arc<AtomicU32>,
     microphone_gain: Arc<AtomicU32>,
+    speaker_gain: Arc<AtomicU32>,
     noise_suppression: Arc<AtomicBool>,
     disabled: Arc<AtomicBool>,
     recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
@@ -1115,7 +1126,8 @@ fn run_audio_io(
                 Some(device) => {
                     let name = device.name().unwrap_or_else(|_| "<unknown>".into());
                     match build_output_stream(&device, Arc::clone(&shared_rx), events.clone(),
-                        Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&disabled), Arc::clone(&recorder)) {
+                        Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&disabled),
+                        Arc::clone(&speaker_gain), Arc::clone(&recorder)) {
                         Ok(stream) => match stream.play() {
                             Ok(()) => {
                                 eprintln!("[svchorizon] Speaker opened: {name}");
@@ -1320,6 +1332,7 @@ struct OutputAssembler {
     listener: Arc<Mutex<ListenerPose>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
     disabled: Arc<AtomicBool>,
+    speaker_gain: Arc<AtomicU32>,
     recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
     recording_buffers: HashMap<[u8; 16], Vec<i16>>,
 }
@@ -1338,6 +1351,7 @@ impl OutputAssembler {
         listener: Arc<Mutex<ListenerPose>>,
         player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
         disabled: Arc<AtomicBool>,
+        speaker_gain: Arc<AtomicU32>,
         recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
     ) -> Self {
         Self {
@@ -1347,6 +1361,7 @@ impl OutputAssembler {
             listener,
             player_audio_settings,
             disabled,
+            speaker_gain,
             recorder,
             recording_buffers: HashMap::new(),
         }
@@ -1417,6 +1432,9 @@ impl OutputAssembler {
         if self.disabled.load(Ordering::Relaxed) {
             return [0, 0];
         }
+        // The official client's speaker amplification, applied to the mixed
+        // output only: recordings keep the raw per-speaker levels.
+        let master_gain = f32::from_bits(self.speaker_gain.load(Ordering::Relaxed));
         let mut left = 0.0f32;
         let mut right = 0.0f32;
         let step = self.step;
@@ -1430,8 +1448,8 @@ impl OutputAssembler {
                     let pcm = &voice.frame.pcm;
                     let sample = pcm[index] as f32
                         + (pcm[next] as f32 - pcm[index] as f32) * fraction;
-                    left += sample * voice.left_gain;
-                    right += sample * voice.right_gain;
+                    left += sample * voice.left_gain * master_gain;
+                    right += sample * voice.right_gain * master_gain;
                     recorded.push((*speaker, sample * voice.left_gain, sample * voice.right_gain));
                     voice.position += step;
                 }
@@ -1476,6 +1494,7 @@ fn build_output_stream(
     listener: Arc<Mutex<ListenerPose>>,
     player_audio_settings: Arc<RwLock<HashMap<[u8; 16], PlayerAudioSettings>>>,
     disabled: Arc<AtomicBool>,
+    speaker_gain: Arc<AtomicU32>,
     recorder: Arc<RwLock<Option<Arc<Recorder>>>>,
 ) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
@@ -1486,7 +1505,7 @@ fn build_output_stream(
     let rate = config.sample_rate.0;
     match format {
         cpal::SampleFormat::F32 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&disabled), Arc::clone(&recorder));
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&disabled), Arc::clone(&speaker_gain), Arc::clone(&recorder));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [f32], _| {
                 for frame in data.chunks_mut(channels) {
@@ -1504,7 +1523,7 @@ fn build_output_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::I16 => {
-            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&disabled), Arc::clone(&recorder));
+            let mut output = OutputAssembler::new(rx, rate, Arc::clone(&listener), Arc::clone(&player_audio_settings), Arc::clone(&disabled), Arc::clone(&speaker_gain), Arc::clone(&recorder));
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [i16], _| {
                 for frame in data.chunks_mut(channels) {
@@ -1520,7 +1539,7 @@ fn build_output_stream(
             }, None).map_err(|e| e.to_string())
         }
         cpal::SampleFormat::U16 => {
-            let mut output = OutputAssembler::new(rx, rate, listener, player_audio_settings, disabled, recorder);
+            let mut output = OutputAssembler::new(rx, rate, listener, player_audio_settings, disabled, speaker_gain, recorder);
             let errors = events;
             device.build_output_stream(&config, move |data: &mut [u16], _| {
                 for frame in data.chunks_mut(channels) {
@@ -1995,7 +2014,7 @@ mod tests {
     fn mixes_speakers_but_keeps_each_speakers_packets_sequential() {
         let (tx, rx) = mpsc::sync_channel(8);
         let listener = Arc::new(Mutex::new(ListenerPose::default()));
-        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())), Arc::new(AtomicBool::new(false)), Arc::new(RwLock::new(None)));
+        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicU32::new(1.0f32.to_bits())), Arc::new(RwLock::new(None)));
 
         let make_frame = |sender, sample| AudioFrame {
             sender,
@@ -2014,6 +2033,21 @@ mod tests {
             let _ = output.next_stereo();
         }
         assert_eq!(output.next_stereo(), [4_000, 4_000]);
+    }
+
+    #[test]
+    fn speaker_gain_amplifies_the_stereo_mix() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let listener = Arc::new(Mutex::new(ListenerPose::default()));
+        let mut output = OutputAssembler::new(Arc::new(Mutex::new(rx)), SAMPLE_RATE as u32, listener, Arc::new(RwLock::new(HashMap::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicU32::new(2.0f32.to_bits())), Arc::new(RwLock::new(None)));
+
+        tx.send(AudioFrame {
+            sender: [9; 16],
+            pcm: [1_000; FRAME_SAMPLES],
+            position: None,
+            max_distance: None,
+        }).unwrap();
+        assert_eq!(output.next_stereo(), [2_000, 2_000]);
     }
 
     #[test]

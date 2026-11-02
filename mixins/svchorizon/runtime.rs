@@ -118,15 +118,26 @@ fn remember_recording_name(id: [u8; 16], name: &str) {
 // ---------------------------------------------------------------------------
 
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
-static MENU_PAGE: AtomicUsize = AtomicUsize::new(0); // 0 main, 1 groups, 2 players
+static MENU_PAGE: AtomicUsize = AtomicUsize::new(0); // 0 main, 1 groups, 2 players, 3 mic devices, 4 speaker devices
 static MENU_SELECTED: AtomicUsize = AtomicUsize::new(0);
+/// Main page: which column the selection sits in (0 icon strip, 1 rows).
+static MENU_FOCUS: AtomicUsize = AtomicUsize::new(1);
+/// Main page: which icon button of the vertical strip is selected.
+static MENU_ICON: AtomicUsize = AtomicUsize::new(0);
 static MENU_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 /// Master speaker mute (the official client's "disable voice chat").
 static SPEAKERS_DISABLED: AtomicBool = AtomicBool::new(false);
+/// The official client's "hide icons" toggle: draw no voice chat HUD at all.
+static HIDE_ICONS: AtomicBool = AtomicBool::new(false);
 
 const MENU_MAIN: usize = 0;
 const MENU_GROUPS: usize = 1;
 const MENU_PLAYERS: usize = 2;
+const MENU_MIC_DEVICES: usize = 3;
+const MENU_SPK_DEVICES: usize = 4;
+/// The main page's vertical icon strip: microphone, hide icons, group,
+/// recording - the official VoiceChatScreen's left column.
+const MENU_ICON_COUNT: usize = 4;
 
 fn menu_open() -> bool {
     MENU_OPEN.load(Ordering::Relaxed)
@@ -144,6 +155,7 @@ fn read_setting(game: &crate::game::Game<'_>, key: &str) -> Option<String> {
 /// game thread and applied to every fresh VoiceClient.
 static PERSISTED_NOISE_SUPPRESSION: AtomicBool = AtomicBool::new(true);
 static PERSISTED_MIC_GAIN: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+static PERSISTED_SPEAKER_GAIN: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 static PERSISTED_ACTIVATION_THRESHOLD: AtomicU32 = AtomicU32::new(0.025f32.to_bits());
 
 /// Reads the persisted settings (game thread; native_setting reads files).
@@ -155,15 +167,20 @@ fn load_persisted_settings(game: &crate::game::Game<'_>) {
     if let Some(gain) = read_setting(game, "microphone_gain").and_then(|value| value.parse::<f32>().ok()) {
         PERSISTED_MIC_GAIN.store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
     }
+    if let Some(gain) = read_setting(game, "speaker_gain").and_then(|value| value.parse::<f32>().ok()) {
+        PERSISTED_SPEAKER_GAIN.store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+    }
     if let Some(threshold) = read_setting(game, "activation_threshold").and_then(|value| value.parse::<f32>().ok()) {
         PERSISTED_ACTIVATION_THRESHOLD.store(threshold.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
+    HIDE_ICONS.store(read_setting(game, "hide_icons").map(|value| value == "on").unwrap_or(false), Ordering::Relaxed);
 }
 
 /// Applies the persisted client settings to a fresh VoiceClient (any thread).
 fn apply_client_settings(client: &VoiceClient) {
     client.set_noise_suppression(PERSISTED_NOISE_SUPPRESSION.load(Ordering::Relaxed));
     client.set_microphone_gain(f32::from_bits(PERSISTED_MIC_GAIN.load(Ordering::Relaxed)));
+    client.set_speaker_gain(f32::from_bits(PERSISTED_SPEAKER_GAIN.load(Ordering::Relaxed)));
     let enabled = VOICE_ACTIVATION.load(Ordering::Relaxed);
     client.set_voice_activation(
         enabled && !SELF_MUTED.load(Ordering::Relaxed),
@@ -816,6 +833,54 @@ static RECONNECTING: AtomicBool = AtomicBool::new(false);
 static CONNECTING: AtomicBool = AtomicBool::new(false);
 static GROUPS_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUDIO_DEVICE_PREFS: OnceLock<Mutex<(Option<String>, Option<String>)>> = OnceLock::new();
+/// Device lists are enumerated once when their menu page opens: audio host
+/// queries are far too slow to run inside the HUD draw every frame.
+static MIC_DEVICE_LIST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static SPK_DEVICE_LIST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn mic_device_list() -> &'static Mutex<Vec<String>> {
+    MIC_DEVICE_LIST.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn spk_device_list() -> &'static Mutex<Vec<String>> {
+    SPK_DEVICE_LIST.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// (Re)enumerates the device list a menu page shows.
+fn refresh_device_list(page: usize) {
+    let (store, output) = match page {
+        MENU_MIC_DEVICES => (mic_device_list(), false),
+        MENU_SPK_DEVICES => (spk_device_list(), true),
+        _ => return,
+    };
+    let devices = if output {
+        VoiceClient::output_devices()
+    } else {
+        VoiceClient::input_devices()
+    };
+    if let Ok(mut slot) = store.lock() {
+        *slot = devices;
+    }
+}
+
+/// The menu page that lists `page`'s devices (index 0 is "OS default").
+fn device_page_rows(page: usize) -> Vec<(String, bool)> {
+    let slot = match page {
+        MENU_MIC_DEVICES => mic_device_list(),
+        MENU_SPK_DEVICES => spk_device_list(),
+        _ => return Vec::new(),
+    };
+    let selected = audio_device_preferences().lock().ok()
+        .map(|preferences| if page == MENU_MIC_DEVICES { preferences.0.clone() } else { preferences.1.clone() })
+        .unwrap_or_default();
+    let mut rows = vec![("System default".to_owned(), selected.is_none())];
+    if let Ok(devices) = slot.lock() {
+        for device in devices.iter() {
+            rows.push((device.clone(), Some(device) == selected.as_ref()));
+        }
+    }
+    rows
+}
 
 fn audio_device_preferences() -> &'static Mutex<(Option<String>, Option<String>)> {
     AUDIO_DEVICE_PREFS.get_or_init(|| Mutex::new((None, None)))
@@ -1865,8 +1930,7 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             let opening = !menu_open();
             MENU_OPEN.store(opening, Ordering::Relaxed);
             if opening {
-                MENU_PAGE.store(MENU_MAIN, Ordering::Relaxed);
-                MENU_SELECTED.store(0, Ordering::Relaxed);
+                open_menu_page(MENU_MAIN);
             }
         } else if !pressed {
             MENU_KEY_DOWN.store(false, Ordering::Release);
@@ -1903,62 +1967,103 @@ pub fn on_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
 static RECORDING_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static NOISE_SUPPRESSION_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// Keyboard navigation of the voice chat menu overlay.
+/// Keyboard navigation of the voice chat menu overlay. The main page has
+/// two columns like the official screen: the left icon strip (Up/Down
+/// cycles it) and the settings rows; Left/Right move between them and
+/// adjust the amplification sliders while one is selected.
 fn handle_menu_key(game: &mut crate::game::Game<'_>, key: &str) {
     let page = MENU_PAGE.load(Ordering::Relaxed);
-    let row_count = match page {
-        MENU_GROUPS => group_state().lock().map(|state| state.groups.len().max(1)).unwrap_or(1),
-        MENU_PLAYERS => group_state().lock().map(|state| state.players.len().max(1)).unwrap_or(1),
-        _ => MENU_MAIN_ROWS,
-    };
+    let row_count = menu_row_count(page);
     match key {
         "key.keyboard.escape" => {
             if page == MENU_MAIN {
                 MENU_OPEN.store(false, Ordering::Relaxed);
             } else {
-                MENU_PAGE.store(MENU_MAIN, Ordering::Relaxed);
-                MENU_SELECTED.store(0, Ordering::Relaxed);
+                open_menu_page(MENU_MAIN);
             }
         }
-        "key.keyboard.down" => {
-            let _ = MENU_SELECTED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                Some((value + 1) % row_count)
-            });
-        }
-        "key.keyboard.up" => {
-            let _ = MENU_SELECTED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                Some((value + row_count - 1) % row_count)
-            });
-        }
-        "key.keyboard.enter" | "key.keyboard.right" => activate_menu_row(game, page, 1),
-        "key.keyboard.left" => activate_menu_row(game, page, -1),
+        "key.keyboard.down" => match page {
+            MENU_MAIN if MENU_FOCUS.load(Ordering::Relaxed) == 0 => {
+                let _ = MENU_ICON.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some((value + 1) % MENU_ICON_COUNT)
+                });
+            }
+            _ => {
+                let _ = MENU_SELECTED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some((value + 1) % row_count)
+                });
+            }
+        },
+        "key.keyboard.up" => match page {
+            MENU_MAIN if MENU_FOCUS.load(Ordering::Relaxed) == 0 => {
+                let _ = MENU_ICON.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some((value + MENU_ICON_COUNT - 1) % MENU_ICON_COUNT)
+                });
+            }
+            _ => {
+                let _ = MENU_SELECTED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some((value + row_count - 1) % row_count)
+                });
+            }
+        },
+        "key.keyboard.enter" => activate_menu_row(game, page, 0),
+        "key.keyboard.right" => match page {
+            MENU_MAIN if MENU_FOCUS.load(Ordering::Relaxed) == 1
+                && MENU_SELECTED.load(Ordering::Relaxed) <= 1 => adjust_amplification(game, 1),
+            MENU_MAIN => MENU_FOCUS.store(1, Ordering::Relaxed),
+            MENU_GROUPS | MENU_PLAYERS => activate_menu_row(game, page, 1),
+            _ => {}
+        },
+        "key.keyboard.left" => match page {
+            MENU_MAIN if MENU_FOCUS.load(Ordering::Relaxed) == 1
+                && MENU_SELECTED.load(Ordering::Relaxed) <= 1 => adjust_amplification(game, -1),
+            MENU_MAIN => MENU_FOCUS.store(0, Ordering::Relaxed),
+            MENU_GROUPS | MENU_PLAYERS => activate_menu_row(game, page, -1),
+            _ => {}
+        },
         _ => {}
     }
 }
 
+/// The number of selectable rows on a menu page (8 rows fit the panel).
+fn menu_row_count(page: usize) -> usize {
+    match page {
+        MENU_GROUPS => group_state().lock().map(|state| state.groups.len().min(8).max(1)).unwrap_or(1),
+        MENU_PLAYERS => group_state().lock().map(|state| state.players.len().min(8).max(1)).unwrap_or(1),
+        MENU_MIC_DEVICES => mic_device_list().lock().map(|devices| devices.len().min(7) + 1).unwrap_or(1),
+        MENU_SPK_DEVICES => spk_device_list().lock().map(|devices| devices.len().min(7) + 1).unwrap_or(1),
+        _ => MENU_MAIN_ROWS,
+    }
+}
+
+/// Switches the menu to `page`, resetting the selection and refreshing the
+/// device lists when needed.
+fn open_menu_page(page: usize) {
+    if matches!(page, MENU_MIC_DEVICES | MENU_SPK_DEVICES) {
+        refresh_device_list(page);
+    }
+    MENU_PAGE.store(page, Ordering::Relaxed);
+    MENU_SELECTED.store(0, Ordering::Relaxed);
+    MENU_FOCUS.store(1, Ordering::Relaxed);
+    MENU_ICON.store(0, Ordering::Relaxed);
+}
+
 const MENU_MAIN_ROWS: usize = 8;
 
-/// Enter/Left/Right on a menu row.
+/// Enter (direction 0) or Left/Right (-1/1) on a menu row.
 fn activate_menu_row(game: &mut crate::game::Game<'_>, page: usize, direction: i32) {
     let selected = MENU_SELECTED.load(Ordering::Relaxed);
     match page {
+        MENU_MAIN if MENU_FOCUS.load(Ordering::Relaxed) == 0 => activate_menu_icon(game),
         MENU_MAIN => match selected {
-            0 => toggle_microphone(game),
-            1 => toggle_speakers(game),
+            0 => adjust_microphone_gain(game, direction),
+            1 => adjust_speaker_gain(game, direction),
             2 => toggle_noise_suppression_setting(game),
             3 => toggle_voice_activation_setting(game),
-            4 => {
-                MENU_PAGE.store(MENU_PLAYERS, Ordering::Relaxed);
-                MENU_SELECTED.store(0, Ordering::Relaxed);
-            }
-            5 => {
-                MENU_PAGE.store(MENU_GROUPS, Ordering::Relaxed);
-                MENU_SELECTED.store(0, Ordering::Relaxed);
-            }
-            6 => toggle_recording(game),
-            _ => {
-                MENU_OPEN.store(false, Ordering::Relaxed);
-            }
+            4 => open_menu_page(MENU_MIC_DEVICES),
+            5 => open_menu_page(MENU_SPK_DEVICES),
+            6 => open_menu_page(MENU_PLAYERS),
+            _ => toggle_speakers(game),
         },
         MENU_GROUPS => {
             let state = group_state().lock().expect("SVC group state poisoned");
@@ -1994,8 +2099,102 @@ fn activate_menu_row(game: &mut crate::game::Game<'_>, page: usize, direction: i
                 }
             }
         }
+        MENU_MIC_DEVICES | MENU_SPK_DEVICES if direction == 0 => {
+            select_menu_device(game, page, selected);
+        }
         _ => {}
     }
+}
+
+/// Enter on one of the main page's icon buttons: the official screen's left
+/// column (microphone, hide icons, group, recording).
+fn activate_menu_icon(game: &mut crate::game::Game<'_>) {
+    match MENU_ICON.load(Ordering::Relaxed) {
+        0 => toggle_microphone(game),
+        1 => toggle_hide_icons(game),
+        2 => open_menu_page(MENU_GROUPS),
+        _ => toggle_recording(game),
+    }
+}
+
+fn toggle_hide_icons(game: &mut crate::game::Game<'_>) {
+    let hidden = !HIDE_ICONS.load(Ordering::Relaxed);
+    HIDE_ICONS.store(hidden, Ordering::Relaxed);
+    persist_setting(game, "hide_icons", if hidden { "on" } else { "off" });
+}
+
+/// Applies and persists a microphone amplification change (0.0-4.0);
+/// Enter (direction 0) resets it to 100%, Left/Right step by 10%.
+fn adjust_microphone_gain(game: &mut crate::game::Game<'_>, direction: i32) {
+    let current = f32::from_bits(PERSISTED_MIC_GAIN.load(Ordering::Relaxed));
+    let gain = if direction == 0 {
+        1.0
+    } else {
+        (current + if direction < 0 { -0.1 } else { 0.1 }).clamp(0.0, 4.0)
+    };
+    PERSISTED_MIC_GAIN.store(gain.to_bits(), Ordering::Relaxed);
+    persist_setting(game, "microphone_gain", &format!("{gain:.2}"));
+    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        client.set_microphone_gain(gain);
+    }
+}
+
+/// Enter (reset to 100%) or Left/Right (step 10%) on the speaker slider.
+fn adjust_speaker_gain(game: &mut crate::game::Game<'_>, direction: i32) {
+    let current = f32::from_bits(PERSISTED_SPEAKER_GAIN.load(Ordering::Relaxed));
+    let gain = if direction == 0 {
+        1.0
+    } else {
+        (current + if direction < 0 { -0.1 } else { 0.1 }).clamp(0.0, 4.0)
+    };
+    PERSISTED_SPEAKER_GAIN.store(gain.to_bits(), Ordering::Relaxed);
+    persist_setting(game, "speaker_gain", &format!("{gain:.2}"));
+    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        client.set_speaker_gain(gain);
+    }
+}
+
+/// Left/Right on one of the two amplification rows: row 0 is the
+/// microphone slider, row 1 the speaker slider.
+fn adjust_amplification(game: &mut crate::game::Game<'_>, direction: i32) {
+    match MENU_SELECTED.load(Ordering::Relaxed) {
+        0 => adjust_microphone_gain(game, direction),
+        _ => adjust_speaker_gain(game, direction),
+    }
+}
+
+/// Enter on a device row: selects it (row 0 = OS default), keeps the
+/// persisted preference and the F6/F7 cycling position in sync.
+fn select_menu_device(game: &mut crate::game::Game<'_>, page: usize, row: usize) {
+    let microphone = page == MENU_MIC_DEVICES;
+    let slot = if microphone { mic_device_list() } else { spk_device_list() };
+    let devices = slot.lock().map(|devices| devices.clone()).unwrap_or_default();
+    let selection = if row == 0 { None } else { devices.get(row - 1).cloned() };
+    {
+        let mut preferences = audio_device_preferences().lock().expect("SVC audio preferences poisoned");
+        if microphone { preferences.0 = selection.clone(); } else { preferences.1 = selection.clone(); }
+    }
+    if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+        if microphone {
+            client.set_input_device(selection.clone());
+        } else {
+            client.set_output_device(selection.clone());
+        }
+    }
+    let slot_index = match &selection {
+        None => devices.len(),
+        Some(name) => devices.iter().position(|device| device == name).unwrap_or(devices.len()),
+    };
+    if microphone {
+        INPUT_DEVICE_INDEX.store(slot_index, Ordering::Relaxed);
+    } else {
+        OUTPUT_DEVICE_INDEX.store(slot_index, Ordering::Relaxed);
+    }
+    game.native_chat(&format!(
+        "SVC: {} {}",
+        if microphone { "Microphone" } else { "Speaker" },
+        selection.as_deref().unwrap_or("set to the system default")
+    ));
 }
 
 fn toggle_microphone(game: &mut crate::game::Game<'_>) {
@@ -2043,6 +2242,14 @@ pub fn on_hud(
     batch: &mut horizon_client::hud::HudBatch,
 ) {
     if !game.native_playing() || !game.native_on("svchorizon") { return; }
+    if HIDE_ICONS.load(Ordering::Relaxed) {
+        // The official client's "hide icons": no voice chat HUD at all,
+        // though the config screen still opens.
+        if menu_open() {
+            draw_menu(game, batch);
+        }
+        return;
+    }
     let guard = voice_client().lock().expect("SVC client state poisoned");
     let (label, color) = if SELF_MUTED.load(Ordering::Relaxed) {
         ("SVC: Microphone muted", 0xFF5555)
@@ -2242,147 +2449,190 @@ fn draw_group_hud(
     }
 }
 
-/// The voice chat menu overlay (the official client's VoiceChatScreen, as
-/// far as the HUD hook can go): a centered panel with selectable rows.
+/// The voice chat menu overlay, a replica of the official client's
+/// VoiceChatScreen: a centered panel with the vertical icon button strip on
+/// the left (microphone, hide icons, group, recording), the amplification
+/// sliders and device selectors on the right, and the group/volume pages
+/// behind them.
 fn draw_menu(game: &crate::game::Game<'_>, batch: &mut horizon_client::hud::HudBatch) {
     let page = MENU_PAGE.load(Ordering::Relaxed);
     let selected = MENU_SELECTED.load(Ordering::Relaxed);
-    let panel_width = 195.0f32;
-    let (x, y) = batch.centered_origin(panel_width, 140.0);
-    game.native_fill(batch, [x, y, panel_width, 140.0], 0xC0101018);
+    let panel_width = 248.0f32;
+    let panel_height = 176.0f32;
+    let (x, y) = batch.centered_origin(panel_width, panel_height);
+    game.native_fill(batch, [x, y, panel_width, panel_height], 0xC0101018);
     game.native_fill(batch, [x, y, panel_width, 1.0], 0xFF50505A);
-    game.native_fill(batch, [x, y + 139.0, panel_width, 1.0], 0xFF50505A);
-    game.native_fill(batch, [x, y, 1.0, 140.0], 0xFF50505A);
-    game.native_fill(batch, [x + panel_width - 1.0, y, 1.0, 140.0], 0xFF50505A);
+    game.native_fill(batch, [x, y + panel_height - 1.0, panel_width, 1.0], 0xFF50505A);
+    game.native_fill(batch, [x, y, 1.0, panel_height], 0xFF50505A);
+    game.native_fill(batch, [x + panel_width - 1.0, y, 1.0, panel_height], 0xFF50505A);
 
     let title = match page {
         MENU_GROUPS => "Voice Chat: Groups",
         MENU_PLAYERS => "Voice Chat: Adjust Volumes",
+        MENU_MIC_DEVICES => "Voice Chat: Microphone",
+        MENU_SPK_DEVICES => "Voice Chat: Speakers",
         _ => "Voice Chat",
     };
     let title_x = x + (panel_width - game.native_text_width(title)) / 2.0;
     game.native_text(batch, title, [title_x, y + 6.0], 0xFFFFFF, true);
+    game.native_fill(batch, [x + 6.0, y + 17.0, panel_width - 12.0, 1.0], 0x50505A);
 
-    let rows: Vec<(String, bool)> = match page {
-        MENU_MAIN => main_menu_rows(),
-        MENU_GROUPS => {
-            let state = group_state().lock().expect("SVC group state poisoned");
-            if state.groups.is_empty() {
-                vec![("No groups on this server".to_owned(), false)]
-            } else {
-                state
-                    .groups
-                    .iter()
-                    .map(|group| {
-                        let lock = if group.has_password { " [locked]" } else { "" };
-                        let kind = match group.group_type { 1 => " open", 2 => " isolated", _ => "" };
-                        (format!("{}{}{}", group.name, lock, kind), !group.hidden)
-                    })
-                    .collect()
+    match page {
+        MENU_MAIN => {
+            let focus = MENU_FOCUS.load(Ordering::Relaxed);
+            let icon = MENU_ICON.load(Ordering::Relaxed);
+            // The official screen's left icon column.
+            let strip = [
+                if SELF_MUTED.load(Ordering::Relaxed) { &icons::MICROPHONE_OFF } else { &icons::MICROPHONE },
+                &icons::HIDE_BUTTON,
+                &icons::GROUP,
+                &icons::RECORD_BUTTON,
+            ];
+            let strip_x = x + 6.0;
+            let mut strip_y = y + 22.0;
+            for (index, art) in strip.iter().enumerate() {
+                if index == icon && focus == 0 {
+                    game.native_fill(batch, [strip_x - 1.0, strip_y - 1.0, 18.0, 18.0], 0x40FFFFFF);
+                }
+                icons::draw(game, batch, art, strip_x, strip_y);
+                if index == 3 && recorder_active() {
+                    // A red corner marks a running recording.
+                    game.native_fill(batch, [strip_x + 12.0, strip_y + 12.0, 4.0, 4.0], 0xFFFF1313);
+                }
+                strip_y += 19.0;
+            }
+
+            // The settings rows to the right of the strip.
+            let row_x = strip_x + 26.0;
+            let row_width = panel_width - (row_x - x) - 8.0;
+            let mut row_y = y + 22.0;
+            for (index, (label, slider, value)) in main_menu_rows().into_iter().enumerate() {
+                let highlighted = index == selected && focus == 1;
+                match slider {
+                    Some(ratio) => {
+                        // Official widget layout: label above, bar below.
+                        let color = if highlighted { 0xFFFF55 } else { 0xFFFFFF };
+                        game.native_text(batch, &label, [row_x, row_y], color, true);
+                        let value_width = game.native_text_width(&value);
+                        let bar_width = row_width - value_width - 6.0;
+                        let bar_y = row_y + 11.0;
+                        game.native_fill(batch, [row_x, bar_y, bar_width, 5.0], 0xFF202028);
+                        game.native_fill(
+                            batch,
+                            [row_x, bar_y, (bar_width * ratio.clamp(0.0, 1.0)).max(1.0), 5.0],
+                            if highlighted { 0xFF55FF55 } else { 0xFF3FBF3F },
+                        );
+                        game.native_text(batch, &value, [row_x + bar_width + 6.0, row_y], 0xAAAAAA, true);
+                        row_y += 21.0;
+                    }
+                    None => {
+                        if highlighted {
+                            game.native_fill(batch, [row_x - 2.0, row_y - 1.0, row_width + 4.0, 11.0], 0x40FFFFFF);
+                        }
+                        let color = if highlighted { 0xFFFF55 } else { 0xFFFFFF };
+                        game.native_text(batch, &label, [row_x, row_y], color, true);
+                        row_y += 12.0;
+                    }
+                }
             }
         }
-        MENU_PLAYERS => {
-            let state = group_state().lock().expect("SVC group state poisoned");
-            if state.players.is_empty() {
-                vec![("No other players on voice".to_owned(), false)]
-            } else {
-                state
-                    .players
-                    .iter()
-                    .map(|player| {
-                        let talking = {
-                            let guard = voice_client().lock().ok();
-                            guard
-                                .as_ref()
-                                .and_then(|client| client.as_ref())
-                                .is_some_and(|client| client.is_talking(player.id))
-                        };
-                        let marker = if talking { "> " } else { "  " };
-                        let flag = if player.ignored { " [muted]" } else { "" };
-                        (format!("{}{}{} {:.0}%", marker, player.name, flag, player.volume * 100.0), true)
-                    })
-                    .collect()
+        _ => {
+            let rows = match page {
+                MENU_GROUPS => group_page_rows(),
+                MENU_PLAYERS => player_page_rows(),
+                MENU_MIC_DEVICES | MENU_SPK_DEVICES => device_page_rows(page),
+                _ => Vec::new(),
+            };
+            let mut row_y = y + 22.0;
+            for (index, (label, active)) in rows.into_iter().enumerate().take(8) {
+                let highlighted = index == selected;
+                if highlighted {
+                    game.native_fill(batch, [x + 4.0, row_y - 1.0, panel_width - 8.0, 11.0], 0x40FFFFFF);
+                }
+                let color = if !active {
+                    0x888888
+                } else if highlighted {
+                    0xFFFF55
+                } else {
+                    0xFFFFFF
+                };
+                game.native_text(batch, &label, [x + 8.0, row_y], color, true);
+                row_y += 12.0;
             }
         }
-        _ => Vec::new(),
-    };
-
-    let mut row_y = y + 20.0;
-    for (index, (label, selectable)) in rows.into_iter().enumerate().take(8) {
-        let highlighted = selectable && index == selected;
-        if highlighted {
-            game.native_fill(batch, [x + 4.0, row_y - 1.0, panel_width - 8.0, 11.0], 0x40FFFFFF);
-        }
-        let color = if !selectable {
-            0x888888
-        } else if highlighted {
-            0xFFFF55
-        } else {
-            0xFFFFFF
-        };
-        game.native_text(batch, &label, [x + 8.0, row_y], color, true);
-        row_y += 12.0;
     }
 
     let hint = match page {
-        MENU_MAIN => "Enter toggle | Esc close",
+        MENU_MAIN => "Enter select | < > adjust | Esc close",
         MENU_GROUPS => "Enter join | Left leave | Esc back",
-        _ => "Right vol+ | Left mute | Esc back",
+        MENU_PLAYERS => "Right vol+ | Left mute | Esc back",
+        _ => "Enter select | Esc back",
     };
     let hint_x = x + (panel_width - game.native_text_width(hint)) / 2.0;
-    game.native_text(batch, hint, [hint_x, y + 128.0], 0xAAAAAA, true);
+    game.native_text(batch, hint, [hint_x, y + panel_height - 12.0], 0xAAAAAA, true);
 }
 
-/// The main menu's rows, with their current values.
-fn main_menu_rows() -> Vec<(String, bool)> {
+/// The groups page's rows.
+fn group_page_rows() -> Vec<(String, bool)> {
+    let state = group_state().lock().expect("SVC group state poisoned");
+    if state.groups.is_empty() {
+        vec![("No groups on this server".to_owned(), false)]
+    } else {
+        state
+            .groups
+            .iter()
+            .map(|group| {
+                let lock = if group.has_password { " [locked]" } else { "" };
+                let kind = match group.group_type { 1 => " open", 2 => " isolated", _ => "" };
+                (format!("{}{}{}", group.name, lock, kind), !group.hidden)
+            })
+            .collect()
+    }
+}
+
+/// The volumes page's rows.
+fn player_page_rows() -> Vec<(String, bool)> {
+    let state = group_state().lock().expect("SVC group state poisoned");
+    if state.players.is_empty() {
+        vec![("No other players on voice".to_owned(), false)]
+    } else {
+        state
+            .players
+            .iter()
+            .map(|player| {
+                let talking = voice_client()
+                    .lock()
+                    .ok()
+                    .as_ref()
+                    .and_then(|guard| guard.as_ref())
+                    .is_some_and(|client| client.is_talking(player.id));
+                let marker = if talking { "> " } else { "  " };
+                let flag = if player.ignored { " [muted]" } else { "" };
+                (format!("{}{}{} {:.0}%", marker, player.name, flag, player.volume * 100.0), true)
+            })
+            .collect()
+    }
+}
+
+/// The main page's right-hand rows: `(label, slider fraction, value text)`;
+/// a `None` fraction is a plain action row.
+fn main_menu_rows() -> Vec<(String, Option<f32>, String)> {
     let client = voice_client().lock().ok();
     let client = client.as_ref().and_then(|slot| slot.as_ref());
-    let connected = client.is_some_and(|client| client.is_connected());
-    let status = if connected {
-        "Connected".to_owned()
-    } else if server_host::is_running() {
-        "Hosting voice chat".to_owned()
-    } else if client.is_some() {
-        "Connecting".to_owned()
-    } else {
-        "No voice chat".to_owned()
-    };
-    let mic = if SELF_MUTED.load(Ordering::Relaxed) {
-        "Mute microphone: ON"
-    } else {
-        "Mute microphone: off"
-    };
-    let speakers = if SPEAKERS_DISABLED.load(Ordering::Relaxed) {
-        "Disable voice chat: ON"
-    } else {
-        "Disable voice chat: off"
-    };
-    let noise = if client.is_some_and(|client| client.is_noise_suppression_enabled()) {
-        "Noise suppression: on"
-    } else {
-        "Noise suppression: OFF"
-    };
-    let activation = if client.is_some_and(|client| client.is_voice_activation_enabled()) {
-        "Voice activation: on"
-    } else {
-        "Voice activation: off"
-    };
-    let recording = if recorder_active() {
-        format!("Recording: {} (stop)", recording_elapsed_text())
-    } else if RECORDING_ALLOWED.load(Ordering::Acquire) {
-        "Recording: start".to_owned()
-    } else {
-        "Recording: not allowed here".to_owned()
-    };
+    let mic = f32::from_bits(PERSISTED_MIC_GAIN.load(Ordering::Relaxed));
+    let speaker = f32::from_bits(PERSISTED_SPEAKER_GAIN.load(Ordering::Relaxed));
+    let noise = if client.is_some_and(|client| client.is_noise_suppression_enabled()) { "on" } else { "OFF" };
+    let activation = if client.is_some_and(|client| client.is_voice_activation_enabled()) { "on" } else { "off" };
+    let speakers = if SPEAKERS_DISABLED.load(Ordering::Relaxed) { "ON" } else { "off" };
     vec![
-        (format!("Voice chat: {status}"), false),
-        (mic.to_owned(), true),
-        (speakers.to_owned(), true),
-        (noise.to_owned(), true),
-        (activation.to_owned(), true),
-        ("Adjust volumes...".to_owned(), true),
-        ("Groups...".to_owned(), true),
-        (recording, true),
+        ("Microphone amplification".to_owned(), Some(mic / 4.0), format!("{:.0}%", mic * 100.0)),
+        ("Speaker amplification".to_owned(), Some(speaker / 4.0), format!("{:.0}%", speaker * 100.0)),
+        (format!("Noise suppression: {noise}"), None, String::new()),
+        (format!("Voice activation: {activation}"), None, String::new()),
+        ("Select microphone...".to_owned(), None, String::new()),
+        ("Select speaker...".to_owned(), None, String::new()),
+        ("Adjust volumes...".to_owned(), None, String::new()),
+        (format!("Disable voice chat: {speakers}"), None, String::new()),
     ]
 }
 
@@ -2544,6 +2794,8 @@ pub fn on_settings(game: &mut crate::game::Game<'_>, mod_id: &str, buttons: &mut
         "Voice activation: off (click to turn on)".to_owned()
     });
     buttons.push(format!("Microphone gain: {:.0}% (click for +25%)", gain * 100.0));
+    let speaker = f32::from_bits(PERSISTED_SPEAKER_GAIN.load(Ordering::Relaxed));
+    buttons.push(format!("Speaker gain: {:.0}% (click for +25%)", speaker * 100.0));
     buttons.push(format!("Activation threshold: {:.1}% (click for +0.5%)", threshold * 100.0));
     buttons.push(if recorder_active() {
         format!("Recording: {} (click to stop)", recording_elapsed_text())
@@ -2581,6 +2833,14 @@ pub fn on_settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, button:
             }
         }
         5 => {
+            let gain = (f32::from_bits(PERSISTED_SPEAKER_GAIN.load(Ordering::Relaxed)) + 0.25).clamp(0.0, 4.0);
+            PERSISTED_SPEAKER_GAIN.store(gain.to_bits(), Ordering::Relaxed);
+            persist_setting(game, "speaker_gain", &gain.to_string());
+            if let Some(client) = voice_client().lock().expect("SVC client state poisoned").as_ref() {
+                client.set_speaker_gain(gain);
+            }
+        }
+        6 => {
             let mut threshold = f32::from_bits(PERSISTED_ACTIVATION_THRESHOLD.load(Ordering::Relaxed)) + 0.005;
             if threshold > 0.2 { threshold = 0.005; }
             PERSISTED_ACTIVATION_THRESHOLD.store(threshold.to_bits(), Ordering::Relaxed);
@@ -2592,7 +2852,7 @@ pub fn on_settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, button:
                 );
             }
         }
-        6 => toggle_recording(game),
+        7 => toggle_recording(game),
         _ => {}
     }
 }
