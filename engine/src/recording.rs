@@ -304,7 +304,7 @@ impl RecorderSink {
 pub struct Recorder {
     sink: Arc<RecorderSink>,
     sender: std::sync::mpsc::Sender<RecordingMessage>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 enum RecordingMessage {
@@ -320,8 +320,8 @@ impl Recorder {
         dir: PathBuf,
         names: Arc<std::sync::RwLock<HashMap<[u8; 16], String>>>,
         rate: u32,
-    ) -> Option<Self> {
-        let sink = RecorderSink::start(dir, names, rate).ok()?;
+    ) -> std::io::Result<Self> {
+        let sink = RecorderSink::start(dir, names, rate)?;
         let (sender, receiver) = std::sync::mpsc::channel::<RecordingMessage>();
         let thread_sink = sink.clone();
         let thread = std::thread::Builder::new()
@@ -337,12 +337,11 @@ impl Recorder {
                     }
                 }
                 thread_sink.finish();
-            })
-            .ok()?;
-        Some(Self {
+            })?;
+        Ok(Self {
             sink,
             sender,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
         })
     }
 
@@ -363,12 +362,20 @@ impl Recorder {
     }
 
     /// Ends this recording: pending audio is written, headers finalized.
-    pub fn stop_and_finish(mut self) -> PathBuf {
+    pub fn stop_and_finish(self) -> PathBuf {
+        self.finish_detached()
+    }
+
+    /// Finishes without consuming the recorder (it may be shared in an
+    /// `Arc`): signals the writer thread and waits for the final headers.
+    pub fn finish_detached(&self) -> PathBuf {
         self.sink.stop();
         let location = self.sink.location();
         let _ = self.sender.send(RecordingMessage::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Ok(mut slot) = self.thread.lock() {
+            if let Some(thread) = slot.take() {
+                let _ = thread.join();
+            }
         }
         location
     }
@@ -376,12 +383,7 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        if self.thread.is_some() {
-            let _ = self.sender.send(RecordingMessage::Stop);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
+        self.finish_detached();
     }
 }
 

@@ -14,7 +14,7 @@
 
 use crate::voice::{
     decode_packet_prefix, encode_packet, write_byte_array, write_varint, Packet, Reader,
-    KEEP_ALIVE, MAGIC, MAX_DATAGRAM, MAX_OPUS, NONCE_BYTES, TAG_BYTES,
+    MAGIC, MAX_DATAGRAM, MAX_OPUS, NONCE_BYTES, TAG_BYTES,
 };
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -813,8 +813,13 @@ impl HostedVoiceServer {
         self.core.lock().map(|core| core.connections.len()).unwrap_or(0)
     }
 
+    /// The guests currently on the roster (diagnostics).
+    pub fn roster_snapshot(&self) -> Vec<[u8; 16]> {
+        self.core.lock().map(|core| core.roster.keys().copied().collect()).unwrap_or_default()
+    }
+
     /// Stops the loop and closes the socket.
-    pub fn shutdown(self) {
+    pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
     }
 }

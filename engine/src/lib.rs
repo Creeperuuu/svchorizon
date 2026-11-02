@@ -32,6 +32,8 @@ pub mod silk;
 pub mod recording;
 #[cfg(feature = "std")]
 pub mod server;
+#[cfg(feature = "std")]
+pub mod server_host;
 
 pub use silk::{SilkResampler, SilkResamplerDown1_3, SilkResamplerDown1_6};
 

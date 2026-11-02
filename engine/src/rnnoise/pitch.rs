@@ -1,15 +1,45 @@
 //! Pitch analysis: `pitch.c` and the `celt_lpc.c` helpers, float path.
 
-use super::{PITCH_FRAME_SIZE, PITCH_MAX_PERIOD, PITCH_MIN_PERIOD};
+use super::{PITCH_FRAME_SIZE, PITCH_MAX_PERIOD};
 
-/// `rnn_pitch_downsample` (pitch.c), float path: decimate by 2 with a
-/// zero-adding pre-emphasis FIR, in a `[len / 2]` output.
+/// `rnn_pitch_downsample` (pitch.c), float path: decimate by 2, then fit a
+/// 4-tap LPC over the decimated signal and apply the zero-adding pre-emphasis
+/// FIR5, so the pitch search sees the whitened signal it was trained on.
 pub(crate) fn downsample(x: &[f32], out: &mut [f32]) {
     let len = x.len();
     for i in 1..len / 2 {
         out[i] = 0.25 * (x[2 * i - 1] + x[2 * i + 1]) + 0.5 * x[2 * i];
     }
     out[0] = 0.25 * x[1] + 0.5 * x[0];
+    let n = len / 2;
+    // rnn_autocorr with no window and lag 4.
+    let mut ac = [0.0f32; 5];
+    autocorr(out, &mut ac, 4, n);
+    // Noise floor -40 dB, then lag windowing.
+    ac[0] *= 1.0001;
+    for (i, value) in ac.iter_mut().enumerate().skip(1) {
+        *value -= *value * (0.008 * i as f32) * (0.008 * i as f32);
+    }
+    // rnn_lpc, then the 0.9^i damping of the coefficients.
+    let mut lpc_coefficients = [0.0f32; 4];
+    lpc(&mut lpc_coefficients, &ac);
+    let mut damping = 1.0f32;
+    for coefficient in lpc_coefficients.iter_mut() {
+        damping *= 0.9;
+        *coefficient *= damping;
+    }
+    // Add a zero (the FIR5 numerator) and filter in place.
+    let c1 = 0.8f32;
+    let num = [
+        lpc_coefficients[0] + c1,
+        lpc_coefficients[1] + c1 * lpc_coefficients[0],
+        lpc_coefficients[2] + c1 * lpc_coefficients[1],
+        lpc_coefficients[3] + c1 * lpc_coefficients[2],
+        c1 * lpc_coefficients[3],
+    ];
+    let source: Vec<f32> = out[..n].to_vec();
+    let mut mem = [0.0f32; 5];
+    fir5(&source, &num, out, n, &mut mem);
 }
 
 /// `celt_inner_prod` (pitch.h).

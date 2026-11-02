@@ -3,9 +3,8 @@
 //! conjugate-extends the spectrum and reads the result reversed, undoing the
 //! 1/960 scale the forward pass applies.
 
-use crate::kiss_fft::{KissCpx, KissFftState};
 use super::{FREQ_SIZE, WINDOW_SIZE};
-use crate::kiss_fft;
+use crate::kiss_fft::{KissCpx, KissFftState};
 
 /// `forward_transform` (denoise.c).
 pub(crate) fn forward(

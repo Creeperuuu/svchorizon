@@ -48,7 +48,6 @@ fn compute_linear(layer: &Layer, out: &mut [f32], input: &[f32]) {
             // input blocks that exist; each block's 32 weights are
             // row-major-in-block (8 rows x 4 columns).
             let weights = layer.weights;
-            let bias = layer.bias;
             let mut idx = 0usize;
             let mut w = 0usize;
             let mut row_group = 0usize;

@@ -227,16 +227,6 @@ impl Denoiser {
         false
     }
 
-    fn frame_synthesis(&mut self, out: &mut [f32; FRAME_SIZE], y: &[(f32, f32); FREQ_SIZE]) {
-        let mut x = [0.0f32; WINDOW_SIZE];
-        fft::inverse(&self.fft, y, &mut x);
-        apply_window(&mut x);
-        for i in 0..FRAME_SIZE {
-            out[i] = x[i] + self.synthesis_mem[i];
-        }
-        self.synthesis_mem.copy_from_slice(&x[FRAME_SIZE..]);
-    }
-
     fn frame_synthesis_of(
         fft: &KissFftState,
         synthesis_mem: &mut [f32],
