@@ -18,12 +18,22 @@ pub mod modes;
 /// + no-`alloc` capable (see `split_self_delimited` docs).
 #[cfg(feature = "std")]
 pub mod multistream;
+/// Pure-Rust RNNoise denoiser (Simple Voice Chat's noise suppression),
+/// std-only like the voice client that drives it.
+#[cfg(feature = "std")]
+pub mod rnnoise;
 pub mod pitch;
 pub mod pvq;
 pub mod quant_bands;
 pub mod range_coder;
 pub mod rate;
 pub mod silk;
+#[cfg(feature = "std")]
+pub mod recording;
+#[cfg(feature = "std")]
+pub mod server;
+#[cfg(feature = "std")]
+pub mod server_host;
 
 pub use silk::{SilkResampler, SilkResamplerDown1_3, SilkResamplerDown1_6};
 

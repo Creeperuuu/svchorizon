@@ -6,8 +6,9 @@ use crate::fixedvec::FixedVec;
 
 pub const MAXFACTORS: usize = 8;
 
-/// Maximum FFT size (`nfft`) used by the MDCT plans. Bounded by `MAX_N4 = 480`.
-pub const KISS_MAX_N: usize = 480;
+/// Maximum FFT size (`nfft`) used by the MDCT plans (`MAX_N4 = 480`) and by
+/// the RNNoise denoiser's 960-point analysis window.
+pub const KISS_MAX_N: usize = 960;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]

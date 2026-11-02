@@ -80,6 +80,39 @@ bindings = [
   { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "corners" }
 ]
 
+[[injection]]
+id = "voice-settings"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_settings"
+helper = "native_settings.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "buttons", ty = "&mut Vec<String>", value = "buttons" }
+]
+
+[[injection]]
+id = "voice-settings-click"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_settings_click"
+helper = "native_settings_click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "button", ty = "usize", value = "button" }
+]
+
+# The integrated/LAN hub feeds the hosted voice server: per guest, per tick.
+[[injection]]
+id = "voice-hub"
+kind = "HEAD"
+target = "horizon_client::lan::hub::Hub::process_inbox"
+helper = "voice_hub.rs"
+bindings = [
+  { name = "hub", ty = "&mut crate::lan::hub::Hub", value = "self" },
+  { name = "guest_index", ty = "usize", value = "i" }
+]
+
 [[module]]
 id = "remote-positions"
 file = "crates/horizon-client/src/game/remote.rs"
