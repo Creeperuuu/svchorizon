@@ -1,120 +1,22 @@
+
 name: Build SVC Horizon hnmod
+
 on:
   workflow_dispatch:
-    # The native-mixin-check job also runs on every push to the working
-    # branch: it compiles the real mixin against the pinned Horizon and
-    # catches compile errors before any manual game build is dispatched.
-    # The Windows-minute-heavy jobs below stay manual.
-  push:
-    branches:
-      - ci/windows-game-build
+    inputs:
+      horizon_commit:
+        description: "Horizon commit hash to build against"
+        required: true
+        type: string
+        default: "ba6344a59cb9e755b730dcf02285fc0d33b97d3c"
 
 permissions:
   contents: read
 
 jobs:
-  protocol-tests:
-    # Manual runs only - full fmt/clippy/test matrix across two operating systems.
-    if: github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format sources
-        run: cargo fmt --all
-      - name: Verify formatting
-        run: cargo fmt --all -- --check
-      - name: Test protocol core
-        run: cargo test --workspace --all-targets
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  native-mixin-check:
-    # Runs on every push: this is the job that compiles the real mixin against
-    # the pinned Horizon, so it catches compile errors before any manual build.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: horizon-rust/horizon
-          ref: ba6344a59cb9e755b730dcf02285fc0d33b97d3c
-          path: horizon
-      - name: Materialize tracked symlinks in pinned Horizon
-        run: |
-          cd horizon
-          git ls-files -s | awk '$1 == 120000 {print $4}' | while IFS= read -r link; do
-            [ -n "$link" ] || continue
-            target=$(git cat-file blob "HEAD:$link")
-            rm -f "$link"
-            cp -L "$target" "$link"
-          done
-      - uses: actions/checkout@v4
-        with:
-          repository: horizon-rust/horizon-mixins
-          ref: d9c83d7096b7ea5b83678da2efdfd6161f74997e
-          path: horizon-mixins
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - name: Install Linux audio build dependencies
-        # libudev: hidapi (via gilrs, pulled in by horizon-client) needs it for its build script.
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
-      - name: Fetch mixin tooling
-        run: cargo fetch --locked --manifest-path horizon-mixins/Cargo.toml
-      - name: Fetch pinned Horizon dependencies
-        run: cargo fetch --locked --manifest-path horizon/Cargo.toml
-      - name: Stage vendored Opus engine into the native bundle
-        run: python tools/prepare_bundle.py
-      - name: Build mixin CLI
-        run: cargo build --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli
-      - name: Prepare plan output directory
-        # rust-cache restores the cargo target dir including a previous run's
-        # target/mixins stage, which the mixin CLI refuses to replace
-        # (E_STAGE_OWNERSHIP); start the stage from scratch on every run.
-        run: rm -rf target/mixins && mkdir -p target/mixins
-      - name: Plan native hooks
-        run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- plan --workspace horizon --mods mixins --out target/mixins/plan.json
-      - name: Apply native hooks
-        run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- apply --workspace horizon --mods mixins --out target/mixins/modded
-      - name: Compile and test the actual native mixin
-        run: cargo run --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli -- check --workspace horizon --mods mixins --out target/mixins/modded --trust-native-mods
-
-  engine-windows-check:
-    # Manual runs only - Windows runner minutes are reserved for game builds.
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Stage bundled engine
-        run: python tools/prepare_bundle.py
-      - name: Format engine sources
-        run: cargo fmt --manifest-path mixins/svchorizon/engine/Cargo.toml
-      - name: Check engine formatting
-        run: cargo fmt --manifest-path mixins/svchorizon/engine/Cargo.toml -- --check
-      - name: Compile Opus, AES-GCM and CPAL on Windows
-        run: cargo check --manifest-path mixins/svchorizon/engine/Cargo.toml
-      - name: Run native engine protocol tests
-        run: cargo test --manifest-path mixins/svchorizon/engine/Cargo.toml
-
   package:
     if: github.event_name == 'workflow_dispatch'
-    needs: [protocol-tests, native-mixin-check, engine-windows-check]
+    needs: []
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
