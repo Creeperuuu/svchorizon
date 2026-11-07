@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Pinned compatibility
 
 - Minecraft: 26.3
-- Horizon: `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`
+- Horizon: `66f3981f522b24c250b21523a70080965b940424`
 - horizon-mixins: `d9c83d7096b7ea5b83678da2efdfd6161f74997e`
 - Simple Voice Chat compatibility version: 20 (the shipped `voicechat-bukkit-2.6.27` plugin for MC 26.3; upstream 2.7.0-pre1 moves to 21 with a wire change)
 
