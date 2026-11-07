@@ -71,7 +71,7 @@ the HUD reflect the probe result instead of speculating about firewalls.
 
 ## Compatibility pin
 
-The native bundle targets Minecraft 26.3, Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client speaks Simple Voice Chat compatibility versions **20**, **21** and **18**: on every join the generations are probed one at a time (the server answers only the request whose number matches its own plugin build and sends the player an incompatibility chat notice for every other number; the client detects that notice and skips to the next generation), and the UDP layer switches to the matching wire format. Compat 20 is the release line published for Minecraft 1.12.2 through the current 1.21.x/26.x servers (`voicechat-bukkit-2.6.27` and friends); compat 21 is upstream 2.7.x (2.7.0-pre1); compat 18 is the 2.5.x line on servers that never updated, wire-identical to compat 20. This is a property of the server's plugin build, not of one Minecraft version, so probing all three covers older and newer servers alike.
+The native bundle targets Minecraft 26.3, Horizon commit `66f3981f522b24c250b21523a70080965b940424`, and horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e`. The client speaks Simple Voice Chat compatibility versions **20**, **21** and **18**: on every join the generations are probed one at a time (the server answers only the request whose number matches its own plugin build and sends the player an incompatibility chat notice for every other number; the client detects that notice and skips to the next generation), and the UDP layer switches to the matching wire format. Compat 20 is the release line published for Minecraft 1.12.2 through the current 1.21.x/26.x servers (`voicechat-bukkit-2.6.27` and friends); compat 21 is upstream 2.7.x (2.7.0-pre1); compat 18 is the 2.5.x line on servers that never updated, wire-identical to compat 20. This is a property of the server's plugin build, not of one Minecraft version, so probing all three covers older and newer servers alike.
 
 ## Interop-critical wire details (verified against the 2.6.27 plugin jar and a live server)
 
@@ -86,7 +86,7 @@ The vendored Opus implementation is from [restsend/opus-rs](https://github.com/r
 
 ## Local build validation (2026-10-31, branch dev/continue-port)
 
-Validated against Horizon commit `ba6344a59cb9e755b730dcf02285fc0d33b97d3c` with horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e` (Rust 1.99.1, Linux x86-64):
+Validated against Horizon commit `66f3981f522b24c250b21523a70080965b940424` with horizon-mixins `d9c83d7096b7ea5b83678da2efdfd6161f74997e` (Rust 1.99.1, Linux x86-64):
 
 - `horizon-mixins plan` and `apply` pass on the pinned source (6 injections, 2 modules, 1 bundle crate).
 - The modded `horizon-client` compiles; `cargo test -p horizon-client` runs the game's own suites green (733 lib + 215 bin tests, 0 failures), including this mod's 9 runtime tests.
